@@ -685,9 +685,15 @@ impl App {
                         let names: Vec<&str> = broken.iter().filter_map(Value::as_str).collect();
                         self.error = Some(format!("recompute left these objects invalid: {}", names.join(", ")));
                     }
-                    self.modified = true;
-                    self.refresh();
-                    self.sketch_resync();
+                    // A script that only measured changed nothing: nothing to save or reload,
+                    // but the property panel may hold a typed value to put back.
+                    if v["document_changed"].as_bool() != Some(false) {
+                        self.modified = true;
+                        self.refresh();
+                        self.sketch_resync();
+                    } else if let Some(obj) = self.selection.as_ref().map(|s| s.obj.clone()) {
+                        self.request("props", json!({ "obj": obj }), Pending::Props);
+                    }
                 }
                 Pending::Edges(_, g) => self.on_edges(g, &v),
                 Pending::Face(g) => self.on_face(g, &v),
@@ -1962,6 +1968,15 @@ impl App {
                 }
                 Ok(self.request("validate", args, Pending::AgentQuery))
             }
+            "run_script" => match (a["code"].as_str(), a.get("dry_run")) {
+                (None, _) => Err("code: give the script's Python source".into()),
+                (_, Some(other)) if !other.is_boolean() => Err(format!("dry_run is true or false, not {other}")),
+                (Some(code), dry) => {
+                    let dry = dry == Some(&Value::Bool(true));
+                    let args = json!({ "code": code, "params": a["params"], "title": a["title"], "dry_run": dry });
+                    Ok(self.request("script", args, if dry { Pending::AgentQuery } else { Pending::Edit }))
+                }
+            },
             "save" => self.agent_save_path(a).map(|p| self.save_to(p)),
             "undo" => Ok(self.undo(false)),
             "redo" => Ok(self.undo(true)),

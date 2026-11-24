@@ -277,7 +277,7 @@ feature on the way could not be checked whole.
   random `VIBECAD_TOKEN`; the script connects back and must greet with the token. The listener
   closes after that one connection, and the directory is removed once FreeCAD has read the script. Every message is a JSON header plus an optional binary payload, both
   length-prefixed (see the script's docstring). Commands: `open`, `new`, `tree`, `props`,
-  `set_prop`, `set_props`, `sketch`, `new_sketch`, `sketch_edit`, `set_visible`, `set_tip`, `undo`, `redo`, `scene`, `save_as`, `export`, the modelling
+  `set_prop`, `set_props`, `script`, `sketch`, `new_sketch`, `sketch_edit`, `set_visible`, `set_tip`, `undo`, `redo`, `scene`, `save_as`, `export`, the modelling
   ones (`datum_plane`, `extrude`, `fillet`, `mirror`, `pattern`, `copy`, `delete`), `edges`
   and `face` for picking edges and drawing handles, and the agent's (`snapshot`, `timeline`,
   `slice`, `diff`), and `validate`. Requests go out as
@@ -379,8 +379,8 @@ removed when the window closes. So the agent edits and sees the same document as
 the screen, with one FreeCAD.
 
 Tools: `get_status`, `get_tree`, `get_properties`, `get_sketch`, `new_sketch`, `sketch_edit`,
-`extrude`, `set_property`, `set_properties`, `undo`, `redo`, `save`, `open_document` (refused
-while there are unsaved edits), and for checking what an edit did:
+`extrude`, `set_property`, `set_properties`, `run_script`, `undo`, `redo`, `save`,
+`open_document` (refused while there are unsaved edits), and for checking what an edit did:
 
 - **Properties.** `get_properties` leaves out what reads as noise (shapes, materials, the raw
   expression engine); entries the tools cannot set (links, lists, vectors) are read-only, and a
@@ -413,6 +413,33 @@ while there are unsaved edits), and for checking what an edit did:
   `extrude` extrudes a sketch's closed profiles (a Pad, or a Pocket for a negative distance) or
   pushes or pulls a flat face. A sketch with open curves is refused until they are closed,
   construction or gone.
+- **`run_script`**: Python source run inside the window's FreeCAD, for what no other tool makes
+  (a surface through computed points, lofts and sweeps, shapes built in a loop) or measures. It
+  is one undo step and one state, and takes `dry_run` like `set_properties`. The script sees
+  `doc`, `FreeCAD` (also `App`), `Part`, `math`, `params` (the call's `params`) and
+  `show(shape, name)`, which puts a shape into the document as the `Part::Feature` `name` and
+  replaces that object's shape when it is there: the same code with other `params` changes
+  its result, it does not add a copy. Back come what it printed, its variable `result`, the
+  objects it created and removed, and the states to `diff` and `slice`. A script that raises
+  leaves the document as it was, and the error names its line; so does one still running after
+  5 minutes, stopped between two Python instructions (a single call into OCCT runs to its
+  end). A script that changed nothing leaves no undo step, keeps the steps redo can bring
+  back, and leaves the document unmodified. The
+  script is not kept in the document: what stays are ordinary FreeCAD objects.
+
+  ```python
+  # params: {"n": 12, "size": 60, "height": 4}
+  n, size, h = params["n"], params["size"], params["height"]
+  pts = [[App.Vector(size * i / n, size * j / n, 10 + h * math.sin(4 * i / n) * math.cos(4 * j / n))
+          for j in range(n + 1)] for i in range(n + 1)]
+  top = Part.BSplineSurface()
+  top.interpolate(pts)
+  show(top.toShape().extrude(App.Vector(0, 0, -50)).common(Part.makeBox(size, size, 50)), "Wave")
+  ```
+
+  The script runs with the rights of the person's FreeCAD: it can read and write files and
+  start programs. Only a client that holds the token in `agent.json` (readable by this user
+  only) can send one, each call shows in the feed with its code, and Pause refuses them.
 
 - **States and timelines.** The worker keeps the exact shape of every solid body (a PartDesign
   Body, or any solid no other shape takes as input) at each state: `s0` at open, one after
@@ -461,7 +488,10 @@ nothing behind, and undoes each step.
 progress in faces, each mesh once, biggest first when nothing was tessellated), that a `tree`
 sent during a scene longer than a second is answered before it, opens every file again in a new
 process to check that all meshes come from the disk cache, that an edited shape does not, and
-that a second `scene` sent mid-stream ends the first. Last it loads every file twice more from
+that a second `scene` sent mid-stream ends the first. On the sample it runs scripts: a wavy
+block made, changed by the same script with other params, tried dry and undone; one that only
+measures; and ones that raise, exit, never end or have a syntax error, which must leave the
+document and its undo history as they were. Last it loads every file twice more from
 an empty cache, meshed in the worker (`VIBECAD_TESSELLATORS=0`) and by the tessellators, and
 checks that the tessellators made every mesh and that the meshes agree: the same faces and
 flags, triangle counts within 1 %, the same box within the tolerance. Give it a large assembly

@@ -276,6 +276,88 @@ def check_sketch_and_batch(cl):
     assert pad["Length"]["value"] == length0 and "expression" not in pad["Length"], pad["Length"]
 
 
+# A wavy surface through computed points, as the top of a block standing on z = 0.
+WAVE = """
+n, size, height = params["n"], params["size"], params["height"]
+grid = [[App.Vector(size * i / n, size * j / n, 6 + height * math.sin(3 * i / n) * math.cos(3 * j / n))
+         for j in range(n + 1)] for i in range(n + 1)]
+top = Part.BSplineSurface()
+top.interpolate(grid)
+solid = top.toShape().extrude(App.Vector(0, 0, -50)).common(Part.makeBox(size, size, 50))
+assert solid.isValid() and len(solid.Solids) == 1
+show(solid, "Wave")
+print("faces", len(solid.Faces))
+result = {"volume": solid.Volume, "top": solid.BoundBox.ZMax, "at": App.Vector(1, 2, 3)}
+"""
+
+
+def check_script(cl):
+    """Scripts: a surface through computed points made a solid, changed by running the script
+    again with other params; a dry run; a script that only measures; and the ways one fails,
+    each leaving the document and its undo history as they were."""
+    names = lambda: [n["name"] for n in cl.call("tree")[0]["nodes"]]
+    cl.call("set_props", changes=[{"obj": "Pad", "prop": "Length", "value": 9.0}])  # no redo steps left
+    undo0 = cl.call("tree")[0]["undo"]
+    made, _ = cl.call("script", code=WAVE, params={"n": 8, "size": 40.0, "height": 2.0}, title="wave")
+    print("script:", {k: made[k] for k in ("created", "output", "result", "changed_bodies", "document_changed")})
+    assert made["created"] == ["Wave"] and made["changed_bodies"] == ["Wave"] and made["document_changed"], made
+    assert made["output"] == "faces 6\n" and not made["broken"] and made["result"]["at"].startswith("Vector"), made
+    assert abs(made["result"]["volume"] - 40 * 40 * 6) < 0.15 * 40 * 40 * 6, made["result"]
+    assert cl.call("tree")[0]["undo"] == undo0 + 1 and "Wave" in names(), "one undo step, and in the tree"
+    assert "Wave" in [i["obj"] for i in cl.scene()["instances"]], "drawn"
+    tl, _ = cl.call("timeline", body="Wave")
+    assert tl["bodies"]["Wave"]["changes"][-1]["cause"] == "script: wave", tl["bodies"]["Wave"]
+
+    trial, _ = cl.call("script", code=WAVE, params={"n": 8, "size": 40.0, "height": 4.0}, dry_run=True)
+    print("script, dry run:", trial["trial"], trial["changed_bodies"], trial["created"], trial["result"]["top"])
+    assert trial["dry_run"] and trial["changed_bodies"] == ["Wave"] and trial["created"] == [], trial
+    assert trial["result"]["top"] > made["result"]["top"] + 1, (trial["result"], made["result"])
+    d, _ = cl.call("diff", before=trial["state_before"], state=trial["trial"], body="Wave", sections=False)
+    assert d["bodies"][0]["change"] == "changed" and d["bodies"][0]["added"]["volume"] > 1, d["bodies"][0]
+    assert cl.call("tree")[0]["undo"] == undo0 + 1, "a dry run leaves no step"
+
+    again, _ = cl.call("script", code=WAVE, params={"n": 8, "size": 40.0, "height": 4.0})
+    assert again["created"] == [] and again["changed_bodies"] == ["Wave"], "the same object, changed: %s" % again
+    assert names().count("Wave") == 1
+
+    states0 = len(cl.call("timeline")[0]["states"])
+    measured, _ = cl.call("script", code="result = {n: doc.getObject(n).Shape.Volume for n in ('Wave', 'Body')}")
+    print("script that only measures:", measured["result"], measured["document_changed"])
+    assert "Wave" in measured["result"] and measured["document_changed"] is False, measured
+    assert cl.call("tree")[0]["undo"] == undo0 + 2 and len(cl.call("timeline")[0]["states"]) == states0
+
+    for what, kw in (("raises", dict(code="show(Part.makeBox(1, 1, 1), 'Junk')\nx = 1\ndoc.getObject('Nope').Shape")),
+                     ("has a syntax error", dict(code="a = 1\nb = (2,\n")),
+                     ("exits", dict(code="doc.addObject('Part::Feature', 'Junk')\nimport sys\nsys.exit(1)")),
+                     ("never ends", dict(code="doc.addObject('Part::Feature', 'Junk')\nwhile True:\n    try:\n"
+                                              "        while True: pass\n    except: pass", timeout=1.0)),
+                     ("ends late", dict(code="import time\ntry:\n    while True: time.sleep(0.01)\n"
+                                             "except BaseException: pass\nshow(Part.makeBox(1, 1, 1), 'Junk')", timeout=1.0)),
+                     ("takes a body's name", dict(code="show(Part.makeBox(1, 1, 1), 'Body')")),
+                     ("is empty", dict(code="  ")),
+                     ("gets a list as params", dict(code="x = 1", params=[1]))):
+        print("script that %s:" % what, _error(cl, "script", **kw).splitlines()[0][:110])
+    assert "(line 3: doc.getObject('Nope').Shape)" in _error(cl, "script", code="x = 1\n\ndoc.getObject('Nope').Shape")
+    assert "(line 2: b = (2,)" in _error(cl, "script", code="a = 1\nb = (2,\n")
+    assert cl.call("tree")[0]["undo"] == undo0 + 2 and "Junk" not in names(), "failed scripts leave nothing"
+    assert len(cl.call("timeline")[0]["states"]) == states0
+    cl.call("undo")
+    cl.call("undo")
+    assert "Wave" not in names(), "undone"
+    cl.call("script", code="result = len(doc.Objects)")
+    assert cl.call("tree")[0]["redo"] == 2, "a script that only reads keeps the steps redo brings back"
+    cl.call("undo")  # the pad's length
+
+
+def _error(cl, cmd, **kw):
+    """The error a command is refused with."""
+    try:
+        cl.call(cmd, **kw)
+    except RuntimeError as ex:
+        return str(ex)
+    raise AssertionError("%s %s did not fail" % (cmd, kw))
+
+
 def main(paths):
     cl = Client()
     for path in paths:
@@ -356,6 +438,7 @@ def main(paths):
         with zipfile.ZipFile(out) as z:
             print("saved:", saved, "GuiDocument.xml" in z.namelist())
         check_sketch_and_batch(cl)
+        check_script(cl)
     # a document saved from FreeCAD's GUI keeps its colours through a headless save, also in place
     colored = [p for p in paths if p.endswith("EasyScanner.FCStd")]
     if colored:

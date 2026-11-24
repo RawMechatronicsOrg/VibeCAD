@@ -22,11 +22,15 @@ script with VIBECAD_ROLE=tessellator, which get each shape as BREP text and send
 """
 import array
 import collections
+import contextlib
+import ctypes
 import hashlib
 import hmac
+import io
 import math
 import json
 import os
+import re
 import select
 import shutil
 import socket
@@ -34,6 +38,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import xml.etree.ElementTree as ET
@@ -63,7 +68,7 @@ MAX_FACE_COLORS = 20000
 BATCH_SECONDS = 0.3
 # Requests that change what the scene shows; one arriving during a scene stream ends it.
 ENDS_SCENE = {"scene", "open", "new", "set_prop", "set_props", "new_sketch", "sketch_edit", "undo", "redo", "set_visible",
-              "set_tip", "datum_plane", "extrude", "fillet", "mirror", "pattern", "copy", "delete"}
+              "set_tip", "datum_plane", "extrude", "fillet", "mirror", "pattern", "copy", "delete", "script"}
 LINK_TYPES = ("App::Link", "App::LinkElement")
 # How FreeCAD's origin planes turn (yaw, pitch, roll): XY faces +Z, XZ -Y, YZ +X.
 BASE_PLANES = {"XY": (0, 0, 0), "XZ": (0, 0, 90), "YZ": (90, 0, 90)}
@@ -80,6 +85,12 @@ DATUM_UNITS = {"Distance": "mm", "DistanceX": "mm", "DistanceY": "mm", "Radius":
                "Angle": "°"}
 # Trial states of dry runs kept per document.
 MAX_TRIALS = 20
+# A script (see `Worker.cmd_script`) is stopped after this many seconds, and what it printed
+# and its result are cut at this many characters each.
+SCRIPT_SECONDS = 300
+MAX_SCRIPT_TEXT = 20000
+# The file name a script is compiled under: its lines in a traceback carry it.
+SCRIPT_NAME = "<script>"
 # Part of every disk cache key: bump when `encode_mesh` changes what it writes.
 # Largest angle, in radians, one segment of a curve may turn by: 10 degrees, so circles are
 # round on screen and the rims of parts that sit in each other's holes line up closely.
@@ -1548,7 +1559,7 @@ class Worker(Modelling):
         empty expression clears one), with one recompute: one undo step and one state. With
         "dry_run" the document is put back as it was, and the result is kept as a trial state
         ("t1", ...) that `slice` and `diff` take like any other."""
-        doc = self._doc()
+        self._doc()
         changes = req.get("changes") or []
         if not changes:
             raise ValueError("no changes given")
@@ -1569,26 +1580,40 @@ class Worker(Modelling):
             steps.append((obj, name, "value", value))
         title = "; ".join("set %s.%s %s %s" % (o.Name, n, "=" if k == "value" else ":=", _short(v, 40))
                           for o, n, k, v in steps)
-        dry = bool(req.get("dry_run"))
-        if dry:
-            self._refuse_dry_run_over_redo(doc)
-        was_edited = self.edited
-        self.edited = True
-        doc.openTransaction(title if len(steps) == 1 else "Set %d properties" % len(steps))
-        committed = False
-        try:
+
+        def apply():
             for obj, name, kind, v in steps:
                 if kind == "expression":
                     set_expression(obj, name, v)
                 else:
                     set_property(obj, name, v)
+
+        return self._edit(title if len(steps) == 1 else "Set %d properties" % len(steps), title, apply,
+                          bool(req.get("dry_run")))
+
+    def _edit(self, title, cause, apply, dry=False):
+        """Run `apply()`, which changes the document and may return fields for the reply, then
+        recompute: one undo step named `title` and one state. With `dry` the document is put
+        back as it was and the result kept as a trial state; it is put back too when anything
+        raises. "document_changed" says whether there is anything to undo."""
+        doc = self._doc()
+        if dry:
+            self._refuse_dry_run_over_redo(doc)
+        was_edited = self.edited
+        self.edited = True
+        doc.openTransaction(title)
+        committed = False
+        try:
+            out = apply() or {}
             doc.recompute()
             invalid = [o for o in doc.Objects if "Invalid" in o.State]
-            out = {"broken": [o.Name for o in invalid],
-                   "errors": [{"object": o.Name, "error": _object_error(o)} for o in invalid]}
+            out.update({"broken": [o.Name for o in invalid],
+                        "errors": [{"object": o.Name, "error": _object_error(o)} for o in invalid]})
             if dry:
-                out.update(self._trial(title))
+                out.update(self._trial(cause))
                 return out
+            # FreeCAD starts the transaction at the first change: none, and nothing changed.
+            out["document_changed"] = bool(doc.HasPendingTransaction)
             commit_transaction(doc)
             committed = True
         finally:
@@ -1597,7 +1622,77 @@ class Worker(Modelling):
                 doc.recompute()
                 if dry:
                     self.edited = was_edited
-        out.update(self._record_edit(title))
+        if not out["document_changed"]:
+            self.edited = was_edited
+        out.update(self._record_edit(cause))
+        return out
+
+    def cmd_script(self, req):
+        """Run Python source ("code") in this FreeCAD against the open document, as one
+        undoable step and one state: for what the other commands cannot make (surfaces through
+        points, lofts and sweeps, shapes computed in a loop) and for measuring.
+
+        The script sees `doc` (the document), `FreeCAD` (also as `App`), `Part`, `math`,
+        `params` (the request's "params", so one script serves many sizes) and `show(shape,
+        name)`, which puts a shape into the document as the Part::Feature `name` and, when it
+        is there already, replaces its shape: running a script again with other params changes
+        its objects, it does not add copies. What it prints comes back as "output", its
+        variable `result` (when it sets one) as "result", and the names of the objects it added
+        and removed as "created" and "removed". The document is recomputed after it.
+
+        A script that raises, or runs past "timeout" seconds, leaves the document as it was;
+        the error names the script's line. With "dry_run" the document is put back too, and the
+        result kept as a trial state, as `cmd_set_props` does. The script must leave opening,
+        closing, saving, undo and transactions to the worker."""
+        doc = self._doc()
+        code, params = req.get("code"), req.get("params")
+        if not isinstance(code, str) or not code.strip():
+            raise ValueError("no code given")
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            raise ValueError("params is an object of names and values")
+        seconds = float(req.get("timeout") or SCRIPT_SECONDS)
+        try:
+            compiled = compile(code, SCRIPT_NAME, "exec")
+        except SyntaxError as e:
+            raise ScriptError(script_error(e, code, seconds)) from None
+
+        def show(shape, name="Shape"):
+            if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                raise ValueError("show: %r is not an object name (letters, digits and _)" % (name,))
+            o = doc.getObject(name)
+            if o is None:
+                o = doc.addObject("Part::Feature", name)
+            elif o.TypeId != "Part::Feature":
+                raise ValueError("show: %s is a %s, not a plain shape; choose another name" % (name, o.TypeId))
+            o.Shape = shape
+            return o
+
+        scope = {"__name__": "__script__", "FreeCAD": FreeCAD, "App": FreeCAD, "Part": Part, "math": math,
+                 "doc": doc, "params": params, "show": show}
+        before = {o.Name for o in doc.Objects}
+        printed = io.StringIO()
+
+        def apply():
+            try:
+                run_limited(compiled, scope, printed, seconds)
+            except BaseException as e:  # SystemExit and the time limit too: the worker keeps serving
+                raise ScriptError(script_error(e, code, seconds)) from None
+            after = {o.Name for o in doc.Objects}
+            out = {"output": _cut(printed.getvalue()), "created": sorted(after - before),
+                   "removed": sorted(before - after)}
+            if "result" in scope:
+                out["result"] = _jsonable(scope["result"])
+            return out
+
+        title = _short(req.get("title") or "", 60)
+        tips = self._tips()
+        dry = bool(req.get("dry_run"))
+        out = self._edit("Script: " + title if title else "Script", "script: " + title if title else "script", apply, dry)
+        if not dry:
+            self._follow_tips(tips)
+            self._forget_gone()
         return out
 
     def _trial(self, cause):
@@ -3576,6 +3671,95 @@ def error_text(e):
     if isinstance(arg, dict):
         arg = arg.get("sErrMsg") or arg.get("swhat") or arg
     return "%s: %s" % (type(e).__name__, arg)
+
+
+# ---- scripts (see `Worker.cmd_script`) ----
+
+class ScriptError(Exception):
+    """A script failed; the message says how and at which of its lines."""
+
+
+class ScriptStopped(BaseException):
+    """Raised inside a script past its time limit. Not an Exception, so that the script's own
+    `except Exception` does not swallow it."""
+
+
+def run_limited(compiled, scope, printed, seconds):
+    """Execute a compiled script with what it prints going to `printed`. Past `seconds` it gets
+    a ScriptStopped at its next Python instruction, and again every half second while it goes
+    on (it may catch one): a loop in Python ends there, one call into OCCT first runs to its
+    end. A script that got one and still came to its end is stopped all the same."""
+    tid = threading.get_ident()
+    done, late = threading.Event(), threading.Event()
+
+    def watch():
+        wait = seconds
+        while not done.wait(wait):
+            late.set()
+            _raise_in_thread(tid, ScriptStopped)
+            wait = 0.5
+
+    watcher = threading.Thread(target=watch, daemon=True)
+    with contextlib.redirect_stdout(printed):
+        try:
+            watcher.start()
+            exec(compiled, scope)
+        finally:
+            # End the watcher and take back a stop it sent as the script ended, so that none is
+            # raised later, in the worker's own code; one may still land in these very lines.
+            while True:
+                try:
+                    done.set()
+                    watcher.join()
+                    _raise_in_thread(tid, None)
+                    break
+                except ScriptStopped:
+                    pass
+    if late.is_set():
+        raise ScriptStopped()
+
+
+def _raise_in_thread(tid, exc):
+    """Make the thread raise `exc` at its next Python instruction; None takes back one not
+    raised yet."""
+    ctypes.pythonapi.PyThreadState_SetAsyncExc(
+        ctypes.c_ulong(tid), ctypes.py_object(exc) if exc is not None else ctypes.py_object())
+
+
+def script_error(e, code, seconds):
+    """What a script raised and the line of it that did, in one line of text."""
+    line = None
+    for frame in traceback.extract_tb(e.__traceback__):
+        if frame.filename == SCRIPT_NAME:
+            line = frame.lineno  # the innermost of the script's own frames
+    if isinstance(e, ScriptStopped):
+        what = "stopped after %g s, its time limit" % seconds
+    elif isinstance(e, SyntaxError) and line is None and e.filename == SCRIPT_NAME:
+        what, line = "SyntaxError: %s" % e.msg, e.lineno
+    else:
+        what = error_text(e)
+    lines = code.splitlines()
+    if line is None or not 1 <= line <= len(lines):
+        return what
+    return "%s (line %d: %s)" % (what, line, _short(lines[line - 1].strip(), 80))
+
+
+def _cut(text, limit=MAX_SCRIPT_TEXT):
+    return text if len(text) <= limit else text[:limit] + "\n… (%d more characters)" % (len(text) - limit)
+
+
+def _jsonable(value):
+    """A script's result as JSON data; what JSON has no form for (vectors, shapes) as text."""
+    try:
+        text = json.dumps(value, default=str, allow_nan=False)
+        if len(text) <= MAX_SCRIPT_TEXT:
+            return json.loads(text)
+    except Exception:  # no JSON form, NaN, or a `str` of its own that raises
+        try:
+            text = repr(value)
+        except Exception as e:
+            text = "<result: %s>" % error_text(e)
+    return _cut(text)
 
 
 # ---- GuiDocument.xml: colours and visibility, which a headless FreeCAD neither reads nor writes ----

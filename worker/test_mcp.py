@@ -134,6 +134,26 @@ def main(exe, out):
         err, text, _ = m.tool("set_property", object="Pad", property="Length")
         print("neither value nor expression:", err, text[:60])
         assert err
+        dome = "r = params['r']\nshow(Part.makeSphere(r).common(Part.makeBox(2 * r, 2 * r, r, App.Vector(-r, -r, 0))), 'Dome')\nresult = r"
+        err, text, _ = m.tool("run_script", code=dome, params={"r": 10.0}, title="dome")
+        made = json_part(text)
+        print("run_script:", made)
+        assert not err and made["created"] == ["Dome"] and made["changed_bodies"] == ["Dome"] and made["result"] == 10.0, text
+        err, text, _ = m.tool("run_script", code=dome, params={"r": 14.0}, dry_run=True)
+        trial = json_part(text)
+        assert not err and trial["dry_run"] and trial["changed_bodies"] == ["Dome"] and trial["created"] == [], text
+        err, text, imgs = m.tool("slice", state=trial["trial"], before=trial["state_before"], body="Dome", axis="y", offsets=[0.0])
+        assert not err and len(imgs) == 1, text[:300]
+        open(os.path.join(out, "script_dry_run_slice.png"), "wb").write(imgs[0])
+        err, text, _ = m.tool("run_script", code="result = doc.getObject('Dome').Shape.Volume")
+        print("run_script that measures:", text[:160])
+        assert not err and abs(json_part(text)["result"] - 2 / 3 * 3.141592653589793 * 1000) < 1, text
+        err, text, _ = m.tool("run_script", code="show(Part.makeBox(1, 1, 1), 'Junk')\nraise RuntimeError('no')")
+        print("run_script that raises:", err, text[:90])
+        assert err and "line 2" in text, text
+        err, text, _ = m.tool("get_tree")
+        tree = [n["name"] for n in json_part(text)["nodes"]]
+        assert "Dome" in tree and "Junk" not in tree, tree
         saved_to = os.path.join(out, "agent_saved.FCStd")
         if os.path.exists(saved_to):  # from an earlier run into the same out_dir
             os.remove(saved_to)

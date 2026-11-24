@@ -22,7 +22,9 @@ with an earlier state. To try an edit without making it, pass dry_run: the docum
 the result is a trial state (\"t1\", ...) that diff and slice take like any other. A sketch's dimensions \
 are properties named \"Constraints.<name>\" (get_sketch lists them). To model: new_sketch on a plane or \
 flat face, sketch_edit to draw, constrain and dimension (each reply has a picture of the sketch and its \
-closed profiles), then extrude the sketch. After modelling, call validate: it lists the degenerate places \
+closed profiles), then extrude the sketch. For shapes sketches and properties do not make (generated \
+surfaces, lofts, anything computed) run_script runs Python in the window's FreeCAD as one undoable step, \
+with the same states and dry_run. After modelling, call validate: it lists the degenerate places \
 (thin walls, narrow gaps, steps, sharp edges) that sketches missing each other by a hair leave, each with \
 the feature that made it. Nothing is written to disk until save. Lengths are in mm, \
 angles in degrees, volumes in mm^3. The person can pause you from the window or leave \
@@ -151,6 +153,16 @@ pub fn tools() -> Value {
                 "changes": { "type": "array", "minItems": 1, "items": { "type": "object", "properties": change(json!({})), "required": ["object", "property"] } },
                 "dry_run": dry_run
             }, "required": ["changes"] }
+        },
+        {
+            "name": "run_script",
+            "description": "Run a Python script inside the window's FreeCAD, for what the other tools cannot make (a surface through computed points, lofts and sweeps, shapes built in a loop or by a formula) or measure. One undo step and one state, as set_properties; a script that raises, or runs over 5 minutes, leaves the document as it was, and the error names its line. The script sees `doc` (the open document), `FreeCAD` (also `App`), `Part`, `math`, `params`, and `show(shape, name)`: put a Part shape into the document as the object `name`, replacing that object's shape when it exists, so the same code run again with other params changes its result instead of adding a copy. Returns what it printed (output), its variable `result` if it sets one, the objects created and removed, invalid objects with their errors, state_before, state_after and the bodies whose shape changed. Only solids are bodies for diff and slice: an open surface is drawn, but has no states. Leave opening, saving, undo and transactions to the tools.",
+            "inputSchema": { "type": "object", "properties": {
+                "code": { "type": "string", "description": "Python source, e.g. \"show(Part.makeSphere(params['r']), 'Ball')\"." },
+                "params": { "type": "object", "description": "Values the script reads as params[\"name\"]. Keep the numbers here and the code general: to change the shape, send the same code with other params." },
+                "title": { "type": "string", "description": "A few words naming the step, for undo and the timeline." },
+                "dry_run": dry_run
+            }, "required": ["code"] }
         },
         { "name": "undo", "description": "Undo the last model edit.", "inputSchema": { "type": "object", "properties": {} } },
         { "name": "redo", "description": "Redo the last undone edit.", "inputSchema": { "type": "object", "properties": {} } },
