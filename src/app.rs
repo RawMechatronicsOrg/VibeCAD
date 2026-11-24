@@ -39,6 +39,8 @@ struct Node {
     error: bool,
     /// The corners of a construction plane the view draws, in document coordinates.
     plane: Option<[Vec3; 4]>,
+    /// A body's tip: the feature whose shape is the body's, where the rollback marker sits.
+    tip: Option<String>,
 }
 
 #[derive(Default)]
@@ -190,6 +192,8 @@ pub struct App {
     /// The box the ground grid is sized for: the document's last drawn extent, so the grid
     /// stays put when everything is hidden.
     ground: Option<(Vec3, Vec3)>,
+    /// A rollback marker being dragged: its body and the feature it would roll back to.
+    rollback: Option<(String, String)>,
     /// The modelling command whose dialog is open.
     command: Option<Command>,
     /// Construction planes as drawn last frame, in points, for clicks on them.
@@ -235,6 +239,7 @@ impl App {
             window_size: s.window_size,
             maximized: s.maximized,
             ground: None,
+            rollback: None,
             command: None,
             plane_outlines: Vec::new(),
         }
@@ -645,6 +650,7 @@ impl App {
                     let p: Vec<Vec3> = c.iter().filter_map(|q| Some(Vec3::new(q[0].as_f64()? as f32, q[1].as_f64()? as f32, q[2].as_f64()? as f32))).collect();
                     p.try_into().ok()
                 }),
+                tip: n["tip"].as_str().map(String::from),
             });
         }
         t.build_history();
@@ -991,33 +997,75 @@ impl App {
     /// Along the bottom, as in Fusion: every body's features in the order they are built.
     fn timeline_panel(&mut self, ui: &mut egui::Ui) {
         let mut chosen = None;
+        // Where the marker of each body may stop: after a feature that can be its tip.
+        let mut stops: Vec<(String, String, f32)> = Vec::new();
+        let mut markers: Vec<(String, egui::Response)> = Vec::new();
+        let tip_of = |body: &str| match &self.rollback {
+            Some((b, f)) if b == body => Some(f.as_str()),
+            _ => self.tree.nodes.get(body).and_then(|n| n.tip.as_deref()),
+        };
         egui::ScrollArea::horizontal().auto_shrink([false, true]).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 let several = self.tree.history.first().map(|f| &self.tree.owner[f]) != self.tree.history.last().map(|f| &self.tree.owner[f]);
                 let mut body: Option<&String> = None;
+                let mut past_tip = false;
                 for f in &self.tree.history {
                     let Some(node) = self.tree.nodes.get(f) else { continue };
                     let owner = &self.tree.owner[f];
-                    if several && body != Some(owner) {
-                        if body.is_some() {
-                            ui.add_space(6.0);
-                            ui.separator();
+                    if body != Some(owner) {
+                        if several {
+                            if body.is_some() {
+                                ui.add_space(6.0);
+                                ui.separator();
+                            }
+                            let label = self.tree.nodes.get(owner).map_or(owner.as_str(), |n| n.label.as_str());
+                            ui.weak(label);
                         }
-                        let label = self.tree.nodes.get(owner).map_or(owner.as_str(), |n| n.label.as_str());
-                        ui.weak(label);
                         body = Some(owner);
+                        past_tip = false;
                     }
                     let kind = ui_chrome::object_kind(&node.kind);
                     let selected = self.selection.as_ref().is_some_and(|s| &s.obj == f);
-                    let tip = format!("{}  ({})
-{}", node.label, if kind.name.is_empty() { &node.kind } else { kind.name }, kind.about);
-                    if ui_chrome::timeline_step(ui, kind.family, selected, node.error).on_hover_text(tip).clicked() {
+                    let mut tip = format!("{}  ({})\n{}", node.label, if kind.name.is_empty() { &node.kind } else { kind.name }, kind.about);
+                    if past_tip {
+                        tip.push_str("\n\nRolled back: after the marker, not part of the body's shape now.");
+                    }
+                    let step = ui_chrome::timeline_step(ui, kind.family, selected, node.error, past_tip).on_hover_text(tip);
+                    if step.clicked() {
                         chosen = Some(f.clone());
+                    }
+                    if kind.family.makes_shape() {
+                        stops.push((owner.clone(), f.clone(), step.rect.right()));
+                    }
+                    if tip_of(owner) == Some(f.as_str()) {
+                        let marker = ui_chrome::rollback_marker(ui, egui::Id::unique(("rollback", owner)))
+                            .on_hover_text("Rollback marker: the body's shape is made by the features before it.\nDrag it to roll the body back or forward.");
+                        markers.push((owner.clone(), marker));
+                        past_tip = true;
                     }
                 }
             });
         });
+        for (body, m) in markers {
+            if m.dragged()
+                && let Some(x) = m.interact_pointer_pos().map(|p| p.x)
+            {
+                // Snap to the nearest place the marker may stop, as it is dragged.
+                let near = stops.iter().filter(|(b, ..)| *b == body).min_by(|a, b| (a.2 - x).abs().total_cmp(&(b.2 - x).abs()));
+                if let Some((_, f, _)) = near {
+                    self.rollback = Some((body.clone(), f.clone()));
+                }
+            }
+            if m.drag_stopped()
+                && let Some((b, f)) = self.rollback.take().filter(|(b, _)| *b == body)
+                && let Some(n) = self.tree.nodes.get_mut(&b)
+                && n.tip.as_ref() != Some(&f)
+            {
+                n.tip = Some(f.clone());
+                self.request("set_tip", json!({ "body": b, "feature": f }), Pending::Edit);
+            }
+        }
         if let Some(obj) = chosen {
             self.select(Some(Selection { obj, sub: None, face_id: 0 }));
         }
@@ -1595,7 +1643,7 @@ mod tests {
     use super::*;
 
     fn node(kind: &str, children: &[&str]) -> Node {
-        Node { label: String::new(), kind: kind.into(), children: children.iter().map(|c| c.to_string()).collect(), visible: true, error: false, plane: None }
+        Node { label: String::new(), kind: kind.into(), children: children.iter().map(|c| c.to_string()).collect(), visible: true, error: false, plane: None, tip: None }
     }
 
     #[test]

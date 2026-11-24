@@ -830,6 +830,11 @@ pub fn object_kind(type_id: &str) -> ObjectKind {
 }
 
 impl Family {
+    /// Features of this family make a body's shape, so the body's tip may be one of them.
+    pub fn makes_shape(self) -> bool {
+        matches!(self, Family::Add | Family::Cut | Family::Finish | Family::Pattern | Family::Solid)
+    }
+
     fn color(self) -> Color32 {
         match self {
             Family::Body => Color32::from_rgb(70, 130, 200),
@@ -856,8 +861,8 @@ pub fn kind_badge(ui: &mut egui::Ui, family: Family, dim: bool) -> egui::Respons
 }
 
 /// A step of the timeline: the feature's badge on a tile that lights up when hovered or
-/// selected, outlined in red when the feature failed.
-pub fn timeline_step(ui: &mut egui::Ui, family: Family, selected: bool, error: bool) -> egui::Response {
+/// selected, outlined in red when the feature failed, faded when rolled back.
+pub fn timeline_step(ui: &mut egui::Ui, family: Family, selected: bool, error: bool, rolled_back: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(26.0, 26.0), Sense::click());
     if ui.is_rect_visible(rect) {
         let v = ui.style().interact_selectable(&resp, selected);
@@ -868,9 +873,25 @@ pub fn timeline_step(ui: &mut egui::Ui, family: Family, selected: bool, error: b
         if error {
             p.rect_stroke(rect, 4.0, Stroke::new(1.5, Color32::LIGHT_RED), egui::StrokeKind::Inside);
         }
-        paint_badge(p, Rect::from_center_size(rect.center(), Vec2::splat(18.0)), family, false);
+        paint_badge(p, Rect::from_center_size(rect.center(), Vec2::splat(18.0)), family, rolled_back);
     }
     resp
+}
+
+/// The rollback marker, as in Fusion: a bar with a grip after the step that makes the body's
+/// shape. `id` stays the same wherever it is drawn, so a drag follows it as it snaps along.
+pub fn rollback_marker(ui: &mut egui::Ui, id: Id) -> egui::Response {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(10.0, 26.0), Sense::hover());
+    let resp = ui.interact(rect, id, Sense::drag());
+    if ui.is_rect_visible(rect) {
+        let c = if resp.hovered() || resp.dragged() { Color32::from_rgb(245, 160, 50) } else { Color32::from_rgb(214, 120, 30) };
+        let p = ui.painter();
+        let (x, top) = (rect.center().x, rect.top());
+        p.line_segment([pos2(x, top + 6.0), pos2(x, rect.bottom())], Stroke::new(2.0, c));
+        let grip = vec![pos2(x - 4.5, top), pos2(x + 4.5, top), pos2(x + 4.5, top + 5.0), pos2(x, top + 9.0), pos2(x - 4.5, top + 5.0)];
+        p.add(egui::Shape::convex_polygon(grip, c, Stroke::NONE));
+    }
+    resp.on_hover_and_drag_cursor(egui::CursorIcon::ResizeHorizontal)
 }
 
 fn paint_badge(p: &egui::Painter, r: Rect, family: Family, dim: bool) {

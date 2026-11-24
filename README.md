@@ -30,6 +30,13 @@ translucent panels floating over the view (fold them by their header), and a vie
 top-right corner. Click a face of the cube for that view, an edge or a corner for the views in
 between, drag it to orbit; the house next to it goes back to the isometric view.
 
+As in Fusion, the tree lists parts only; what a PartDesign body is built from (sketches, pads,
+pockets, fillets, patterns) is on the timeline along the bottom, in the order it is built, each
+sketch just before the feature made from it. Click a step to select it. The orange rollback
+marker sits after the body's tip, the feature whose shape is the body's: drag it back to see the
+body as it was at an earlier step (the steps after it fade), and forward again. That is FreeCAD's
+Set tip, so it is undone with Undo and saved with the document.
+
 The view has a light background and a ground grid on the XY plane through the origin, as in
 Fusion: minor and major lines (steps of 1, 2, 2.5 or 5 × 10^n mm; a major cell of about 90 pixels,
 so the lines and their labels get finer as you zoom in),
@@ -105,7 +112,7 @@ one and reopens the file.
   random `VIBECAD_TOKEN`; the script connects back and must greet with the token. The listener
   closes after that one connection, and the directory is removed once FreeCAD has read the script. Every message is a JSON header plus an optional binary payload, both
   length-prefixed (see the script's docstring). Commands: `open`, `new`, `tree`, `props`,
-  `set_prop`, `set_visible`, `undo`, `redo`, `scene`, `save_as`, `export`, and the modelling
+  `set_prop`, `set_visible`, `set_tip`, `undo`, `redo`, `scene`, `save_as`, `export`, and the modelling
   ones (`datum_plane`, `extrude`, `fillet`, `mirror`, `pattern`, `copy`, `delete`). Requests go out as
   they are made; replies come back in order, a scene's stream frames before its reply, except
   that `tree` and `props` asked while a scene streams are answered at once, between its frames,
@@ -257,8 +264,9 @@ documents, where the `Pad` steps just report an error.
   from the solid's by more than 2 % is drawn from both sides (correct, only slower).
 - Each edit reloads the tree and the scene; quick edits in a row are not merged.
 - A link to a whole sub-assembly (`App::Part`) is drawn, but tessellated again on every reload.
-- The tree follows `Group` (and a body's origin); PartDesign's habit of showing a sketch under
-  the feature that uses it is not reproduced.
+- The tree and the timeline follow `Group`; a sketch no feature uses stays where it is in its
+  body's order. The rollback marker stops only after features that make a shape (not after a
+  sketch or a datum).
 - Built and run on Windows only so far. On Linux it needs `freecadcmd` on `PATH` (or
   `VIBECAD_FREECAD_CMD`); FreeCAD from Flatpak, Snap or an AppImage is not found yet, and the
   Flatpak and Snap sandboxes may not see the script in the temp directory. File dialogs use the
