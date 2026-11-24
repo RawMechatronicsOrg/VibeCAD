@@ -202,7 +202,6 @@ def main(paths):
     # a document saved from FreeCAD's GUI keeps its colours through a headless save, also in place
     colored = [p for p in paths if p.endswith("EasyScanner.FCStd")]
     if colored:
-        import shutil
         copy = os.path.join(tempfile.gettempdir(), "vibecad_colored.FCStd")
         shutil.copy(colored[0], copy)
         cl.call("open", path=copy)

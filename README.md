@@ -29,8 +29,13 @@ translucent panels floating over the view (fold them by their header), and a vie
 top-right corner. Click a face of the cube for that view, an edge or a corner for the views in
 between, drag it to orbit; the house next to it goes back to the isometric view.
 
-VIEW → DISPLAY also switches the surface grid (a faint grid in document coordinates; on curved
-faces its lines read like contour lines) and the palette (objects that only have FreeCAD's
+The view has a light background and a ground grid on the XY plane through the origin, as in
+Fusion: minor and major lines (steps of 1, 2, 2.5 or 5 × 10^n mm; a major cell of about 90 pixels,
+so the lines and their labels get finer as you zoom in),
+the X axis red and the Y axis green, and the distance from the origin along the two far edges.
+Labels are left out where the ground is seen too edge-on to read. Parts hide the grid; the
+labels are drawn over the view and are not hidden by parts yet.
+VIEW → DISPLAY → Grid switches it. VIEW → DISPLAY also switches the palette (objects that only have FreeCAD's
 default grey get a muted colour each, by their name; off: the document's colours only). The
 EDGE WIDTH slider sets the edge width from 1 to 4 pixels (default 1.5).
 
@@ -72,8 +77,13 @@ one and reopens the file.
   they are made; replies come back in order, a scene's stream frames before its reply.
 - **Scene.** The worker tessellates each distinct shape once (`MeshPart.meshFromShape` with one
   segment per face) and sends instances that place it, so the 265 links of an assembly with 121
-  parts cost 121 meshes. Shapes with more than 20 000 B-rep edges (solids sewn from a mesh) come
-  without them, and the window draws the mesh edges where faces meet at more than 25°.
+  parts cost 121 meshes. Curves are cut into segments of at most 10° (0.17 rad), so circles are round on screen.
+  Edges are taken from the mesh, so they lie exactly on the triangles: where a curved face meets
+  another (a cylinder's rims, a fillet's borders), where flat faces fold by more than 40°, and
+  where they fold by 25-40° in a line that carries on a drawn edge (hysteresis). The facets of a
+  solid sewn from a mesh (a cable, a bought screw) show no seams, and their normals are smoothed
+  where triangles turn by less than 40°, so they shade round. Shapes without faces (sketches)
+  bring their B-rep edges.
 - **Loading in stages.** `scene` streams: first, before any tessellation, every instance's
   placement, colours and its shape's box (FreeCAD's `BoundBox`); the window draws those as
   translucent boxes and fits the view, so the tree, selection and orbiting work at once. Then
@@ -108,11 +118,7 @@ one and reopens the file.
   each segment becomes a screen-facing quad in the vertex shader (from the edge points in a
   storage buffer), clipped at the near plane before the divide, with a soft falloff across its
   width and alpha blending; the ends reach half the width past the points so corners close.
-  Faces carry a depth bias so the edges on them win; hidden edges stay hidden. The grid is
-  computed per pixel from the world position: lines where x, y or z is a multiple of the step
-  (1, 2 or 5 × 10^n mm, about 20 cells across the scene, plus a ten times finer level that
-  appears as you zoom in), each family fading where the surface runs parallel to its planes,
-  anti-aliased with `fwidth`, darkening light surfaces and lightening dark ones by 5–10 %.
+  Faces carry a depth bias so the edges on them win; hidden edges stay hidden.
 - **Picking.** Face ids are drawn in their own single-sample pass into an `R32Uint` target,
   without lighting, only when a click asks: the pass replays the last frame's camera and
   culled instances, scissored to the clicked pixel, and the pixel is read back and mapped to

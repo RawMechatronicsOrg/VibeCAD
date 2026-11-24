@@ -44,8 +44,10 @@ struct U {
     view_proj: mat4x4<f32>,
     light: vec4<f32>,       // xyz: direction the camera looks in
     sel: vec4<u32>,         // x: selected face id, y: selected instance id
-    view: vec4<f32>,        // x, y: viewport in pixels, z: edge width in pixels, w: grid step
-    opts: vec4<u32>,        // x: surface grid on, y: palette colours on
+    view: vec4<f32>,        // x, y: viewport in pixels, z: edge width in pixels
+    opts: vec4<u32>,        // y: palette colours on
+    grid: vec4<f32>,        // ground grid: half size, major step, minor step (mm)
+    bg: vec4<f32>,          // background colour at the bottom of the view
 };
 @group(0) @binding(0) var<uniform> u: U;
 // One RGBA8 colour per global face id - 1.
@@ -76,7 +78,6 @@ struct VOut {
     @location(1) color: vec4<f32>,
     @location(2) @interpolate(flat) face: u32,
     @location(3) @interpolate(flat) inst: u32,
-    @location(4) world: vec3<f32>,
 };
 
 fn model(i: Inst) -> mat4x4<f32> {
@@ -88,7 +89,6 @@ fn vs_face(v: VIn, i: Inst) -> VOut {
     var o: VOut;
     let world = model(i) * vec4<f32>(v.pos, 1.0);
     o.clip = u.view_proj * world;
-    o.world = world.xyz;
     o.normal = mat3x3<f32>(i.n0, i.n1, i.n2) * v.normal;
     let face = i.ids.y + v.face;
     o.color = unpack4x8unorm(face_colors[face]);
@@ -98,20 +98,6 @@ fn vs_face(v: VIn, i: Inst) -> VOut {
     o.face = face + 1u;
     o.inst = i.ids.x;
     return o;
-}
-
-// Lines where the surface crosses the planes x, y or z = k * step, about a pixel wide. A family
-// fades where the surface is parallel to its planes (no blotches, no seams); on curved faces the
-// crossings read as contour lines. Cells smaller than ~10 pixels fade out instead of crowding
-// the view; the finer level comes in that way as you zoom in.
-fn grid(p: vec3<f32>, n: vec3<f32>, step: f32) -> f32 {
-    let c = p / step;
-    let w = max(fwidth(c), vec3<f32>(1e-7));
-    let line = 1.0 - min(abs(fract(c - 0.5) - 0.5) / w, vec3<f32>(1.0));
-    let fade = 1.0 - smoothstep(vec3<f32>(0.05), vec3<f32>(0.1), w);
-    let across = 1.0 - smoothstep(vec3<f32>(0.75), vec3<f32>(0.95), abs(n));
-    let g = line * fade * across;
-    return max(g.x, max(g.y, g.z));
 }
 
 @fragment
@@ -134,15 +120,7 @@ fn fs_face(v: VOut) -> @location(0) vec4<f32> {
     if (v.face == u.sel.x && v.face != 0u) {
         base = mix(base, vec3<f32>(0.20, 0.75, 1.00), 0.65);
     }
-    var c = base * (0.30 * sky + 0.48 * head + 0.24 * key) * rim;
-    // Derivatives need uniform control flow: compute both levels, then apply.
-    let coarse = grid(v.world, n, u.view.w);
-    let fine = grid(v.world, n, u.view.w * 0.1);
-    if (u.opts.x != 0u) {
-        // Darker lines on light surfaces, lighter ones on dark surfaces, where darker would vanish.
-        let ink = select(vec3<f32>(0.0), vec3<f32>(1.0), dot(c, vec3<f32>(0.3, 0.59, 0.11)) < 0.2);
-        c = mix(c, ink, max(0.10 * coarse, 0.05 * fine));
-    }
+    let c = base * (0.30 * sky + 0.48 * head + 0.24 * key) * rim;
     return vec4<f32>(c, 1.0);
 }
 
@@ -185,6 +163,79 @@ fn fs_box(v: BOut) -> @location(0) vec4<f32> {
         base = mix(base, vec3<f32>(0.35, 0.85, 0.45), 0.5);
     }
     return vec4<f32>(base * (0.55 + 0.45 * abs(dot(n, u.light.xyz))), 0.35);
+}
+
+// The background: a vertical gradient from near white at the top to `bg` at the bottom.
+struct BgOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) t: f32,
+};
+
+@vertex
+fn vs_bg(@builtin(vertex_index) i: u32) -> BgOut {
+    var corners = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+    var o: BgOut;
+    o.clip = vec4<f32>(corners[i], 1.0, 1.0);
+    o.t = corners[i].y * 0.5 + 0.5;
+    return o;
+}
+
+@fragment
+fn fs_bg(v: BgOut) -> @location(0) vec4<f32> {
+    let top = mix(u.bg.rgb, vec3<f32>(1.0), 0.85);
+    return vec4<f32>(mix(u.bg.rgb, top, clamp(v.t, 0.0, 1.0)), 1.0);
+}
+
+// The ground grid: a square on z = 0 around the origin, drawn per pixel. Minor and major lines,
+// the outline of the square, and the X (red) and Y (green) axes across it.
+struct GOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) p: vec2<f32>,
+};
+
+@vertex
+fn vs_grid(@builtin(vertex_index) i: u32) -> GOut {
+    var corners = array<vec2<f32>, 6>(vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0),
+                                      vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(-1.0, 1.0));
+    // A little past the outline, so the outline's soft edge is whole.
+    let p = corners[i] * u.grid.x * 1.01;
+    var o: GOut;
+    o.clip = u.view_proj * vec4<f32>(p, 0.0, 1.0);
+    o.p = p;
+    return o;
+}
+
+// How much of a line of the `step` lattice covers this pixel, faded out where cells get smaller
+// than a few pixels so the far grid does not turn into a grey blur.
+fn lattice(p: vec2<f32>, step: f32) -> f32 {
+    let c = p / step;
+    let w = max(fwidth(c), vec2<f32>(1e-6));
+    let line = vec2<f32>(1.0) - min(abs(fract(c - 0.5) - 0.5) / w, vec2<f32>(1.0));
+    let fade = vec2<f32>(1.0) - smoothstep(vec2<f32>(0.12), vec2<f32>(0.3), w);
+    return max(line.x * fade.x, line.y * fade.y);
+}
+
+@fragment
+fn fs_grid(v: GOut) -> @location(0) vec4<f32> {
+    let half = u.grid.x;
+    let fw = max(fwidth(v.p), vec2<f32>(1e-6));
+    // Pixels from the outline, positive inside.
+    let inside = min((half - abs(v.p.x)) / fw.x, (half - abs(v.p.y)) / fw.y);
+    if (inside < -1.0) {
+        discard;
+    }
+    let outline = 1.0 - clamp(abs(inside), 0.0, 1.0);
+    let minor = lattice(v.p, u.grid.z) * step(0.0, inside);
+    let major = lattice(v.p, u.grid.y) * step(0.0, inside);
+    let x_axis = (1.0 - clamp(abs(v.p.y) / fw.y - 0.5, 0.0, 1.0)) * step(0.0, inside);
+    let y_axis = (1.0 - clamp(abs(v.p.x) / fw.x - 0.5, 0.0, 1.0)) * step(0.0, inside);
+    var a = max(max(0.16 * minor, 0.34 * major), 0.62 * outline);
+    var c = vec3<f32>(0.32, 0.33, 0.35);
+    c = mix(c, vec3<f32>(0.90, 0.25, 0.22), x_axis);
+    a = max(a, 0.85 * x_axis);
+    c = mix(c, vec3<f32>(0.25, 0.68, 0.30), y_axis * (1.0 - x_axis));
+    a = max(a, 0.85 * y_axis);
+    return vec4<f32>(c, a);
 }
 
 struct EOut {
@@ -258,6 +309,49 @@ struct Uniforms {
     sel: [u32; 4],
     view: [f32; 4],
     opts: [u32; 4],
+    grid: [f32; 4],
+    bg: [f32; 4],
+}
+
+/// The square ground grid on z = 0 around the origin, sized to the scene: steps of 1, 2, 2.5 or
+/// 5 times a power of ten (25, 50, 75 … mm for a part a few hundred millimetres across), ten
+/// to twenty major cells, five minor ones in each.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GroundGrid {
+    /// Half the side of the square, a whole number of major steps.
+    pub half: f32,
+    pub major: f32,
+    pub minor: f32,
+}
+
+impl GroundGrid {
+    /// For a scene with these bounds (document coordinates).
+    pub fn around(lo: Vec3, hi: Vec3) -> GroundGrid {
+        let reach = [lo.x, hi.x, lo.y, hi.y].iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1.0) * 1.15;
+        let major = nice_step(2.0 * reach / 14.0);
+        GroundGrid { half: (reach / major).ceil().max(2.0) * major, major, minor: major / 5.0 }
+    }
+
+    /// The same square with finer lines as the view zooms in: a major cell of about 90 pixels,
+    /// never coarser than the scene's own step. `px_per_mm` is the view's scale at its centre.
+    pub fn for_scale(self, px_per_mm: f32) -> GroundGrid {
+        if !(px_per_mm > 0.0) {
+            return self;
+        }
+        let major = nice_step(90.0 / px_per_mm).min(self.major).max(self.major * 1e-4);
+        GroundGrid { major, minor: major / 5.0, ..self }
+    }
+}
+
+/// The step of 1, 2, 2.5 or 5 times a power of ten nearest to `raw`.
+fn nice_step(raw: f32) -> f32 {
+    let raw = raw.max(1e-6);
+    let base = 10f32.powf(raw.log10().floor());
+    [1.0f32, 2.0, 2.5, 5.0, 10.0]
+        .into_iter()
+        .map(|m| m * base)
+        .min_by(|a, b| (a.ln() - raw.ln()).abs().total_cmp(&(b.ln() - raw.ln()).abs()))
+        .unwrap_or(base)
 }
 
 /// Per-instance vertex data, `Inst` in the shader.
@@ -356,8 +450,6 @@ struct GpuScene {
     runs: Vec<Run>,
     /// The visible boxes, in the instance buffer after the runs.
     box_range: Range<u32>,
-    /// Spacing of the surface grid, from the size of the scene.
-    grid_step: f32,
 }
 
 /// What the last `set_scene` and `render` cost.
@@ -379,6 +471,8 @@ pub struct Renderer {
     id_pipelines: [wgpu::RenderPipeline; 3],
     edge_pipeline: wgpu::RenderPipeline,
     box_pipeline: wgpu::RenderPipeline,
+    background_pipeline: wgpu::RenderPipeline,
+    grid_pipeline: wgpu::RenderPipeline,
     /// A unit cube, `[0, 1]³`, for the boxes.
     cube: wgpu::Buffer,
     /// Samples per pixel of the colour pass: `MSAA`, or 1 where the GPU lacks it.
@@ -405,10 +499,11 @@ pub struct Frame {
     pub show_edges: bool,
     /// In pixels.
     pub edge_width: f32,
-    pub show_grid: bool,
     /// Colour objects that have only FreeCAD's default grey from `PALETTE`.
     pub palette: bool,
+    /// The colour at the bottom of the view; the top is near white.
     pub background: [f64; 3],
+    pub grid: Option<GroundGrid>,
 }
 
 impl Renderer {
@@ -521,10 +616,11 @@ impl Renderer {
             front_face,
             ..Default::default()
         };
-        // Faces are pushed back a little so the edges on them win the depth test; the slope
-        // term covers the width of an edge quad on a face seen at a grazing angle. The id pass
-        // uses the same bias, so nearly coincident faces sort there as they do on screen.
-        let face_bias = wgpu::DepthBiasState { constant: 2, slope_scale: 2.5, clamp: 0.0 };
+        // Faces are pushed back a little so the edges on them win the depth test. Edges come from
+        // the triangles themselves, so a small push does: a bigger slope term grows with the size
+        // of a pixel and, zoomed out, lets edges behind thin walls show through. The id pass uses
+        // the same bias, so nearly coincident faces sort there as they do on screen.
+        let face_bias = wgpu::DepthBiasState { constant: 1, slope_scale: 1.0, clamp: 0.0 };
         let face_pipelines = std::array::from_fn(|k| {
             let (label, s) = (["faces, both sides", "faces, front", "faces, front, mirrored"][k], sides[k]);
             pipeline(PipelineDesc {
@@ -583,6 +679,33 @@ impl Renderer {
             depth_write: false,
             samples,
         });
+        // Background and grid read no vertex buffers: their corners come from the vertex index.
+        let background_pipeline = pipeline(PipelineDesc {
+            label: "background",
+            vs: "vs_bg",
+            fs: "fs_bg",
+            buffers: &[],
+            targets: &color_target,
+            primitive: triangles((None, wgpu::FrontFace::Ccw)),
+            bias: Default::default(),
+            compare: wgpu::CompareFunction::Always,
+            depth_write: false,
+            samples,
+        });
+        // The grid blends over the faces and writes no depth; pushed back further than the faces,
+        // a face lying on z = 0 (the bottom of a part) covers it instead of flickering with it.
+        let grid_pipeline = pipeline(PipelineDesc {
+            label: "ground grid",
+            vs: "vs_grid",
+            fs: "fs_grid",
+            buffers: &[],
+            targets: &edge_target,
+            primitive: triangles((None, wgpu::FrontFace::Ccw)),
+            bias: wgpu::DepthBiasState { constant: 8, slope_scale: 3.0, clamp: 0.0 },
+            compare: wgpu::CompareFunction::Less,
+            depth_write: false,
+            samples,
+        });
         let cube = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("vibecad box"),
             contents: bytemuck::cast_slice(&unit_cube()),
@@ -608,6 +731,8 @@ impl Renderer {
             id_pipelines,
             edge_pipeline,
             box_pipeline,
+            background_pipeline,
+            grid_pipeline,
             cube,
             samples,
             bind_layout,
@@ -682,7 +807,6 @@ impl Renderer {
             visible: Vec::with_capacity(scene.instances.len()),
             runs: Vec::new(),
             box_range: 0..0,
-            grid_step: scene.bbox.map_or(1.0, |(lo, hi)| grid_step((hi - lo).length())),
         });
         self.stats.upload_ms = started.elapsed().as_secs_f64() * 1e3;
         Ok(())
@@ -882,8 +1006,10 @@ impl Renderer {
             view_proj: f.view_proj.to_cols_array_2d(),
             light: [f.forward.x, f.forward.y, f.forward.z, 0.0],
             sel: [f.selected_face, f.selected_instance, 0, 0],
-            view: [size.0 as f32, size.1 as f32, f.edge_width.clamp(0.5, 8.0), self.scene.as_ref().map_or(1.0, |s| s.grid_step)],
-            opts: [f.show_grid as u32, f.palette as u32, 0, 0],
+            view: [size.0 as f32, size.1 as f32, f.edge_width.clamp(0.5, 8.0), 0.0],
+            opts: [0, f.palette as u32, 0, 0],
+            grid: f.grid.map_or([0.0; 4], |g| [g.half, g.major, g.minor, 1.0]),
+            bg: [f.background[0] as f32, f.background[1] as f32, f.background[2] as f32, 1.0],
         };
         self.queue.write_buffer(&self.ubuf, 0, bytemuck::bytes_of(&u));
         let mut enc = self.device.create_command_encoder(&Default::default());
@@ -917,8 +1043,20 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            // The background and the grid use the uniforms only; any bind group of the layout does.
+            let any_bind = self.scene.as_ref().map(|s| &s.box_bind);
+            if let Some(bind) = any_bind {
+                pass.set_pipeline(&self.background_pipeline);
+                pass.set_bind_group(0, bind, &[]);
+                pass.draw(0..3, 0..1);
+            }
             if let Some(s) = self.scene.as_ref() {
                 draw_faces(&mut pass, s, &self.face_pipelines);
+                if f.grid.is_some() {
+                    pass.set_pipeline(&self.grid_pipeline);
+                    pass.set_bind_group(0, &s.box_bind, &[]);
+                    pass.draw(0..6, 0..1);
+                }
                 if f.show_edges && !s.runs.is_empty() {
                     // Six vertices per segment, two points per segment: three per point.
                     pass.set_pipeline(&self.edge_pipeline);
@@ -1195,15 +1333,6 @@ fn msaa_samples(rs: &egui_wgpu::RenderState) -> u32 {
     if ok { MSAA } else { 1 }
 }
 
-/// Grid spacing for a scene `size` across: about 20 cells, at 1, 2 or 5 times a power of ten.
-fn grid_step(size: f32) -> f32 {
-    let raw = (size / 20.0).max(1e-4);
-    let base = 10f32.powf(raw.log10().floor());
-    let m = (raw / base).ln();
-    let nice = [1.0f32, 2.0, 5.0, 10.0].into_iter().min_by(|a, b| (m - a.ln()).abs().total_cmp(&(m - b.ln()).abs())).unwrap_or(1.0);
-    nice * base
-}
-
 /// A palette colour (RGBA8) for an instance whose faces all have FreeCAD's default grey, chosen
 /// by a stable hash of its object name; 0, keep the document's colours, otherwise.
 fn palette_color(inst: &InstanceInfo) -> u32 {
@@ -1221,15 +1350,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn grid_step_is_one_two_or_five_times_ten_to_the_n() {
-        assert_eq!(grid_step(20.0), 1.0);
-        assert_eq!(grid_step(50.0), 2.0);
-        assert_eq!(grid_step(94.0), 5.0); // the sample plate's diagonal
-        assert!((grid_step(2000.0) - 100.0).abs() < 1e-3);
-        assert!((grid_step(0.4) - 0.02).abs() < 1e-6);
-    }
-
-    #[test]
     fn unit_cube_faces_outward_counter_clockwise() {
         let cube = unit_cube();
         assert_eq!(cube.len(), 36);
@@ -1240,6 +1360,25 @@ mod tests {
             // the normal points away from the centre
             assert!((p(0) - Vec3::splat(0.5)).dot(n) > 0.0);
         }
+    }
+
+    #[test]
+    fn ground_grid_steps_like_fusion() {
+        // the sample plate, 80 x 50 mm from the origin
+        let g = GroundGrid::around(Vec3::ZERO, Vec3::new(80.0, 50.0, 6.0));
+        assert_eq!((g.major, g.minor), (10.0, 2.0));
+        assert!(g.half >= 92.0 && (g.half / g.major).fract() == 0.0, "{g:?}");
+        // a few hundred millimetres across: 25 mm steps, as Fusion shows
+        let g = GroundGrid::around(Vec3::new(-180.0, -170.0, 0.0), Vec3::new(160.0, 175.0, 300.0));
+        assert_eq!(g.major, 25.0);
+        assert!(g.half >= 207.0);
+        // zoomed in, the lines get finer in the same steps, never coarser than the scene's
+        let near = g.for_scale(40.0);
+        assert_eq!((near.major, near.minor, near.half), (2.5, 0.5, g.half));
+        assert_eq!(g.for_scale(0.01).major, 25.0);
+        // a tiny part far from nothing still gets a grid
+        let g = GroundGrid::around(Vec3::splat(0.1), Vec3::splat(0.2));
+        assert!(g.half > 0.0 && g.minor > 0.0);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use glam::Vec2;
 use serde_json::{Value, json};
 
 use crate::camera::{Camera, View};
-use crate::render::{Frame, Renderer};
+use crate::render::{Frame, GroundGrid, Renderer};
 use crate::scene::SceneData;
 use crate::selftest::{SelfTest, Stage, write_bmp};
 use crate::ui_chrome::{self, Action, CubeAction, RibbonState, Tab};
@@ -108,10 +108,10 @@ pub struct App {
     show_edges: bool,
     /// Edge width in pixels.
     edge_width: f32,
-    show_grid: bool,
     /// Default-grey objects get a palette colour each.
     palette: bool,
     show_log: bool,
+    show_grid: bool,
     open_on_ready: Option<PathBuf>,
     /// The document has edits that are not saved.
     modified: bool,
@@ -149,9 +149,9 @@ impl App {
             info: None,
             show_edges: true,
             edge_width: 1.5,
-            show_grid: true,
             palette: true,
             show_log: false,
+            show_grid: true,
             open_on_ready: open,
             modified: false,
             tab: Tab::default(),
@@ -666,12 +666,12 @@ impl App {
     fn overlays(&mut self, ctx: &egui::Context) {
         let Some(view) = self.view_rect else { return };
         let title = self.doc_label.clone().unwrap_or_else(|| "No document".into());
-        ui_chrome::overlay(ctx, "tree", view.left_top() + egui::vec2(10.0, 10.0), egui::Align2::LEFT_TOP, 250.0, view.height() * 0.6, &title, |ui| {
+        ui_chrome::overlay(ctx, "tree", view, view.left_top() + egui::vec2(10.0, 10.0), egui::Align2::LEFT_TOP, 260.0, view.height() - 20.0, &title, |ui| {
             self.tree_panel(ui)
         });
         if self.selection.is_some() {
             let top = view.right_top() + egui::vec2(-10.0, 150.0);
-            ui_chrome::overlay(ctx, "props", top, egui::Align2::RIGHT_TOP, 290.0, view.height() - 200.0, "Properties", |ui| {
+            ui_chrome::overlay(ctx, "props", view, top, egui::Align2::RIGHT_TOP, 290.0, view.height() - 200.0, "Properties", |ui| {
                 self.props_panel(ui)
             });
         }
@@ -714,7 +714,9 @@ impl App {
             } else if !node.visible {
                 text = text.weak();
             }
-            if ui.selectable_label(selected, text).on_hover_text(format!("{}\n{}", name, node.kind)).clicked() {
+            // Cut long names to the panel's width; the full one is in the tooltip.
+            let tip = format!("{}\n{}\n{}", node.label, name, node.kind);
+            if ui.add(egui::Button::selectable(selected, text).truncate()).on_hover_text(tip).clicked() {
                 actions.push(TreeAction::Select(name.to_string()));
             }
         };
@@ -780,7 +782,8 @@ impl App {
         ui.label(&name).on_hover_text(p["type"].as_str().unwrap_or(""));
         let kind = p["kind"].as_str().unwrap_or("text");
         if p["readonly"].as_bool() == Some(true) || kind == "text" {
-            ui.label(p["text"].as_str().unwrap_or(""));
+            let text = p["text"].as_str().unwrap_or("");
+            ui.add(egui::Label::new(text).truncate()).on_hover_text(text);
             return;
         }
         let buf = self.edits.entry(name.clone()).or_insert_with(|| match kind {
@@ -906,11 +909,14 @@ impl App {
         }
 
         let dark = ui.visuals().dark_mode;
-        let f = self.frame(size, if dark { [0.035, 0.04, 0.05] } else { [0.78, 0.80, 0.84] });
+        let f = self.frame(size, if dark { [0.035, 0.04, 0.05] } else { BACKGROUND });
         self.renderer.render(size, &f);
         if let Some(tex) = self.renderer.texture_id {
             let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
             ui.painter().image(tex, rect, uv, Color32::WHITE);
+        }
+        if let Some(grid) = f.grid {
+            ui_chrome::ground_labels(&ui.painter_at(rect), grid, rect, f.view_proj, f.forward);
         }
         self.view_rect = Some(rect);
         if let CubeAction::Home = ui_chrome::view_cube(ui, rect, &mut self.camera) {
@@ -1123,16 +1129,20 @@ impl App {
             selected_instance,
             show_edges: self.show_edges,
             edge_width: self.edge_width,
-            show_grid: self.show_grid,
             palette: self.palette,
             background,
+            grid: self
+                .show_grid
+                .then(|| self.scene.as_ref().and_then(|s| s.data.bbox))
+                .flatten()
+                .map(|(lo, hi)| GroundGrid::around(lo, hi).for_scale(self.camera.px_per_unit(size.1 as f32))),
         }
     }
 
     /// Redraw the view with the current selection (the self-test captures between frames).
     fn render_now(&mut self) {
         if let Some(size) = self.renderer.size() {
-            let f = self.frame(size, [0.78, 0.80, 0.84]);
+            let f = self.frame(size, BACKGROUND);
             self.renderer.render(size, &f);
         }
     }
@@ -1140,7 +1150,7 @@ impl App {
     /// What the scene and the current view cost, for the self-test report.
     fn perf(&mut self) -> Value {
         let Some(size) = self.renderer.size() else { return Value::Null };
-        let f = self.frame(size, [0.78, 0.80, 0.84]);
+        let f = self.frame(size, BACKGROUND);
         let frame_ms = self.renderer.bench(size, &f, 30);
         let s = self.renderer.stats;
         json!({
@@ -1156,6 +1166,9 @@ impl App {
         })
     }
 }
+
+/// The bottom of the view's light background; the top is near white.
+const BACKGROUND: [f64; 3] = [0.84, 0.86, 0.89];
 
 fn start_worker(ctx: &egui::Context) -> Worker {
     let ctx = ctx.clone();

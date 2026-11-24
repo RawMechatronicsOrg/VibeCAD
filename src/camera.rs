@@ -104,6 +104,11 @@ impl Camera {
     }
 
     /// Scroll in points; positive zooms in.
+    /// Pixels per document unit at the target, in a view `height_px` high.
+    pub fn px_per_unit(&self, height_px: f32) -> f32 {
+        height_px / (2.0 * self.distance * (FOV_Y * 0.5).tan())
+    }
+
     pub fn zoom(&mut self, steps: f32) {
         self.distance = (self.distance * (-steps * 0.0015).exp()).clamp(self.radius * 1e-3, self.radius * 1e3);
     }

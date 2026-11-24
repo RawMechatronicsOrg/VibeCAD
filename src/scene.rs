@@ -3,9 +3,11 @@
 //! `SceneData` holds what is known so far; `add_meshes` takes in one batch.
 //!
 //! The worker sends each shape once, with points shared between its faces. Here every vertex is
-//! split per face (so a face has its own normals and its own id for picking) and edges are added:
-//! the B-rep edges when the worker sent them, otherwise the mesh edges where two faces meet at an
-//! angle. Instances are not copied; the GPU places each mesh once per instance. Faces are
+//! split per face (so a face has its own id for picking) and edges are taken from the mesh itself,
+//! so they lie exactly on the triangles: where two faces meet at an angle, or where a curved face
+//! meets another (a cylinder's rim, a fillet's border). Shapes without faces (sketches, wires)
+//! come with their B-rep edges instead. Normals are smoothed across faces that meet flatter than
+//! `SMOOTH_DEG`, so a solid sewn from a coarse mesh (a cable, a screw) shades round, not faceted. Instances are not copied; the GPU places each mesh once per instance. Faces are
 //! numbered in the order their meshes arrive, so ids already given out never change.
 
 use std::collections::HashMap;
@@ -15,8 +17,17 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use serde_json::Value;
 
-/// Edges between faces sharper than this are drawn when the shape has no B-rep edges.
-const FEATURE_ANGLE_DEG: f32 = 25.0;
+/// Where two flat faces meet, an edge is drawn if they fold by more than `STRONG_EDGE_DEG`, or by
+/// more than `WEAK_EDGE_DEG` when it carries on in a straight line from an edge that is drawn
+/// (edge detection with hysteresis). A coarse mesh of a round part (a cable) folds by 20-35
+/// degrees all over: its seams stay hidden instead of showing as scattered dashes, while a crease
+/// that softens along its length stays one line.
+const WEAK_EDGE_DEG: f32 = 25.0;
+const STRONG_EDGE_DEG: f32 = 40.0;
+/// How far a weak edge may turn from the line it continues.
+const CONTINUE_DEG: f32 = 30.0;
+/// Triangles whose normals differ by less than this are shaded as one smooth surface.
+const SMOOTH_DEG: f32 = 40.0;
 /// FreeCAD's default shape colour, 0.8 grey: what an object without colours of its own has.
 pub const DEFAULT_COLOR: [u8; 4] = [204, 204, 204, 255];
 
@@ -264,74 +275,158 @@ fn prepare_mesh(m: &Value, payload: &[u8]) -> Result<Mesh> {
         bail!("mesh index out of range");
     }
 
-    // Split shared points per face; area-weighted normals smooth within a face, sharp between faces.
+    // Split shared points per face, so that every face has its own vertices and id.
+    let canon = weld(&pts);
     let mut split: HashMap<u64, u32> = HashMap::with_capacity(points * 2);
     let mut faces = m["faces"].as_u64().unwrap_or(0) as u32;
     let mut vertices: Vec<Vertex> = Vec::with_capacity(points * 2);
-    let mut normals: Vec<Vec3> = Vec::with_capacity(points * 2);
+    let mut face_normal: Vec<Vec3> = Vec::with_capacity(points * 2);
+    let mut vertex_point: Vec<u32> = Vec::with_capacity(points * 2);
     let mut indices = Vec::with_capacity(triangles * 3);
+    // Area-weighted normals; `unit` for the angle tests.
     let tri_normal: Vec<Vec3> = corners
         .chunks_exact(3)
         .map(|t| (pts[t[1] as usize] - pts[t[0] as usize]).cross(pts[t[2] as usize] - pts[t[0] as usize]))
         .collect();
+    let unit: Vec<Vec3> = tri_normal.iter().map(|n| n.normalize_or_zero()).collect();
+    let mut around: Vec<Vec<u32>> = vec![Vec::new(); points];
     for (t, tri) in corners.chunks_exact(3).enumerate() {
         let f = tri_face[t];
         faces = faces.max(f + 1);
         for &c in tri {
+            around[canon[c as usize] as usize].push(t as u32);
             let key = (c as u64) << 32 | f as u64;
             let idx = *split.entry(key).or_insert_with(|| {
                 vertices.push(Vertex { pos: pts[c as usize].to_array(), normal: [0.0; 3], face: f });
-                normals.push(Vec3::ZERO);
+                face_normal.push(Vec3::ZERO);
+                vertex_point.push(canon[c as usize]);
                 vertices.len() as u32 - 1
             });
-            normals[idx as usize] += tri_normal[t];
+            face_normal[idx as usize] += tri_normal[t];
             indices.push(idx);
         }
     }
-    for (v, n) in vertices.iter_mut().zip(&normals) {
-        v.normal = n.normalize_or_zero().to_array();
+    // Smooth across faces: every triangle at the point that turns less than SMOOTH_DEG from the
+    // vertex's own face counts, so sharp folds stay sharp and facets of a curve blend.
+    let cos_smooth = SMOOTH_DEG.to_radians().cos();
+    for (i, v) in vertices.iter_mut().enumerate() {
+        let own = face_normal[i].normalize_or_zero();
+        let smooth: Vec3 = around[vertex_point[i] as usize]
+            .iter()
+            .filter(|&&t| unit[t as usize].dot(own) > cos_smooth)
+            .map(|&t| tri_normal[t as usize])
+            .sum();
+        v.normal = smooth.try_normalize().unwrap_or(own).to_array();
     }
 
     let edges = if m["brep_edges"].as_bool() == Some(true) {
         eidx.iter().map(|&i| epts[i as usize].to_array()).collect()
     } else {
-        feature_edges(&pts, &corners, &tri_face, &tri_normal).iter().map(Vec3::to_array).collect()
+        let mut curved = vec![false; faces as usize];
+        for f in m["curved_faces"].as_array().map(Vec::as_slice).unwrap_or(&[]).iter().filter_map(Value::as_u64) {
+            if let Some(c) = curved.get_mut(f as usize) {
+                *c = true;
+            }
+        }
+        mesh_edges(&pts, &canon, &corners, &tri_face, &unit, &curved).iter().map(Vec3::to_array).collect()
     };
     Ok(Mesh { vertices, indices, edges, faces, closed: m["closed"].as_bool() == Some(true) })
 }
 
-/// Mesh edges on the outline, or between faces that meet at more than `FEATURE_ANGLE_DEG`.
-fn feature_edges(pts: &[Vec3], corners: &[u32], tri_face: &[u32], tri_normal: &[Vec3]) -> Vec<Vec3> {
-    let cos_limit = FEATURE_ANGLE_DEG.to_radians().cos();
-    // edge -> (first triangle, how many triangles share it, whether it is already drawn)
-    let mut seen: HashMap<(u32, u32), (u32, u32, bool)> = HashMap::with_capacity(corners.len());
-    let mut lines = Vec::new();
+/// For every point, the index of the first point at the same position: a face meshed on its own
+/// repeats the points it shares with its neighbours.
+fn weld(pts: &[Vec3]) -> Vec<u32> {
+    let (lo, hi) = bounds(pts.iter().copied()).unwrap_or((Vec3::ZERO, Vec3::ONE));
+    let quantum = ((hi - lo).length() * 1e-6).max(1e-9);
+    let mut first: HashMap<[i64; 3], u32> = HashMap::with_capacity(pts.len());
+    pts.iter()
+        .enumerate()
+        .map(|(i, p)| *first.entry((*p / quantum).round().to_array().map(|x| x as i64)).or_insert(i as u32))
+        .collect()
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Strength {
+    Strong,
+    Weak,
+}
+
+/// The edges to draw, as a line list of mesh points (see `WEAK_EDGE_DEG`): the outline of open
+/// shells, borders where a curved face meets another, sharp folds between flat faces, and gentler
+/// folds that continue a drawn line. Never lines inside one face, so a cylinder shows its rims
+/// and not its facets.
+fn mesh_edges(pts: &[Vec3], canon: &[u32], corners: &[u32], tri_face: &[u32], unit: &[Vec3], curved: &[bool]) -> Vec<Vec3> {
+    let (cos_weak, cos_strong) = (WEAK_EDGE_DEG.to_radians().cos(), STRONG_EDGE_DEG.to_radians().cos());
+    let is_curved = |f: u32| curved.get(f as usize).copied().unwrap_or(false);
+    // edge (by welded points) -> (first triangle, second triangle, how many triangles share it)
+    let mut shared: HashMap<(u32, u32), (u32, u32, u32)> = HashMap::with_capacity(corners.len());
     for (t, tri) in corners.chunks_exact(3).enumerate() {
         for k in 0..3 {
-            let (a, b) = (tri[k], tri[(k + 1) % 3]);
-            let key = if a < b { (a, b) } else { (b, a) };
-            let entry = seen.entry(key).or_insert((t as u32, 0, false));
-            entry.1 += 1;
-            if entry.1 == 2 && !entry.2 {
-                let o = entry.0 as usize;
-                if tri_face[o] != tri_face[t] {
-                    let (n1, n2) = (tri_normal[o].normalize_or_zero(), tri_normal[t].normalize_or_zero());
-                    if n1 != Vec3::ZERO && n2 != Vec3::ZERO && n1.dot(n2) < cos_limit {
-                        entry.2 = true;
-                        lines.push(pts[key.0 as usize]);
-                        lines.push(pts[key.1 as usize]);
-                    }
+            let (a, b) = (canon[tri[k] as usize], canon[tri[(k + 1) % 3] as usize]);
+            if a == b {
+                continue;
+            }
+            let e = shared.entry(if a < b { (a, b) } else { (b, a) }).or_insert((t as u32, u32::MAX, 0));
+            if e.2 == 1 {
+                e.1 = t as u32;
+            }
+            e.2 += 1;
+        }
+    }
+    let mut candidates: Vec<((u32, u32), Strength)> = Vec::new();
+    for (&key, &(t1, t2, count)) in &shared {
+        let strength = if count != 2 {
+            Some(Strength::Strong) // an outline, or a seam of more than two faces
+        } else {
+            let (fa, fb) = (tri_face[t1 as usize], tri_face[t2 as usize]);
+            let fold = unit[t1 as usize].dot(unit[t2 as usize]);
+            if fa == fb {
+                None
+            } else if is_curved(fa) || is_curved(fb) || fold < cos_strong {
+                Some(Strength::Strong)
+            } else if fold < cos_weak {
+                Some(Strength::Weak)
+            } else {
+                None
+            }
+        };
+        if let Some(s) = strength {
+            candidates.push((key, s));
+        }
+    }
+    // Hysteresis: from every strong edge, follow weak edges that carry on in a straight line.
+    let mut at_point: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (i, &((a, b), _)) in candidates.iter().enumerate() {
+        at_point.entry(a).or_default().push(i);
+        at_point.entry(b).or_default().push(i);
+    }
+    let cos_continue = CONTINUE_DEG.to_radians().cos();
+    let mut keep: Vec<bool> = candidates.iter().map(|(_, s)| *s == Strength::Strong).collect();
+    let mut stack: Vec<usize> = (0..candidates.len()).filter(|&i| keep[i]).collect();
+    while let Some(i) = stack.pop() {
+        let (a, b) = candidates[i].0;
+        for (at, from) in [(a, b), (b, a)] {
+            let back = (pts[from as usize] - pts[at as usize]).normalize_or_zero();
+            for &j in at_point.get(&at).map(Vec::as_slice).unwrap_or(&[]) {
+                if keep[j] {
+                    continue;
+                }
+                let (c, d) = candidates[j].0;
+                let to = if c == at { d } else { c };
+                let ahead = (pts[to as usize] - pts[at as usize]).normalize_or_zero();
+                if back.dot(ahead) < -cos_continue {
+                    keep[j] = true;
+                    stack.push(j);
                 }
             }
         }
     }
-    for (&(a, b), &(_, count, drawn)) in &seen {
-        if count != 2 && !drawn {
-            lines.push(pts[a as usize]);
-            lines.push(pts[b as usize]);
-        }
-    }
-    lines
+    candidates
+        .iter()
+        .zip(&keep)
+        .filter(|(_, k)| **k)
+        .flat_map(|(((a, b), _), _)| [pts[*a as usize], pts[*b as usize]])
+        .collect()
 }
 
 fn matrix(v: &Value) -> Result<Mat4> {
@@ -465,6 +560,78 @@ mod tests {
         let batch = parse_meshes(&h, &p).unwrap();
         // once per mesh: the shared edge (90 degrees) plus 4 outline edges
         assert_eq!(batch.meshes[0].1.edges.len(), 5 * 2);
+    }
+
+    /// Two triangles of a square meeting 10 degrees out of plane, as two faces; with `shared`
+    /// false each face repeats the two points on the fold, as a face meshed on its own does.
+    fn shallow(shared: bool, curved: &[u32]) -> Mesh {
+        let z = 10f32.to_radians().tan();
+        let (pts, tris): (Vec<f32>, Vec<u32>) = if shared {
+            (vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, -1.0, z], vec![0, 1, 2, 0, 3, 1])
+        } else {
+            (vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, -1.0, z, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0], vec![0, 1, 2, 4, 3, 5])
+        };
+        let p = payload(&pts, &tris, &[0, 1]);
+        let h = json!({"meshes": [{"index": 0, "points": pts.len() / 3, "triangles": 2, "faces": 2, "brep_edges": false,
+                                   "curved_faces": curved, "closed": false, "edge_points": 0, "edge_segments": 0,
+                                   "offset": 0, "size": p.len()}]});
+        parse_meshes(&h, &p).unwrap().meshes.remove(0).1
+    }
+
+    #[test]
+    fn a_shallow_seam_between_flat_faces_is_not_drawn() {
+        // only the 4 outline edges: the facets of a sewn mesh read as one surface
+        assert_eq!(shallow(true, &[]).edges.len(), 4 * 2);
+    }
+
+    #[test]
+    fn a_curved_face_keeps_its_border_even_where_it_meets_smoothly() {
+        // a fillet or a cylinder's rim: the shallow seam is drawn because face 1 is curved
+        assert_eq!(shallow(true, &[1]).edges.len(), 5 * 2);
+    }
+
+    #[test]
+    fn points_repeated_per_face_are_matched_by_position() {
+        // without matching, the fold would count as two outline edges and be drawn twice
+        assert_eq!(shallow(false, &[]).edges.len(), 4 * 2);
+        assert_eq!(shallow(false, &[1]).edges.len(), 5 * 2);
+    }
+
+    /// A crease along the x axis in two halves, four faces: on the left the faces fold by
+    /// `left` degrees, on the right by `right`.
+    fn two_part_crease(left: f32, right: f32) -> Mesh {
+        let (zl, zr) = (left.to_radians().tan(), right.to_radians().tan());
+        #[rustfmt::skip]
+        let pts = [
+            0.0, 0.0, 0.0,  1.0, 0.0, 0.0,  2.0, 0.0, 0.0,   // the crease: 0 1 2
+            0.5, 1.0, 0.0,  1.5, 1.0, 0.0,                   // flat side: 3 4
+            0.5, -1.0, zl,  1.5, -1.0, zr,                   // folded side: 5 6
+        ];
+        let tris = [0, 1, 3, 0, 5, 1, 1, 2, 4, 1, 6, 2];
+        let p = payload(&pts, &tris, &[0, 1, 2, 3]);
+        let h = json!({"meshes": [{"index": 0, "points": 7, "triangles": 4, "faces": 4, "brep_edges": false,
+                                   "closed": false, "edge_points": 0, "edge_segments": 0, "offset": 0, "size": p.len()}]});
+        parse_meshes(&h, &p).unwrap().meshes.remove(0).1
+    }
+
+    #[test]
+    fn a_gentle_fold_is_drawn_only_where_it_continues_a_sharp_one() {
+        // 8 outline edges, plus the sharp left half and the 30-degree right half that carries it on
+        assert_eq!(two_part_crease(80.0, 30.0).edges.len(), 10 * 2);
+        // a 30-degree fold on its own, as on a coarse cable, is not drawn
+        assert_eq!(two_part_crease(10.0, 30.0).edges.len(), 8 * 2);
+    }
+
+    #[test]
+    fn shading_is_smooth_across_a_gentle_fold_and_sharp_across_a_steep_one() {
+        let normals_at_origin = |m: &Mesh| -> Vec<Vec3> {
+            m.vertices.iter().filter(|v| v.pos == [0.0, 0.0, 0.0]).map(|v| Vec3::from(v.normal)).collect()
+        };
+        let gentle = normals_at_origin(&shallow(true, &[]));
+        assert_eq!(gentle.len(), 2);
+        assert!(gentle[0].dot(gentle[1]) > 0.9999, "{gentle:?}");
+        let steep = normals_at_origin(&two_part_crease(80.0, 30.0));
+        assert!(steep[0].dot(steep[1]) < 0.5, "{steep:?}");
     }
 
     #[test]

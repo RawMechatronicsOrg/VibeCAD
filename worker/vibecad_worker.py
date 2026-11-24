@@ -55,7 +55,10 @@ BATCH_SECONDS = 0.3
 # Requests that change what the scene shows; one arriving during a scene stream ends it.
 ENDS_SCENE = {"scene", "open", "new", "set_prop", "undo", "redo", "set_visible"}
 # Part of every disk cache key: bump when `encode_mesh` changes what it writes.
-CACHE_VERSION = 1
+# Largest angle, in radians, one segment of a curve may turn by: 10 degrees, so circles are
+# round on screen and the rims of parts that sit in each other's holes line up closely.
+ANGULAR_DEFLECTION = 0.17
+CACHE_VERSION = 3  # 2: meshes carry "curved_faces", B-rep edges only for shapes without faces; 3: finer angle
 CACHE_LIMIT = 1 << 30
 
 
@@ -139,18 +142,35 @@ class Worker:
     # ---- tree and properties ---------------------------------------------------------
 
     def cmd_tree(self, req):
+        """The model tree, with what only gets in the way left out: origins with their axes and
+        planes (not drawn), hidden objects that App::Links show elsewhere (the source of every
+        occurrence of a part), and groups left empty by that."""
         doc = self._doc()
+        objects = doc.Objects
+        linked = set()
+        for o in objects:
+            if o.TypeId in ("App::Link", "App::LinkElement"):
+                target = getattr(o, "LinkedObject", None)
+                if target is not None and target.Document == doc:
+                    linked.add(target.Name)
+        omit = {o.Name for o in objects
+                if _is_datum(o) or (o.Name in linked and not self._visible(o))}
+        groups = {o.Name: [c.Name for c in (getattr(o, "Group", None) or [])] for o in objects}
+        # A group whose members are all left out goes too; repeat for groups of such groups.
+        changed = True
+        while changed:
+            changed = False
+            for name, members in groups.items():
+                if name not in omit and members and all(m in omit for m in members):
+                    omit.add(name)
+                    changed = True
         in_group = set()
         nodes = []
-        for o in doc.Objects:
-            children = [c.Name for c in (getattr(o, "Group", None) or [])]
-            # A Body or Part holds its Origin outside Group; the Origin holds its axes and planes.
-            origin = getattr(o, "Origin", None)
-            if origin is not None and hasattr(origin, "OriginFeatures"):
-                children.insert(0, origin.Name)
-            if o.isDerivedFrom("App::Origin"):
-                children = [f.Name for f in o.OriginFeatures]
-            in_group.update(children)
+        for o in objects:
+            if o.Name in omit:
+                continue
+            children = [c for c in groups[o.Name] if c not in omit]
+            in_group.update(groups[o.Name])
             nodes.append({
                 "name": o.Name,
                 "label": o.Label,
@@ -159,7 +179,7 @@ class Worker:
                 "visible": self._visible(o),
                 "error": "Invalid" in o.State or "Error" in o.State,
             })
-        roots = [o.Name for o in doc.Objects if o.Name not in in_group]
+        roots = [o.Name for o in objects if o.Name not in in_group and o.Name not in omit]
         return {"nodes": nodes, "roots": roots, "undo": doc.UndoCount, "redo": doc.RedoCount}
 
     def cmd_props(self, req):
@@ -271,7 +291,12 @@ class Worker:
             u32[3 * triangles]  triangle corners
             u32[triangles]      face of each triangle, 0-based ("Face1" is 0)
             f32[3 * edge_points] and u32[2 * edge_segments]  B-rep edges as a line list,
-                                only when "brep_edges" is true
+                                only when "brep_edges" is true: for shapes without faces
+                                (sketches, wires). Edges of faces are taken from the mesh by the
+                                window, so they lie exactly on the triangles.
+        "curved_faces" lists the faces that are not planes; the window draws the edges where a
+        curved face meets another face even when they meet smoothly (a fillet, a cylinder's rim),
+        but not the seams between flat facets of a solid sewn from a mesh.
         A mesh is "closed" when it bounds closed solids with every triangle facing out
         (counter-clockwise seen from outside), so the window may skip triangles facing away.
         """
@@ -538,7 +563,7 @@ def placed_shape(o):
 
 
 def encode_mesh(shape, tol):
-    mesh = MeshPart.meshFromShape(Shape=shape, LinearDeflection=tol, AngularDeflection=0.35,
+    mesh = MeshPart.meshFromShape(Shape=shape, LinearDeflection=tol, AngularDeflection=ANGULAR_DEFLECTION,
                                   Relative=False, Segments=True)
     points, facets = mesh.Topology
     pos = array.array("f")
@@ -561,7 +586,8 @@ def encode_mesh(shape, tol):
     nfaces = len(faces)
     epos, eidx = array.array("f"), array.array("I")
     edges = shape.Edges
-    brep_edges = len(edges) <= MAX_BREP_EDGES
+    brep_edges = not faces and len(edges) <= MAX_BREP_EDGES
+    curved = [i for i, f in enumerate(faces) if not isinstance(f.Surface, Part.Plane)]
     if brep_edges:
         for edge in edges:
             try:
@@ -575,6 +601,7 @@ def encode_mesh(shape, tol):
                 eidx.extend((base + k, base + k + 1))
     meta = {"points": len(pos) // 3, "triangles": len(tri) // 3, "faces": nfaces,
             "brep_edges": brep_edges, "edge_points": len(epos) // 3, "edge_segments": len(eidx) // 2,
+            "curved_faces": curved,
             "closed": is_closed_outward(shape, pos, tri)}
     blob = b"".join(a.tobytes() for a in (pos, tri, face_of, epos, eidx))
     return meta, blob
