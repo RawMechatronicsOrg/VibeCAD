@@ -91,6 +91,16 @@ MAX_STATES = 200
 MAX_SLICES = 24
 # Points of the outlines of one `slice` reply, all cuts together; past it they are coarser.
 MAX_OUTLINE_POINTS = 200000
+# `validate`: what is too small to be meant when the request does not say (mm, and never more
+# than a thousandth of the bodies' box), the sharpest edge left alone (degrees), the seconds
+# one request gets, the findings kept per body, the places listed, and the faces past which
+# a body is left alone (a solid sewn from a mesh is small all over).
+MIN_SIZE = 0.1
+MIN_ANGLE = 10.0
+VALIDATE_SECONDS = 30.0
+MAX_FINDINGS = 1000
+MAX_PLACES = 100
+MAX_VALIDATE_FACES = 20000
 # Requests answered while a scene streams, between two of its frames: they only read.
 ANSWERED_DURING_SCENE = {"tree", "props", "sketch", "edges", "face"}
 # Tessellators that have not connected this long after their start are given up.
@@ -1757,9 +1767,14 @@ class Worker(Modelling):
         "offsets", or "count" of them spread evenly over the bodies. With "before", each cut is
         split into what both states have ("same"), what only `state` has ("added") and what only
         `before` had ("removed"). Outlines are in the plane's own coordinates (u, v), given by
-        "basis"."""
+        "basis". With "box" ([x0, y0, z0, x1, y1, z1]) only what lies in it is cut, at the
+        box's own scale: a close look at one place."""
         after = self._pick_bodies(self._state(req.get("state")), req.get("body"))
         before = self._pick_bodies(self._state(req["before"]), req.get("body")) if req.get("before") else None
+        if req.get("box") is not None:
+            box = clip_box(req["box"])
+            after = clipped(after, box)
+            before = clipped(before, box) if before is not None else None
         normal = plane_normal(req)
         count = min(max(int(req.get("count", 5)), 1), MAX_SLICES)
         offsets = req.get("offsets")
@@ -1817,6 +1832,140 @@ class Worker(Modelling):
                                                      {k: before[k] for k in names if k in before},
                                                      n, [round(n.dot(c), 6)], 1)
         return out
+
+    def cmd_validate(self, req):
+        """Run the validators (see `VALIDATORS`; "validators" names some, default all) over the
+        bodies of `state`, or over "body", and list the places they found, worst first.
+
+        A place is what lies together: its "kind" (that of its worst finding), "kinds" (how
+        many findings of each), "what" (the worst of them in words), "size" in mm (the smallest: a wall's thickness, a gap's or
+        a strip's width, an edge's length) and "angle" in degrees (the sharpest edge), "at" (a
+        point in it), "bbox", and the "faces" and "edges" involved, named as the body's shape
+        numbers them. "min_size" (mm) and "min_angle" (degrees) say what is too small; the
+        reply has the values used.
+
+        For the document as it is now, a place in a PartDesign body carries "since": the
+        feature at which it first shows, and the sketches that feature is built from. With
+        "sections": n, the first n places carry "section": a cut through the place as `slice`
+        gives it, of a small box around it ("view_box"; `slice` takes it as "box").
+
+        "seconds" bounds the work (default VALIDATE_SECONDS); bodies it did not reach, or did
+        not finish, say so in "bodies", and "incomplete" is true."""
+        current = req.get("state") in (None, "", "current")
+        shapes = self._pick_bodies(self._state(req.get("state")), req.get("body"))
+        if req.get("body") and not shapes:
+            raise KeyError("no solid body named %s in that state" % (req["body"],))
+        names = req.get("validators") or list(VALIDATORS)
+        if isinstance(names, str):
+            names = [names]
+        unknown = [n for n in names if n not in VALIDATORS]
+        if unknown:
+            raise ValueError("no validator %s; there are: %s" % (", ".join(map(str, unknown)), ", ".join(VALIDATORS)))
+        names = list(dict.fromkeys(names))  # each once
+        sections = req.get("sections") or 0
+        if isinstance(sections, bool) or not isinstance(sections, int) or not 0 <= sections <= MAX_SLICES:
+            raise ValueError("sections is a whole number from 0 to %d" % MAX_SLICES)
+        box = FreeCAD.BoundBox()
+        for s, _ in shapes.values():
+            box.add(s.BoundBox)
+        diag = box.DiagonalLength if box.isValid() and _finite(box.DiagonalLength) else 0.0
+        opts = {"min_size": _positive(req.get("min_size"), "min_size") or min(MIN_SIZE, max(diag / 1000.0, 1e-4)),
+                "min_angle": _positive(req.get("min_angle"), "min_angle") or MIN_ANGLE}
+        if opts["min_angle"] >= 90:
+            raise ValueError("min_angle is under 90 degrees")
+        deadline = time.time() + (_positive(req.get("seconds"), "seconds") or VALIDATE_SECONDS)
+
+        def tick():
+            if time.time() > deadline:
+                raise OutOfTime
+
+        bodies, places, late = [], [], False
+        for name in sorted(shapes):
+            shape, label = shapes[name]
+            entry = {"body": name, "label": label, "faces": _count_faces(shape), "places": 0}
+            bodies.append(entry)
+            if late:
+                entry["skipped"] = "out of time"
+            elif entry["faces"] > MAX_VALIDATE_FACES and not req.get("body"):
+                entry["skipped"] = "%d faces (a solid sewn from a mesh?); name it as body to look at it anyway" % entry["faces"]
+            if "skipped" in entry:
+                continue
+            mine, trouble = find_places(shape, names, opts, tick)
+            if trouble:
+                entry["incomplete"] = trouble
+                late = late or trouble == "out of time"
+            entry["places"] = len(mine)
+            for p in mine:
+                p["body"], p["label"] = name, label
+            places.extend(mine)
+        places.sort(key=lambda p: p["rank"])
+        listed = places[:MAX_PLACES]
+        if current and not late and req.get("since", True):
+            try:
+                self._since(listed, names, opts, tick)
+            except OutOfTime:
+                late = True
+        for p in listed[:sections]:
+            try:
+                tick()
+                p["view_box"], p["section"] = place_section(shapes[p["body"]], p, opts["min_size"])
+            except OutOfTime:
+                late = True
+                break
+            except Exception as e:
+                p["section_error"] = error_text(e)
+        out = {"validators": [{"name": n, "about": VALIDATORS[n][1]} for n in names],
+               "min_size": round(opts["min_size"], 6), "min_angle": opts["min_angle"],
+               "bodies": bodies, "places": [place_json(k + 1, p) for k, p in enumerate(listed)],
+               "incomplete": late or any("skipped" in b or "incomplete" in b for b in bodies)}
+        if len(places) > len(listed):
+            out["places_not_listed"] = len(places) - len(listed)
+        return out
+
+    def _since(self, places, names, opts, tick):
+        """Give each place of a PartDesign body "since": the first feature, on the way from
+        the body's first feature to its tip, whose shape has a place there too. Found by
+        halving, which takes a place that is there at a feature to stay to the tip. A place
+        gets no "since" when a feature on its way could not be looked at whole; out of time,
+        OutOfTime is raised and the places not reached have none."""
+        doc = self._doc()
+        limit = opts["min_size"]
+        per_body = {}
+        for p in places:
+            per_body.setdefault(p["body"], []).append(p)
+        for name, mine in per_body.items():
+            body = doc.getObject(name)
+            if body is None or not body.isDerivedFrom("PartDesign::Body"):
+                continue
+            chain = feature_chain(body)
+            if not chain:
+                continue
+            seen = {}  # feature's number in the chain -> the places in its shape, or None
+
+            def there(k):
+                if k not in seen:
+                    placed = placed_shape(chain[k])
+                    found, trouble = ([], "no shape") if placed is None else find_places(
+                        placed[0] if placed[1].isUnity() else placed[0].transformed(placed[1]), names, opts, tick)
+                    if trouble == "out of time":
+                        raise OutOfTime
+                    seen[k] = None if trouble else found
+                return seen[k]
+
+            for p in mine:
+                lo, hi = 0, len(chain) - 1
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    earlier = there(mid)
+                    if earlier is None:
+                        break
+                    if any(same_place(p, q, limit) for q in earlier):
+                        hi = mid
+                    else:
+                        lo = mid + 1
+                if lo == hi:
+                    f = chain[lo]
+                    p["since"] = {"feature": f.Name, "label": f.Label, "sketches": [s.Name for s in _profiles(f)]}
 
     def _pick_bodies(self, shapes, body):
         if not body:
@@ -2485,6 +2634,374 @@ def surface_info(face):
 
 def _vec(p, digits=6):
     return [round(p.x, digits) + 0.0, round(p.y, digits) + 0.0, round(p.z, digits) + 0.0]
+
+
+# ---- validators (see `Worker.cmd_validate`) ----
+#
+# A validator looks at the shape of one body and yields findings, each a dict:
+#     "kind"    what it is, a few words ("thin wall")
+#     "size"    how bad, in mm: the smaller the worse (places are listed by it)
+#     "at"      a point in it, "shape" what it is made of (an edge, a face, several)
+#     "text"    one line for the reader, naming the faces and edges
+#     "faces", "edges"  0-based numbers in shape.Faces and shape.Edges
+#     "angle"   degrees, for what is measured by an angle, not a length
+#     "along"   a unit (x, y, z) across it (through a wall, over a gap), when it has one
+# It is given `tick()`, which raises OutOfTime once the request's time is up: call it in
+# every loop. `find_places` runs the validators and joins findings whose shapes lie within
+# min_size of each other into places, whichever validator made them. To add a validator, write the generator and name it
+# in VALIDATORS.
+
+class OutOfTime(Exception):
+    """The request's time is up (see `Worker.cmd_validate`)."""
+
+
+class TooManyFindings(Exception):
+    """A body gave MAX_FINDINGS findings: it is small all over."""
+
+
+def degenerate_places(shape, opts, tick):
+    """What is too small to be meant, as extrusions of sketches that miss each other by a
+    hair leave it: edges shorter and faces narrower than opts["min_size"], faces that come
+    closer than that without meeting (a thin wall when they stand back to back with material
+    between, a narrow gap when they face each other, a step when they are offset or only a
+    strip parts them), edges where the material, or a slit, thins out
+    at under opts["min_angle"], and edges and faces the solid touches itself along.
+
+    All of it is measured on the exact faces, nothing is sampled. Not found: a wall or a gap
+    between two faces that share a corner, away from the edge they meet at; a face that
+    comes close to itself, unless it is round (a pin, a hole); a strip narrow at one spot only."""
+    limit, min_angle = opts["min_size"], opts["min_angle"]
+    faces, edges = shape.Faces, shape.Edges
+    # Asked once: a face of many holes takes milliseconds to hand out its surface.
+    surfaces = [(f.Surface, f.Orientation == "Reversed") for f in faces]
+    numbered = {}
+    for k, e in enumerate(edges):
+        numbered.setdefault(e.hashCode(), []).append(k)
+    users = {}    # edge -> [(face, the edge as that face runs along it)]
+    corners = []  # per face, its vertices
+    for i, f in enumerate(faces):
+        tick()
+        corners.append({v.hashCode() for v in f.Vertexes})
+        for e in f.Edges:
+            for k in numbered.get(e.hashCode(), ()):
+                if edges[k].isSame(e):
+                    users.setdefault(k, []).append((i, e))
+                    break
+
+    for k, e in enumerate(edges):
+        if e.Degenerated:  # the tip of a cone, the poles of a sphere
+            continue
+        length = e.Length
+        if length < limit:
+            yield {"kind": "short edge", "size": length, "at": e.CenterOfMass, "shape": e,
+                   "text": "Edge%d is %.4g mm long" % (k + 1, length),
+                   "faces": [i for i, _ in users.get(k, ())], "edges": [k]}
+
+    for i, f in enumerate(faces):
+        tick()
+        # As wide as the rectangle of the same area and outline; a thin ring's width, nearly.
+        area, around = f.Area, sum(w.Length for w in f.Wires)
+        width = (around - math.sqrt(max(around * around - 16 * area, 0.0))) / 4
+        s, across = surfaces[i][0], None
+        u0, u1, v0, v1 = f.ParameterRange
+        if isinstance(s, Part.Cylinder) and u1 - u0 > math.pi:
+            across = 2 * s.Radius
+        elif isinstance(s, Part.Sphere):
+            across = 2 * s.Radius
+        elif isinstance(s, Part.Toroid) and v1 - v0 > math.pi:
+            across = 2 * s.MinorRadius
+        if across is not None and across < width:
+            if across < limit:
+                yield {"kind": "narrow face", "size": across, "at": f.CenterOfMass, "shape": f,
+                       "text": "Face%d is round and %.4g mm across" % (i + 1, across), "faces": [i], "edges": []}
+        elif width < limit:
+            yield {"kind": "narrow face", "size": width, "at": f.CenterOfMass, "shape": f,
+                   "text": "Face%d is a strip %.4g mm wide" % (i + 1, width), "faces": [i], "edges": []}
+
+    for k, on in users.items():
+        tick()
+        e = edges[k]
+        if e.Degenerated:
+            continue
+        if len(on) > 2:
+            yield {"kind": "edge of several faces", "size": 0.0, "at": e.CenterOfMass, "shape": e,
+                   "text": "Edge%d joins %d faces: the solid touches itself along it" % (k + 1, len(on)),
+                   "faces": [i for i, _ in on], "edges": [k]}
+            continue
+        if len(on) != 2 or on[0][0] == on[1][0]:
+            continue  # the seam of a round face, or a free edge
+        a, b = e.ParameterRange
+        sharpest = None  # (degrees of material at the edge, where)
+        for t in (0.5, 0.15, 0.85):
+            t = a + (b - a) * t
+            try:
+                p = e.valueAt(t)
+                out, into = [], []
+                for i, own in on:
+                    n = _outward(surfaces[i], p)
+                    # A face lies to the left of its edges, seen from outside.
+                    tangent = own.tangentAt(t)
+                    out.append(n)
+                    into.append(n.cross(tangent * -1 if own.Orientation == "Reversed" else tangent).normalize())
+            except Exception:
+                continue  # no normal or tangent here
+            between = math.degrees(into[0].getAngle(into[1]))
+            # The second face falls away behind the first: a convex edge.
+            material = between if into[1].dot(out[0]) < 1e-9 else 360.0 - between
+            if sharpest is None or min(material, 360.0 - material) < min(sharpest[0], 360.0 - sharpest[0]):
+                sharpest = (material, p)
+        if sharpest is None:
+            continue
+        material, p = sharpest
+        angle = min(material, 360.0 - material)
+        if angle < min_angle:
+            kind, text = ("sharp edge", "the material thins out to nothing along Edge%d: its faces meet at %.3g°") \
+                if material < 180 else ("sharp slit", "a slit closes to nothing along Edge%d: its faces meet at %.3g°")
+            yield {"kind": kind, "size": limit * math.tan(math.radians(angle)), "angle": angle, "at": p,
+                   "shape": e, "text": text % (k + 1, angle), "faces": [i for i, _ in on], "edges": [k]}
+
+    # Faces that come close without meeting, found along x: boxes first, then the exact distance.
+    boxes = [_face_box(f) for f in faces]
+    reach = [_grown(b, limit) for b in boxes]
+    order = sorted(range(len(faces)), key=lambda i: boxes[i].XMin)
+    for n, i in enumerate(order):
+        tick()
+        far = boxes[i].XMax + limit
+        for j in order[n + 1:]:
+            if boxes[j].XMin > far:
+                break
+            if not reach[i].intersect(boxes[j]) or corners[i] & corners[j]:
+                continue
+            tick()
+            try:
+                d, points, _ = faces[i].distToShape(faces[j])
+            except Exception:
+                continue
+            if d >= limit or not points:
+                continue
+            p, q = points[0]
+            lo, hi = sorted((i, j))
+            names = "Face%d and Face%d" % (lo + 1, hi + 1)
+            found = {"size": d, "at": (p + q) * 0.5, "faces": [lo, hi], "edges": []}
+            if d < 1e-6:
+                found.update(kind="touching faces", text="%s touch without sharing an edge" % names)
+            else:
+                across = (q - p) * (1.0 / d)
+                found["along"] = (across.x, across.y, across.z)
+                try:  # which way each face looks at the other, and whether they are back to back
+                    ni, nj = _outward(surfaces[i], p), _outward(surfaces[j], q)
+                    looks, opposed = (ni.dot(across), -nj.dot(across)), ni.dot(nj) < -0.3
+                except Exception:
+                    looks, opposed = (1.0, -1.0), False
+                if min(abs(looks[0]), abs(looks[1])) < 0.1:
+                    # Edge on: a face beside a gap, level with the face across it. The faces
+                    # that bound the gap, or the strip between the two, tell of the place.
+                    continue
+                if opposed and max(looks) < 0:
+                    found.update(kind="thin wall", text="the wall between %s is %.4g mm thick" % (names, d))
+                elif opposed and min(looks) > 0:
+                    found.update(kind="narrow gap", text="the gap between %s is %.4g mm wide" % (names, d))
+                else:
+                    found.update(kind="step", text="%s are %.4g mm apart: a step, or a strip between them" % (names, d))
+            # What it is made of: the lines across, at every spot OCCT names as closest (both
+            # ends, where two faces run side by side).
+            found["shape"] = Part.makeCompound([Part.makeLine(a, b) if (b - a).Length > 1e-7 else Part.Vertex(a)
+                                                for a, b in points[:16]])
+            yield found
+
+
+# name -> (the generator, what it finds, for whoever chooses)
+VALIDATORS = {
+    "degenerate": (degenerate_places,
+                   "Places too small to be meant: thin walls, narrow gaps, steps and strips, short edges, sharp "
+                   "edges and slits, and where a solid touches itself."),
+}
+# The worst first in a place's "what", among findings of one size.
+KIND_ORDER = ("touching faces", "edge of several faces", "thin wall", "narrow gap", "sharp edge", "sharp slit",
+              "narrow face", "step", "short edge")
+
+
+def _outward(surface, p):
+    """The normal at p of a face, given as (its surface, whether the face is reversed on it):
+    it points out of the solid. (`face.normalAt` does the same and measures the face's
+    outline on every call, 3 ms on a plate of 900 holes.)"""
+    s, flipped = surface
+    n = s.normal(*s.parameter(p))
+    return n * -1 if flipped else n
+
+
+def _face_box(face):
+    """A box the face is surely in. A face that was meshed is boxed by its triangles, which
+    cut the corners of a curved one; this one is of the surface itself."""
+    try:
+        return face.optimalBoundingBox(False, False)
+    except Exception:
+        return face.BoundBox
+
+
+def same_place(p, q, reach):
+    """Two findings or places lie together: their shapes come within `reach`."""
+    if not _grown(p["box"], reach).intersect(q["box"]):
+        return False
+    try:
+        return p["shape"].distToShape(q["shape"])[0] <= reach
+    except Exception:
+        return False
+
+
+def _grown(bb, d):
+    return FreeCAD.BoundBox(bb.XMin - d, bb.YMin - d, bb.ZMin - d, bb.XMax + d, bb.YMax + d, bb.ZMax + d)
+
+
+def _positive(value, name):
+    """A request's number that must be above zero, or None when it is not given."""
+    if value is None:
+        return None
+    v = float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else float("nan")
+    if not (_finite(v) and v > 0):
+        raise ValueError("%s is a number above 0" % name)
+    return v
+
+
+def find_places(shape, names, opts, tick):
+    """(places of a shape by the validators `names`, worst first; what cut the work short, or
+    None). A place is the findings that hang together, each within min_size of another: by
+    their shapes, not their boxes, which in a part that lies askew take in half of it."""
+    limit = opts["min_size"]
+    found, trouble = [], None
+    try:
+        for name in names:
+            for f in VALIDATORS[name][0](shape, opts, tick):
+                f["validator"], f["box"] = name, f["shape"].BoundBox
+                found.append(f)
+                if len(found) >= MAX_FINDINGS:
+                    raise TooManyFindings
+    except OutOfTime:
+        trouble = "out of time"
+    except TooManyFindings:
+        trouble = "stopped at %d findings: small all over" % MAX_FINDINGS
+    except Exception as e:
+        trouble = error_text(e)
+    reach = [_grown(f["box"], limit) for f in found]
+    group = list(range(len(found)))
+
+    def root(i):
+        while group[i] != i:
+            group[i] = group[group[i]]
+            i = group[i]
+        return i
+
+    order = sorted(range(len(found)), key=lambda i: reach[i].XMin)
+    try:
+        for n, i in enumerate(order):
+            for j in order[n + 1:]:
+                if reach[j].XMin > reach[i].XMax:
+                    break
+                if root(i) != root(j) and reach[i].intersect(found[j]["box"]):
+                    tick()
+                    if same_place(found[i], found[j], limit):
+                        group[root(i)] = root(j)
+    except OutOfTime:
+        trouble = "out of time"  # the places stand, some in more pieces than they are
+    members = {}
+    for i, f in enumerate(found):
+        members.setdefault(root(i), []).append(f)
+    places = []
+    for fs in members.values():
+        fs.sort(key=lambda f: (round(f["size"], 9), KIND_ORDER.index(f["kind"]) if f["kind"] in KIND_ORDER else len(KIND_ORDER)))
+        whole = Part.makeCompound([f["shape"] for f in fs])
+        place = {"kind": fs[0]["kind"], "kinds": dict(collections.Counter(f["kind"] for f in fs)),
+                 "validators": sorted({f["validator"] for f in fs}),
+                 "what": [f["text"] for f in fs[:4]], "at": fs[0]["at"], "shape": whole, "box": whole.BoundBox,
+                 "faces": sorted({i for f in fs for i in f["faces"]}), "edges": sorted({i for f in fs for i in f["edges"]}),
+                 "rank": fs[0]["size"], "focus": fs[0]["box"], "along": fs[0].get("along")}
+        sizes = [f["size"] for f in fs if "angle" not in f]
+        angles = [f["angle"] for f in fs if "angle" in f]
+        if sizes:
+            place["size"] = min(sizes)
+        if angles:
+            place["angle"] = min(angles)
+        places.append(place)
+    places.sort(key=lambda p: p["rank"])
+    return places, trouble
+
+
+def place_json(number, p):
+    out = {"id": number, "body": p["body"], "label": p["label"], "validators": p["validators"],
+           "kind": p["kind"], "kinds": p["kinds"],
+           "what": p["what"], "at": _vec(p["at"]), "bbox": _box_list(p["box"]),
+           "faces": ["Face%d" % (i + 1) for i in p["faces"][:24]], "edges": ["Edge%d" % (i + 1) for i in p["edges"][:24]]}
+    for key, digits in (("size", 6), ("angle", 3)):
+        if key in p:
+            out[key] = round(p[key], digits)
+    for key in ("since", "view_box", "section", "section_error"):
+        if key in p:
+            out[key] = p[key]
+    return out
+
+
+def _box_list(bb):
+    return [round(x, 6) + 0.0 for x in (bb.XMin, bb.YMin, bb.ZMin, bb.XMax, bb.YMax, bb.ZMax)]
+
+
+def feature_chain(body):
+    """The features that make a PartDesign body's shape, from its first to its tip."""
+    chain, f, inside = [], getattr(body, "Tip", None), set(o.Name for o in body.Group)
+    while f is not None and f.Name in inside and f not in chain:
+        chain.append(f)
+        f = getattr(f, "BaseFeature", None)
+    return chain[::-1]
+
+
+def place_section(body, place, limit):
+    """A close look at a place: (the box looked at, as [x0, y0, z0, x1, y1, z1]; a cut of what
+    the body has in it, as `slice_bodies` gives it). The box is some 24 times as wide as the
+    place is small, around its worst finding. The cut's plane holds the line across that
+    finding (through the wall, over the gap) and is normal to the direction the finding is
+    longest along, so it shows the finding's profile."""
+    shape, label = body
+    focus, along = place["focus"], place["along"]
+    normals = [FreeCAD.Vector(1, 0, 0), FreeCAD.Vector(0, 1, 0), FreeCAD.Vector(0, 0, 1)]
+    if along is not None:
+        # The two directions square to the line across, along the axes where that can be.
+        a = FreeCAD.Vector(*along)
+        e = min(normals, key=lambda n: abs(n.dot(a)))
+        first = (e - a * e.dot(a)).normalize()
+        normals = [first, a.cross(first).normalize()]
+    sides = (focus.XLength, focus.YLength, focus.ZLength)
+    normal = max(normals, key=lambda n: sum(abs(c) * s for c, s in zip((n.x, n.y, n.z), sides)))
+    if max((normal.x, normal.y, normal.z), key=abs) < 0:
+        normal = normal * -1  # along +x rather than -x: offsets read as coordinates
+    # Through the middle of the finding along the cut's normal: its closest points may sit on
+    # an end face, in whose plane there is nothing to cut.
+    at = place["at"] + normal * normal.dot(focus.Center - place["at"])
+    half = 12.0 * max(place["size"], limit / 20.0) if "size" in place else 3.0 * limit
+    view = [at.x - half, at.y - half, at.z - half, at.x + half, at.y + half, at.z + half]
+    piece = clipped({place["body"]: (shape, label)}, clip_box(view))
+    return [round(c, 6) for c in view], slice_bodies(piece, None, normal, [round(normal.dot(at), 6)], 1)
+
+
+def clip_box(box):
+    """A request's box [x0, y0, z0, x1, y1, z1] as a solid."""
+    if not isinstance(box, (list, tuple)) or len(box) != 6 \
+            or not all(isinstance(c, (int, float)) and not isinstance(c, bool) for c in box):
+        raise ValueError("box is six numbers, [x0, y0, z0, x1, y1, z1]")
+    x0, y0, z0, x1, y1, z1 = [float(c) for c in box]
+    if not (all(_finite(c) for c in (x0, y0, z0, x1, y1, z1)) and x1 > x0 and y1 > y0 and z1 > z0):
+        raise ValueError("box is [x0, y0, z0, x1, y1, z1] with x0 < x1, y0 < y1, z0 < z1")
+    return Part.makeBox(x1 - x0, y1 - y0, z1 - z0, FreeCAD.Vector(x0, y0, z0))
+
+
+def clipped(shapes, box):
+    """{body: (what of its shape lies in the box, label)}, without the bodies that have nothing there."""
+    out = {}
+    for name, (shape, label) in shapes.items():
+        if not shape.BoundBox.intersect(box.BoundBox):
+            continue
+        part = shape.common(box)
+        if part.Solids:
+            out[name] = (part, label)
+    return out
 
 
 def placed_shape(o):

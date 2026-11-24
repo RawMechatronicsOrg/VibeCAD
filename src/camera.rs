@@ -90,12 +90,18 @@ impl Camera {
     }
 
     pub fn fit(&mut self, lo: Vec3, hi: Vec3) {
-        self.target = (lo + hi) * 0.5;
         self.radius = ((hi - lo).length() * 0.5).max(1e-3);
+        self.frame((lo + hi) * 0.5, self.radius);
+    }
+
+    /// Look at a ball so that it fills the view, from the direction the camera has. The
+    /// scene's radius, which bounds the zoom, stays.
+    pub fn frame(&mut self, center: Vec3, radius: f32) {
+        self.target = center;
         // The narrower of the two fields of view decides, so tall views do not crop the model.
         let half_x = ((FOV_Y * 0.5).tan() * self.aspect.max(0.05)).atan();
         let half = (FOV_Y * 0.5).min(half_x);
-        self.distance = self.radius / half.sin() * 1.05;
+        self.distance = (radius / half.sin() * 1.05).max(self.radius * 1e-3);
     }
 
     pub fn set_view(&mut self, v: View) {

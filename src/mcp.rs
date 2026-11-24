@@ -22,7 +22,9 @@ with an earlier state. To try an edit without making it, pass dry_run: the docum
 the result is a trial state (\"t1\", ...) that diff and slice take like any other. A sketch's dimensions \
 are properties named \"Constraints.<name>\" (get_sketch lists them). To model: new_sketch on a plane or \
 flat face, sketch_edit to draw, constrain and dimension (each reply has a picture of the sketch and its \
-closed profiles), then extrude the sketch. Nothing is written to disk until save. Lengths are in mm, \
+closed profiles), then extrude the sketch. After modelling, call validate: it lists the degenerate places \
+(thin walls, narrow gaps, steps, sharp edges) that sketches missing each other by a hair leave, each with \
+the feature that made it. Nothing is written to disk until save. Lengths are in mm, \
 angles in degrees, volumes in mm^3. The person can pause you from the window or leave \
 you a note, which arrives at the end of a tool result.";
 
@@ -173,6 +175,7 @@ pub fn tools() -> Value {
                 "normal": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "Any plane normal, instead of axis." },
                 "offsets": { "type": "array", "items": { "type": "number" }, "description": "Plane positions along the normal, in mm (at most 24)." },
                 "count": { "type": "integer", "minimum": 1, "maximum": 24, "description": "Evenly spread planes over the bodies, when offsets are not given (default 5)." },
+                "box": { "type": "array", "items": { "type": "number" }, "minItems": 6, "maxItems": 6, "description": "[x0, y0, z0, x1, y1, z1]: cut only what lies in this box, drawn at the box's own scale: a close look at one place (validate gives each place's view_box)." },
                 "outlines": { "type": "boolean", "description": "Also return every outline as [u0, v0, u1, v1, ...] (large)." }
             } }
         },
@@ -185,6 +188,19 @@ pub fn tools() -> Value {
                 "body": body,
                 "sections": { "type": "boolean", "description": "Include the three cuts (default true)." }
             }, "required": ["before"] }
+        },
+        {
+            "name": "validate",
+            "description": "Run the model validators over the bodies and list the places they find, worst first. The validator \"degenerate\" finds what is too small to be meant, measured on the exact faces: thin walls, narrow gaps, steps and strips, short edges, edges where the material or a slit thins out to nothing, and where a solid touches itself. Per place: kind, kinds (findings of each), what (in words, naming faces and edges), size in mm (the smallest: a wall's thickness, a gap's width) or angle in degrees, at (a point in it), bbox, faces, edges, and since: the feature at which it first shows and the sketches that feature is built from, which is where to mend it. The first places come with a picture: a close cut through each. After mending, call it again: the place should be gone.",
+            "inputSchema": { "type": "object", "properties": {
+                "state": state,
+                "body": body,
+                "validators": { "type": "array", "items": { "type": "string", "enum": ["degenerate"] }, "description": "Which validators to run; default all." },
+                "min_size": { "type": "number", "exclusiveMinimum": 0, "description": "What is too small, in mm. Default 0.1, or a thousandth of the bodies' box if that is less; the reply says what was used." },
+                "min_angle": { "type": "number", "exclusiveMinimum": 0, "description": "Edges whose faces meet at less than this many degrees are sharp (default 10)." },
+                "sections": { "type": "integer", "minimum": 0, "maximum": 8, "description": "How many of the first places get a close cut in the picture (default 4)." },
+                "seconds": { "type": "number", "exclusiveMinimum": 0, "description": "Time the check may take (default 30); bodies it did not finish say so and incomplete is true." }
+            } }
         },
         {
             "name": "save",

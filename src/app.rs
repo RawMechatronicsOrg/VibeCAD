@@ -22,6 +22,7 @@ use crate::worker::{Body, Event, Part, Progress, Worker};
 
 mod handles;
 mod sketch_mode;
+mod validation;
 
 #[derive(Clone)]
 enum Pending {
@@ -41,6 +42,8 @@ enum Pending {
     Export,
     /// A read-only call of the agent; its answer goes back to the agent only.
     AgentQuery,
+    /// The window's own check of the model (see validation.rs).
+    Validate,
     /// The sketch being edited, described again.
     SketchData,
     /// A change to the sketch being edited, adding this many elements.
@@ -237,6 +240,8 @@ pub struct App {
     plane_outlines: Vec<(String, Vec<egui::Pos2>)>,
     /// Edges and drag handles in the view.
     gizmos: handles::Gizmos,
+    /// The validators' panel and the places it lists.
+    validation: validation::Validation,
     /// The sketch being edited in place, when one is.
     sketch: Option<sketch_mode::SketchMode>,
 }
@@ -297,6 +302,7 @@ impl App {
             command: None,
             plane_outlines: Vec::new(),
             gizmos: handles::Gizmos::default(),
+            validation: validation::Validation::new(s.show_check),
             sketch: None,
         }
     }
@@ -349,6 +355,7 @@ impl App {
         self.worker_error = None;
         self.pending.clear();
         self.loading = None;
+        self.validation.clear();
         self.open_on_ready = self.doc_path.clone();
         self.modified = false;
         self.error = None;
@@ -417,6 +424,7 @@ impl App {
     /// After anything that may change the model: reload tree, shapes and the open property list.
     fn refresh(&mut self) {
         self.gizmos.clear();
+        self.validation.dirty = true;
         self.request("tree", json!({}), Pending::Tree);
         self.request("scene", json!({}), Pending::Scene { fit: false });
         if let Some(sel) = &self.selection {
@@ -612,6 +620,9 @@ impl App {
                     match r.result {
                         Err(_) if matches!(kind, Pending::Edges(..) | Pending::Face(_)) => self.on_geometry_error(&kind),
                         Err(e) => {
+                            if matches!(kind, Pending::Validate) {
+                                self.validation.failed(r.id, &e);
+                            }
                             // A drag the solver will not follow is shown by the sketch staying put.
                             if !matches!(kind, Pending::SketchPreview) {
                                 self.error = Some(e);
@@ -640,6 +651,7 @@ impl App {
             match kind {
                 Pending::Open(path) => {
                     self.sketch = None;
+                    self.validation.clear();
                     self.doc_label = v["label"].as_str().map(str::to_string);
                     self.doc_path = Some(path);
                     self.selection = None;
@@ -705,6 +717,7 @@ impl App {
                 }
                 Pending::Scene { .. } => self.on_scene_done(id, &v),
                 Pending::AgentQuery => {}
+                Pending::Validate => self.on_validated(id, &v),
                 Pending::SketchData => self.on_sketch_data(&v),
                 Pending::SketchEdit(adds) => self.on_sketch_edit(adds, &v),
                 Pending::SketchPreview => self.on_sketch_preview(Some(&v)),
@@ -957,6 +970,7 @@ impl App {
             agent_calls: self.feed.len(),
             agent_running: !self.agent_jobs.is_empty(),
             navigation: self.navigation,
+            validation: self.validation.show,
             sketch: self.sketch.as_ref().map(|m| SketchRibbon {
                 label: m.data.as_ref().map_or_else(|| m.obj.clone(), |d| d.label.clone()),
                 tool: m.drawing.as_ref().map(|d| d.tool),
@@ -1023,6 +1037,7 @@ impl App {
                 Action::Navigation(n) => self.navigation = n,
                 Action::Command(op) => self.start_command(op),
                 Action::Delete => self.delete_selected(),
+                Action::Validate => self.toggle_validation(),
                 Action::SketchTool(t) => self.set_sketch_tool(t),
                 Action::SketchConstrain(c) => self.set_constrain_tool(c),
                 Action::SketchConstruction => self.sketch_construction(),
@@ -1068,6 +1083,12 @@ impl App {
         if self.show_feed {
             let at = view.right_bottom() + egui::vec2(-10.0, -24.0);
             ui_chrome::overlay(ctx, "feed", view, at, egui::Align2::RIGHT_BOTTOM, 430.0, feed_height, "Agent", |ui| self.feed_panel(ui));
+        }
+        if self.validation.show {
+            // Beside the tree, along the bottom of the view.
+            let at = view.left_bottom() + egui::vec2(280.0, -24.0);
+            let height = (view.height() * 0.45).max(160.0);
+            ui_chrome::overlay(ctx, "validation", view, at, egui::Align2::LEFT_BOTTOM, 340.0, height, "Check", |ui| self.validation_panel(ui));
         }
     }
 
@@ -1443,6 +1464,7 @@ impl App {
         }
         self.paint_planes(&ui.painter_at(rect), rect, f.view_proj);
         self.paint_handles(&ui.painter_at(rect), rect, f.view_proj);
+        self.paint_places(&ui.painter_at(rect), rect, f.view_proj);
         self.paint_sketch(&ui.painter_at(rect), rect, f.view_proj);
         if let Some(prompt) = self.sketch_prompt() {
             let at = egui::pos2(rect.center().x, rect.top() + 14.0);
@@ -1914,6 +1936,15 @@ impl App {
                     }
                 })
             }
+            "validate" => {
+                let mut args = a.clone();
+                if let Some(m) = args.as_object_mut()
+                    && !m.contains_key("sections")
+                {
+                    m.insert("sections".into(), json!(4)); // the first places come with a picture
+                }
+                Ok(self.request("validate", args, Pending::AgentQuery))
+            }
             "save" => self.agent_save_path(a).map(|p| self.save_to(p)),
             "undo" => Ok(self.undo(false)),
             "redo" => Ok(self.undo(true)),
@@ -1995,6 +2026,13 @@ impl App {
                 }
                 let data = if outlines { v.clone() } else { agent::without_profile_outlines(&v) };
                 out.text.push_str(&data.to_string());
+            }
+            "validate" => {
+                if let Some((picture, legend)) = agent::render_places(&v, 384) {
+                    out.images.push(picture);
+                    out.text = legend + "\n";
+                }
+                out.text.push_str(&agent::without_sections(&v).to_string());
             }
             "open_document" => out.text = format!("{v}\nThe window is loading the document's shapes now."),
             _ => out.text = v.to_string(),
@@ -2145,6 +2183,7 @@ impl App {
             palette: self.palette,
             show_grid: self.show_grid,
             show_log: self.show_log,
+            show_check: self.validation.show,
             ortho: self.camera.ortho,
             tab: self.tab,
             window_size: self.window_size,

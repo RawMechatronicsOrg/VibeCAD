@@ -167,6 +167,24 @@ def main(exe, out):
         added = json_part(text2)["bodies"][0]["added"]["volume"]
         print("extrude:", err, ext["created"], "added", added)
         assert not err and abs(added - sum(p["area"] for p in edit["sketch"]["profiles"]) * 3.0) < 1e-3, text2[:300]
+        # The plate is 6 thick: with 7 mm as too small, its faces are a thin wall, shown in a picture.
+        err, text, imgs = m.tool("validate")
+        clean = json_part(text)
+        print("validate:", err, clean["min_size"], [(p["kind"], p.get("size")) for p in clean["places"]])
+        assert not err and not clean["incomplete"] and clean["validators"][0]["name"] == "degenerate", text[:300]
+        err, text, imgs = m.tool("validate", min_size=7.0)
+        thin = json_part(text)
+        worst = thin["places"][0]
+        print("validate under 7 mm:", [(p["kind"], p.get("size"), p["since"]["feature"]) for p in thin["places"]], text.splitlines()[0][:150])
+        assert not err and len(imgs) == 1 and imgs[0][1:4] == b"PNG" and "section" not in worst and "view_box" in worst, text[:400]
+        # Where the solver puts the sketch's rectangle varies from run to run, and with it what is
+        # worst; the plate's own thickness is under 7 mm in any case.
+        assert any("thin wall" in p["kinds"] for p in thin["places"]) and worst["since"]["feature"], thin["places"]
+        open(os.path.join(out, "validate.png"), "wb").write(imgs[0])
+        err, text, imgs = m.tool("slice", axis="x", count=1, box=worst["view_box"])
+        assert not err and len(imgs) == 1, text[:300]
+        err, text, _ = m.tool("validate", validators=["nope"])
+        assert err, "an unknown validator is refused"
         err, text, _ = m.tool("diff", before="s99")
         print("bad state refused:", err, text[:60])
         assert err

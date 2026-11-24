@@ -51,6 +51,8 @@ pub enum Action {
     Command(Op),
     /// Delete the selected object.
     Delete,
+    /// Show or hide the validators' panel, which lists the model's degenerate places.
+    Validate,
     /// In sketch mode: draw with this tool, or (None) pick elements.
     SketchTool(Option<Tool>),
     /// In sketch mode: a constraint tool or the dimension tool, or (None) none.
@@ -93,6 +95,8 @@ pub struct RibbonState {
     pub agent_calls: usize,
     pub agent_running: bool,
     pub navigation: Scheme,
+    /// The validators' panel is open.
+    pub validation: bool,
     /// A sketch is being edited: the ribbon holds its tools instead of the tabs' buttons.
     pub sketch: Option<SketchRibbon>,
 }
@@ -165,6 +169,9 @@ pub fn ribbon(ui: &mut egui::Ui, tab: &mut Tab, s: &RibbonState, status: impl Fn
                 });
                 group(ui, "DELETE", |ui| {
                     button(ui, &mut out, Action::Delete, Icon::Delete, "Delete", s.has_selection, false, "Delete the selected object (Del)");
+                });
+                group(ui, "INSPECT", |ui| {
+                    button(ui, &mut out, Action::Validate, Icon::Check, "Check", s.has_doc, s.validation, "List the model's degenerate places: thin walls, narrow gaps, steps, sharp edges, with the feature that made each");
                 });
             }
             Tab::View => {
@@ -329,6 +336,7 @@ enum Icon {
     Construction,
     Finish,
     Dimension,
+    Check,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -534,6 +542,12 @@ fn paint_icon(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
             poly(&[(0.75, 0.35), (0.9, 0.45), (0.75, 0.55)], false);
         }
         Icon::Delete => modelling::paint_delete(p, r, c),
+        Icon::Check => {
+            // A magnifier with a tick in it.
+            p.add(egui::Shape::line(arc(0.42, 0.42, 0.32, 0.0, std::f32::consts::TAU), s));
+            p.line_segment([at(0.66, 0.66), at(0.97, 0.97)], Stroke::new(2.0, c));
+            poly(&[(0.27, 0.42), (0.38, 0.54), (0.58, 0.3)], false);
+        }
         Icon::Log => {
             poly(&[(0.15, 0.05), (0.85, 0.05), (0.85, 0.95), (0.15, 0.95)], true);
             for y in [0.3, 0.5, 0.7] {

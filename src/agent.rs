@@ -517,6 +517,41 @@ fn strip(v: &mut Value) {
     }
 }
 
+/// The close-up cuts that come with the first places of a `validate` reply, side by side, and
+/// how to read them.
+pub fn render_places(v: &Value, tile: usize) -> Option<(Picture, String)> {
+    let mut tiles = Vec::new();
+    let mut legend = Vec::new();
+    for p in v["places"].as_array()? {
+        let (Some(pic), Some(b)) = (render_slices(&p["section"], tile), p["view_box"].as_array()) else { continue };
+        let n = &p["section"]["normal"];
+        let offset = &p["section"]["slices"][0]["offset"];
+        let axis = ["x", "y", "z"].iter().zip(0..3).find(|(_, k)| n[*k].as_f64().is_some_and(|c| c > 0.999));
+        let plane = axis.map_or_else(|| format!("normal {n} . p = {offset}"), |(a, _)| format!("{a} = {offset}"));
+        let wide = b.get(3).and_then(Value::as_f64).unwrap_or(0.0) - b.first().and_then(Value::as_f64).unwrap_or(0.0);
+        legend.push(format!("place {} cut by the plane {plane}, a box {wide:.3} mm wide around it", p["id"]));
+        tiles.push(pic);
+    }
+    if tiles.is_empty() {
+        return None;
+    }
+    let text = format!(
+        "Picture: a close look at the first places, left to right, each at its own scale: {}. Blue: material. \
+         For another look at a place, call slice with its view_box as box.",
+        legend.join("; ")
+    );
+    Some((Picture::row(&tiles, 10), text))
+}
+
+/// A `validate` reply without the cuts, which the picture shows.
+pub fn without_sections(v: &Value) -> Value {
+    let mut v = v.clone();
+    for p in v["places"].as_array_mut().into_iter().flatten().filter_map(Value::as_object_mut) {
+        p.remove("section");
+    }
+    v
+}
+
 /// How to read the picture of a `slice` reply.
 pub fn slice_legend(v: &Value) -> String {
     let n = v["slices"].as_array().map_or(0, Vec::len);

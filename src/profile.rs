@@ -26,6 +26,8 @@ pub struct Settings {
     pub palette: bool,
     pub show_grid: bool,
     pub show_log: bool,
+    /// The validators' panel (EDIT → Check) is open.
+    pub show_check: bool,
     pub ortho: bool,
     pub tab: Tab,
     /// The window's inner size in points when it is not maximized.
@@ -42,6 +44,7 @@ impl Default for Settings {
             palette: true,
             show_grid: true,
             show_log: false,
+            show_check: false,
             ortho: true,
             tab: Tab::default(),
             window_size: [1400.0, 900.0],
@@ -62,6 +65,7 @@ impl Settings {
             "palette": self.palette,
             "show_grid": self.show_grid,
             "show_log": self.show_log,
+            "show_check": self.show_check,
             "ortho": self.ortho,
             "tab": self.tab,
             "window_size": self.window_size,
@@ -83,6 +87,7 @@ impl Settings {
             palette: get(v, "palette", d.palette),
             show_grid: get(v, "show_grid", d.show_grid),
             show_log: get(v, "show_log", d.show_log),
+            show_check: get(v, "show_check", d.show_check),
             ortho: get(v, "ortho", d.ortho),
             tab: get(v, "tab", d.tab),
             window_size: if size.iter().all(|s| s.is_finite() && (200.0..=20000.0).contains(s)) { size } else { d.window_size },

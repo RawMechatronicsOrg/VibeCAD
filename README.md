@@ -139,6 +139,42 @@ Typed numbers apply on Enter or when the field loses focus. Opening another file
 window asks before unsaved edits are lost. If FreeCAD crashes, File → Restart FreeCAD starts a new
 one and reopens the file.
 
+## Validators
+
+EDIT → INSPECT → Check opens a panel that lists what the validators find in the model, worst
+first, and keeps it up to date: while it is open the check runs again after every change (not
+while a sketch is drawn), so a place that was mended leaves the list. Every place has a dot in
+the view. A click on a row turns the view to the place and draws its box; a second click goes
+close. The row says how small it is, what it is and in which part; picked, it says which faces
+and edges, and the feature at which the place first shows, with the sketch that feature is
+built from: that is where to mend it. "Smaller than" sets what counts as too small (left alone:
+0.1 mm, or a thousandth of the model's size if that is less). Whether the panel is open is kept
+between runs, like the other switches.
+
+The validators are a stack in the worker (`VALIDATORS` in `vibecad_worker.py`): each is a
+generator that looks at one body's shape and yields findings (kind, size, where, the faces and
+edges). Findings that lie together, whichever validator made them, become one place. The
+first validator, `degenerate`, finds what is too small to be meant, the kind of thing several
+extruded sketches leave when they miss each other by a hair:
+
+| Kind | What |
+| --- | --- |
+| thin wall | two faces closer than the limit with material between them |
+| narrow gap | the same with air between them: a slit, or two solids nearly touching |
+| step | two faces less than the limit apart that are neither back to back nor face to face: offset, or parted by a strip (a chamfer or fillet under the limit reads so) |
+| narrow face, short edge | a strip narrower, an edge shorter than the limit; a pin or hole thinner than it |
+| sharp edge, sharp slit | material, or air, that thins out to nothing: faces meeting at under 10° |
+| touching faces, edge of several faces | a solid that touches itself, or another solid of the body, without being joined |
+
+It measures the exact faces (OCCT's distance between two faces, the surfaces' normals), so a
+sliver of a hundredth of a millimetre is found as surely as a large one; nothing is sampled.
+Faces are paired by their boxes first: a plate with 900 holes took 0.6 s. Findings are joined into a
+place by the distance between their shapes, not by their boxes, so a part that lies askew gives
+the same places. The feature a place is "since" is found by running the same check on the
+shapes of the body's features, halving between the first and the tip (which takes a place that
+is there at a feature to stay to the tip); a place has no "since" when the time ran out or a
+feature on the way could not be checked whole.
+
 ## How it works
 
 ```
@@ -159,7 +195,7 @@ one and reopens the file.
   `set_prop`, `set_props`, `sketch`, `new_sketch`, `sketch_edit`, `set_visible`, `set_tip`, `undo`, `redo`, `scene`, `save_as`, `export`, the modelling
   ones (`datum_plane`, `extrude`, `fillet`, `mirror`, `pattern`, `copy`, `delete`), `edges`
   and `face` for picking edges and drawing handles, and the agent's (`snapshot`, `timeline`,
-  `slice`, `diff`). Requests go out as
+  `slice`, `diff`), and `validate`. Requests go out as
   they are made; replies come back in order, a scene's stream frames before its reply, except
   that `tree` and `props` asked while a scene streams are answered at once, between its frames,
   so the tree and the properties of a selected part do not wait for a large assembly to load.
@@ -307,6 +343,13 @@ while there are unsaved edits), and for checking what an edit did:
   each with its volume, box, centre, a shape guess (box, cylinder) and its faces by surface
   (plane normal and offset, cylinder radius and axis, cone, sphere, torus); and a picture of
   three cuts through the changed region, one per axis, each at its own scale.
+- **`validate`**: the places the validators find (see Validators), worst first: kind, size or
+  angle, what it is in words, a point, the box, the faces and edges, and `since`, the feature
+  and sketches that made it. The first four come with a picture, a cut through a small box
+  around each (`view_box`), across the wall, gap or step. `slice` takes such a box as `box`
+  and cuts only what lies in it, at the box's scale, for a look from another side or a
+  comparison with an earlier state. `min_size` and `min_angle` say what is too small; `state`
+  checks an earlier or a trial state (without `since`).
 
 The AGENTIC tab shows a feed of the agent's calls as they happen: arguments, time taken,
 result, and the pictures the agent got. **Pause** makes the window refuse the agent's calls
@@ -320,6 +363,7 @@ cargo test                                         # scene decoding, the camera,
 python worker/test_worker.py examples/plate.FCStd  # the worker protocol, against a real FreeCAD
 python worker/test_modelling.py                    # the modelling commands, against a real FreeCAD
 python worker/test_sketch.py                       # sketches: make, draw, constrain, drag, extrude
+python worker/test_validate.py                     # validators: a plate with a step, a thin wall, a slit, sharp edges
 python worker/test_mcp.py                          # MCP end to end: opens the window, drives it, closes it
 ```
 
@@ -355,6 +399,13 @@ documents, where the `Pad` steps just report an error.
 
 ## Limits
 
+- The `degenerate` validator does not find a wall or a gap between two faces that share a
+  corner (away from the edge they meet at), a face that comes close to itself unless it is round
+  (a pin, a hole), or a strip that is narrow at one spot only. It checks each body on its own:
+  two bodies that nearly touch or overlap are not compared. A body of more than 20 000 faces (a
+  solid sewn from a mesh) is skipped unless named. A check holds the worker for up to 10 s from
+  the window (30 s from an agent, or what it asks); what it did not finish is said, not hidden.
+  The places are drawn over the view without depth, and a place does not select its faces.
 - No sketcher, and a construction plane cannot be put on an edge. Properties of type length,
   angle, number, integer, bool, string, enumeration and placement are editable; others are shown
   as text.
