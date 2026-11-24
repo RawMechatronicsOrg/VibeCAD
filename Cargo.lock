@@ -3044,6 +3044,7 @@ dependencies = [
  "naga",
  "png",
  "rfd",
+ "serde",
  "serde_json",
 ]
 

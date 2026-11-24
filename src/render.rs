@@ -107,12 +107,6 @@ fn fs_face(v: VOut) -> @location(0) vec4<f32> {
     let to_eye = -u.light.xyz;
     // Two-sided: open shells and flipped faces still read as surfaces.
     n = select(n, -n, dot(n, to_eye) < 0.0);
-    // Matte: soft sky/ground ambient, a headlight and a fixed key light from above, no highlight.
-    let head = max(dot(n, to_eye), 0.0);
-    let key = abs(dot(n, normalize(vec3<f32>(0.35, -0.45, 0.82))));
-    let sky = mix(vec3<f32>(0.95, 0.91, 0.86), vec3<f32>(0.93, 0.97, 1.05), n.z * 0.5 + 0.5);
-    // Surfaces turned away from the eye darken a little toward the silhouette.
-    let rim = 1.0 - 0.12 * (1.0 - head) * (1.0 - head);
     var base = v.color.rgb;
     if (v.inst == u.sel.y && v.inst != 0u) {
         base = mix(base, vec3<f32>(0.35, 0.85, 0.45), 0.35);
@@ -120,8 +114,26 @@ fn fs_face(v: VOut) -> @location(0) vec4<f32> {
     if (v.face == u.sel.x && v.face != 0u) {
         base = mix(base, vec3<f32>(0.20, 0.75, 1.00), 0.65);
     }
-    let c = base * (0.30 * sky + 0.48 * head + 0.24 * key) * rim;
-    return vec4<f32>(c, 1.0);
+    return vec4<f32>(shade(base, n, to_eye), 1.0);
+}
+
+// Plastic, lit in linear light and written back as sRGB: a soft sky and ground, a headlight and
+// a key light from above-front, and a soft highlight. Lighting the sRGB values directly (as
+// before) darkens and greys every face turned away from the light; in linear light the colour
+// keeps its strength and the highlight reads as a smooth, solid material.
+fn shade(srgb: vec3<f32>, n: vec3<f32>, to_eye: vec3<f32>) -> vec3<f32> {
+    let albedo = pow(srgb, vec3<f32>(2.2));
+    let key = normalize(vec3<f32>(0.35, -0.45, 0.82));
+    let head = max(dot(n, to_eye), 0.0);
+    let diffuse = max(dot(n, key), 0.0);
+    let ambient = mix(vec3<f32>(0.13, 0.125, 0.12), vec3<f32>(0.30, 0.31, 0.33), n.z * 0.5 + 0.5);
+    let light = ambient + vec3<f32>(0.42 * head + 0.55 * diffuse);
+    let spec = 0.22 * pow(max(dot(n, normalize(key + to_eye)), 0.0), 60.0) + 0.10 * pow(head, 80.0);
+    let fresnel = 0.05 * pow(1.0 - head, 4.0);
+    let c = albedo * light + vec3<f32>(spec + fresnel);
+    // A soft shoulder instead of a hard clip, so highlights on light parts do not burn out.
+    let mapped = c / (1.0 + 0.2 * c) * 1.12;
+    return pow(clamp(mapped, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2));
 }
 
 // The face id pass: no lighting, one integer per pixel.
@@ -249,6 +261,17 @@ fn edge_point(i: u32) -> vec3<f32> {
     return vec3<f32>(edge_points[3u * i], edge_points[3u * i + 1u], edge_points[3u * i + 2u]);
 }
 
+// A clip-space point moved toward the eye by `px` pixels' worth of world at its depth, in depth
+// only: it stays where it is on screen. Row 1 of view_proj is the projection's y scale times the
+// view's unit up vector, so its length is that scale, for ortho and perspective alike.
+fn toward_eye(c: vec4<f32>, px: f32) -> vec4<f32> {
+    let y_scale = length(vec3<f32>(u.view_proj[0][1], u.view_proj[1][1], u.view_proj[2][1]));
+    let t = px * c.w / (y_scale * u.view.y * 0.5);
+    let d = u.view_proj * vec4<f32>(-u.light.xyz, 0.0);
+    let z = (c.z + t * d.z) / (c.w + t * d.w);
+    return vec4<f32>(c.xy, max(z, 0.0) * c.w, c.w);
+}
+
 // Each segment of the line list becomes a quad facing the screen: six vertices, two triangles.
 // The draw's vertex range is the mesh's edge points times three, so vertex_index / 6 is the
 // segment and vertex_index % 6 the corner.
@@ -272,6 +295,16 @@ fn vs_edge(@builtin(vertex_index) vi: u32, i: Inst) -> EOut {
         b = mix(b, a, b.z / (b.z - a.z));
     }
     let half_view = u.view.xy * 0.5;
+    let half_width = u.view.z * 0.5;
+    // One pixel of fringe for the falloff; the ends reach half the width past the points so that
+    // segments of a polyline overlap at corners instead of leaving notches.
+    let reach = half_width + 1.0;
+    // The quad lies at the depth of its centre line, so a face turned toward the eye beside the
+    // line comes in front of its inner half and eats it, the more the steeper the face: a wide
+    // line looked uneven. Pull it toward the eye by twice its reach, enough for faces up to
+    // about 60 degrees from facing the eye; faces closer to edge-on hide less of it anyway.
+    a = toward_eye(a, 2.0 * reach);
+    b = toward_eye(b, 2.0 * reach);
     let d = b.xy / b.w * half_view - a.xy / a.w * half_view;
     let len = length(d);
     let dir = select(vec2<f32>(1.0, 0.0), d / max(len, 1e-6), len > 1e-6);
@@ -280,10 +313,6 @@ fn vs_edge(@builtin(vertex_index) vi: u32, i: Inst) -> EOut {
     let at_b = k == 1u || k == 2u || k == 4u;
     let side = select(-1.0, 1.0, k == 2u || k == 4u || k == 5u);
     var p = select(a, b, at_b);
-    let half_width = u.view.z * 0.5;
-    // One pixel of fringe for the falloff; the ends reach half the width past the points so that
-    // segments of a polyline overlap at corners instead of leaving notches.
-    let reach = half_width + 1.0;
     let off = normal * side * reach + dir * select(-half_width, half_width, at_b);
     p = vec4<f32>(p.xy + off / half_view * p.w, p.zw);
     o.clip = p;

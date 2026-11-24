@@ -10,13 +10,15 @@ pub struct Camera {
     /// Above the XY plane, radians.
     pub pitch: f32,
     pub ortho: bool,
-    /// Radius of the scene, for the clip planes.
+    /// Radius of the scene, for fitting and zoom limits.
     pub radius: f32,
     /// Width / height of the view, kept from the last frame for `fit`.
     pub aspect: f32,
 }
 
 const FOV_Y: f32 = 35.0 * std::f32::consts::PI / 180.0;
+/// Just short of straight up or down, where the view's up direction is lost.
+const MAX_PITCH: f32 = std::f32::consts::FRAC_PI_2 - 1e-4;
 
 impl Default for Camera {
     fn default() -> Self {
@@ -53,18 +55,36 @@ impl Camera {
         (right, up)
     }
 
-    pub fn view_proj(&self, aspect: f32) -> Mat4 {
+    /// `drawn` bounds everything the view draws (the scene, the ground grid). The clip planes
+    /// sit just outside it, so nothing in it is cut however the camera is panned or zoomed.
+    pub fn view_proj(&self, aspect: f32, drawn: (Vec3, Vec3)) -> Mat4 {
         let (_, up) = self.basis();
-        let view = look_at_rh(self.eye(), self.target, up);
-        let far = self.distance + self.radius * 3.0;
+        let eye = self.eye();
+        let view = look_at_rh(eye, self.target, up);
+        // Depths of the box's corners along the view direction.
+        let (lo, hi) = drawn;
+        let forward = self.forward();
+        let (mut nearest, mut farthest) = (f32::MAX, f32::MIN);
+        for i in 0..8 {
+            let corner = Vec3::new(
+                if i & 1 == 0 { lo.x } else { hi.x },
+                if i & 2 == 0 { lo.y } else { hi.y },
+                if i & 4 == 0 { lo.z } else { hi.z },
+            );
+            let d = (corner - eye).dot(forward);
+            nearest = nearest.min(d);
+            farthest = farthest.max(d);
+        }
+        let pad = (hi - lo).length() * 0.01 + 1e-3;
         let proj = if self.ortho {
             let h = self.distance * (FOV_Y * 0.5).tan();
             let w = h * aspect;
             // The eye may sit inside the scene after zooming; ortho can look behind it safely.
-            orthographic_rh(-w, w, -h, h, self.distance - self.radius * 3.0, far)
+            let near = nearest - pad;
+            orthographic_rh(-w, w, -h, h, near, (farthest + pad).max(near + pad))
         } else {
-            let near = (self.distance - self.radius * 2.0).max(self.distance * 0.01).max(1e-3);
-            perspective_rh(FOV_Y, aspect, near, far)
+            let near = (nearest - pad).max(self.distance * 0.01).max(1e-3);
+            perspective_rh(FOV_Y, aspect, near, (farthest + pad).max(near * 2.0))
         };
         proj * view
     }
@@ -93,7 +113,16 @@ impl Camera {
     /// Mouse drag in pixels.
     pub fn orbit(&mut self, delta: Vec2) {
         self.yaw -= delta.x * 0.008;
-        self.pitch = (self.pitch + delta.y * 0.008).clamp(-1.5707, 1.5707);
+        self.pitch = (self.pitch + delta.y * 0.008).clamp(-MAX_PITCH, MAX_PITCH);
+    }
+
+    /// Turn the camera about its own eye, as looking around: the eye stays put and the point
+    /// orbited about moves with the view. Mouse drag in pixels; right turns right, up looks up.
+    pub fn look(&mut self, delta: Vec2) {
+        let eye = self.eye();
+        self.yaw -= delta.x * 0.004;
+        self.pitch = (self.pitch + delta.y * 0.004).clamp(-MAX_PITCH, MAX_PITCH);
+        self.target = eye + self.forward() * self.distance;
     }
 
     /// Mouse drag in pixels, viewport height in pixels.
@@ -103,12 +132,12 @@ impl Camera {
         self.target += (-right * delta.x + up * delta.y) * world_per_px;
     }
 
-    /// Scroll in points; positive zooms in.
     /// Pixels per document unit at the target, in a view `height_px` high.
     pub fn px_per_unit(&self, height_px: f32) -> f32 {
         height_px / (2.0 * self.distance * (FOV_Y * 0.5).tan())
     }
 
+    /// Scroll in points; positive zooms in.
     pub fn zoom(&mut self, steps: f32) {
         self.distance = (self.distance * (-steps * 0.0015).exp()).clamp(self.radius * 1e-3, self.radius * 1e3);
     }
@@ -182,7 +211,7 @@ mod tests {
         for aspect in [0.4f32, 1.5, 3.0] {
             let mut c = Camera { ortho, aspect, ..Camera::default() };
             c.fit(Vec3::new(0.0, 0.0, 0.0), Vec3::new(80.0, 50.0, 6.0));
-            let vp = c.view_proj(aspect);
+            let vp = c.view_proj(aspect, (Vec3::ZERO, Vec3::new(80.0, 50.0, 6.0)));
             for p in [Vec3::new(0.0, 0.0, 0.0), Vec3::new(80.0, 50.0, 6.0), Vec3::new(40.0, 25.0, 3.0)] {
                 let q = vp.project_point3(p);
                 assert!(q.x.abs() <= 1.0 && q.y.abs() <= 1.0 && (0.0..=1.0).contains(&q.z), "{ortho} {aspect} {p} -> {q}");
@@ -196,7 +225,7 @@ mod tests {
         for ortho in [true, false] {
             let mut c = Camera { ortho, aspect: 1.5, ..Camera::default() };
             c.fit(Vec3::ZERO, Vec3::splat(10.0));
-            let f = Frustum::new(c.view_proj(1.5));
+            let f = Frustum::new(c.view_proj(1.5, (Vec3::ZERO, Vec3::splat(10.0))));
             let unit = |p: Vec3| (p, p + Vec3::ONE);
             // the fitted box, a box poking out of one side, one far to the side, one behind the eye
             assert!(f.intersects(Vec3::ZERO, Vec3::splat(10.0)), "{ortho}");
@@ -210,12 +239,50 @@ mod tests {
             assert!(!f.intersects(lo, hi), "{ortho}");
             // zoomed in, the far corner of the box leaves the view
             c.distance *= 0.05;
-            let f = Frustum::new(c.view_proj(1.5));
+            let f = Frustum::new(c.view_proj(1.5, (Vec3::ZERO, Vec3::splat(10.0))));
             let (lo, hi) = unit(Vec3::ZERO);
             assert!(!f.intersects(lo, hi), "{ortho}");
             let (lo, hi) = unit(c.target - Vec3::splat(0.5));
             assert!(f.intersects(lo, hi), "{ortho}");
         }
+    }
+
+    #[test]
+    fn clip_planes_keep_everything_drawn_however_the_camera_moves() {
+        // A small part far from the origin, and the ground grid reaching back to the origin.
+        let (lo, hi) = (Vec3::new(100.0, 100.0, 0.0), Vec3::new(110.0, 110.0, 5.0));
+        let drawn = (Vec3::new(-130.0, -130.0, 0.0), hi.max(Vec3::new(130.0, 130.0, 0.0)));
+        for ortho in [true, false] {
+            let mut c = Camera { ortho, aspect: 1.5, ..Camera::default() };
+            c.fit(lo, hi);
+            c.yaw = 45f32.to_radians(); // looking back toward the origin
+            c.pitch = 10f32.to_radians();
+            c.zoom(800.0);
+            let vp = c.view_proj(1.5, drawn);
+            for p in [Vec3::new(-130.0, -130.0, 0.0), Vec3::new(-130.0, 130.0, 0.0), Vec3::new(130.0, -130.0, 0.0)] {
+                let q = vp * p.extend(1.0);
+                if q.w > 0.0 {
+                    assert!(q.z / q.w <= 1.0, "{ortho} {p} beyond the far plane: {}", q.z / q.w);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn looking_around_keeps_the_eye_in_place() {
+        let mut c = Camera::default();
+        c.fit(Vec3::ZERO, Vec3::splat(10.0));
+        let eye = c.eye();
+        c.look(Vec2::new(120.0, -40.0));
+        assert!((c.eye() - eye).length() < 1e-3 * c.distance, "{} vs {eye}", c.eye());
+        let before = c.forward();
+        // dragging right turns the view right: the new forward is clockwise from above
+        c.look(Vec2::new(50.0, 0.0));
+        assert!(before.cross(c.forward()).z < 0.0);
+        // dragging up looks up
+        let z = c.forward().z;
+        c.look(Vec2::new(0.0, -50.0));
+        assert!(c.forward().z > z);
     }
 
     #[test]

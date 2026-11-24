@@ -13,19 +13,27 @@ Every message, in both directions, is one frame:
 A request header is {"id": n, "cmd": "...", ...}; the reply carries the same id and either
 "ok": true with the command's fields or "ok": false with "error". Before its reply, "scene"
 streams frames with the same id and "partial": true (see `Worker.cmd_scene`); only they carry a
-payload. Requests may arrive while a scene streams: they wait, and one that changes what the
-scene shows ends the stream early.
+payload. Requests may arrive while a scene streams: "tree" and "props" are answered at once,
+between the scene's frames; others wait, and one that changes what the scene shows ends the
+stream early. So replies come in request order except for those two.
+
+Shapes are tessellated in other processes (see `Tessellators`): freecadcmd running this same
+script with VIBECAD_ROLE=tessellator, which get each shape as BREP text and send its mesh back.
 """
 import array
 import collections
 import hashlib
+import hmac
 import math
 import json
 import os
 import select
+import shutil
 import socket
 import struct
+import subprocess
 import sys
+import tempfile
 import time
 import traceback
 import xml.etree.ElementTree as ET
@@ -53,7 +61,13 @@ MAX_FACE_COLORS = 20000
 # Finished meshes are sent at most this often, in seconds, so the window keeps up.
 BATCH_SECONDS = 0.3
 # Requests that change what the scene shows; one arriving during a scene stream ends it.
-ENDS_SCENE = {"scene", "open", "new", "set_prop", "undo", "redo", "set_visible"}
+ENDS_SCENE = {"scene", "open", "new", "set_prop", "undo", "redo", "set_visible",
+              "set_tip", "datum_plane", "extrude", "fillet", "mirror", "pattern", "copy", "delete"}
+LINK_TYPES = ("App::Link", "App::LinkElement")
+# How FreeCAD's origin planes turn (yaw, pitch, roll): XY faces +Z, XZ -Y, YZ +X.
+BASE_PLANES = {"XY": (0, 0, 0), "XZ": (0, 0, 90), "YZ": (90, 0, 90)}
+# The parts of a placement the property panel edits as numbers.
+PLACEMENT_PARTS = ("x", "y", "z", "yaw", "pitch", "roll")
 # Part of every disk cache key: bump when `encode_mesh` changes what it writes.
 # Largest angle, in radians, one segment of a curve may turn by: 10 degrees, so circles are
 # round on screen and the rims of parts that sit in each other's holes line up closely.
@@ -65,9 +79,540 @@ MAX_STATES = 200
 MAX_SLICES = 24
 # Points of the outlines of one `slice` reply, all cuts together; past it they are coarser.
 MAX_OUTLINE_POINTS = 200000
+# Requests answered while a scene streams, between two of its frames: they only read.
+ANSWERED_DURING_SCENE = {"tree", "props"}
+# Tessellators that have not connected this long after their start are given up.
+TESSELLATOR_START_SECONDS = 60
+
+# The tessellators run this same script. The window removes its copy once this process has
+# read it, so keep the text to write theirs.
+try:
+    with open(__file__, "rb") as _f:
+        SOURCE = _f.read()
+except (NameError, OSError):
+    SOURCE = None
 
 
-class Worker:
+def tessellator_count():
+    """VIBECAD_TESSELLATORS, else one per core up to 4, leaving a core for this process.
+    0 tessellates in this process."""
+    try:
+        return max(0, int(os.environ["VIBECAD_TESSELLATORS"]))
+    except (KeyError, ValueError):
+        return min(4, max(1, (os.cpu_count() or 2) - 1))
+
+
+class Modelling:
+    """Commands that add features to the document, each one undoable step.
+
+    Everything they make is a native FreeCAD object (PartDesign features in a body, Part
+    features beside it), so FreeCAD opens the document as before. References name an object and
+    one of its elements as the window picked them: {"obj": "Pocket", "sub": "Face6"}, or one of
+    the origin's planes or axes: {"base": "XY"} / {"base": "Z"}.
+
+    A plain solid that gets a PartDesign feature (extrude, fillet, pattern) is first made the
+    base of a new body, as FreeCAD's "body from a solid" does; its face numbers stay the same.
+    Links show another part: they are mirrored and copied, but not changed.
+    """
+
+    def _model_edit(self, title, build):
+        """Run `build(doc)`, which returns the object it made, as one undoable step. A new
+        object that fails to recompute undoes the whole step: FreeCAD's message is the error."""
+        doc = self._doc()
+        self.edited = True
+        hide = []  # copies of hidden objects, hidden once the step is committed
+        broken_before = {o.Name for o in doc.Objects if "Invalid" in o.State}
+        tips = self._tips()
+        doc.openTransaction(title)
+        try:
+            made = build(doc, hide)
+            doc.recompute()
+            if made is not None and ("Invalid" in made.State or "Error" in made.State):
+                raise RuntimeError("%s: %s" % (made.Label, _object_error(made)))
+            if made is not None and made.isDerivedFrom("PartDesign::Feature") and not made.Shape.Solids:
+                raise RuntimeError("%s: no solid is left" % made.Label)
+        except Exception:
+            doc.abortTransaction()
+            doc.recompute()
+            raise
+        doc.commitTransaction()
+        self._follow_tips(tips)
+        for o in hide:
+            self.gui.setdefault(o.Name, {})["visible"] = False
+            self.vis_changes[o.Name] = False
+        broken = [o.Name for o in doc.Objects if "Invalid" in o.State and o.Name not in broken_before]
+        out = {"created": made.Name if made is not None else None, "broken": broken}
+        out.update(self._record_edit(title))
+        return out
+
+    def _record_edit(self, cause):
+        """A state after an edit, and what an agent needs to compare it with the one before."""
+        before = self.states[-1]["id"] if self.states else None
+        after = self._record(cause)
+        return {"state_before": before, "state_after": after or before,
+                "changed_bodies": self.states[-1]["changed"] if after else []}
+
+    def _forget_gone(self):
+        """Drop window visibility kept for objects an undo removed: FreeCAD gives their names
+        to the next objects made."""
+        doc = self._doc()
+        for name in [n for n in self.vis_changes if doc.getObject(n) is None]:
+            del self.vis_changes[name]
+            self.gui.pop(name, None)
+
+    # ---- references -------------------------------------------------------------------
+
+    def _body_of(self, o):
+        """The PartDesign body that holds `o`, or None."""
+        for p in o.InList:
+            if p.isDerivedFrom("PartDesign::Body") and o in p.Group:
+                return p
+        return None
+
+    def _whole(self, name):
+        """What an operation on a whole part takes: the body of a feature, else the object."""
+        o = self._obj(name)
+        return self._body_of(o) or o
+
+    def _feature_place(self, doc, o):
+        """(body, feature whose shape new PartDesign features refer to) for object `o`. A plain
+        solid becomes the base feature of a new body placed where it was."""
+        if o.isDerivedFrom("PartDesign::Body"):
+            if o.Tip is None:
+                raise ValueError("%s has no features yet" % o.Label)
+            return o, o.Tip
+        body = self._body_of(o)
+        if body is not None:
+            return body, o
+        if o.TypeId in LINK_TYPES:
+            raise ValueError("%s shows another part: change that part instead" % o.Label)
+        shape = getattr(o, "Shape", None)
+        if shape is None or not shape.Solids:
+            raise ValueError("%s is not a solid" % o.Label)
+        body = doc.addObject("PartDesign::Body", "Body")
+        for g in o.InList:  # keep it in the group or part the solid was in
+            if g.isDerivedFrom("App::DocumentObjectGroup") or g.isDerivedFrom("App::Part"):
+                if o in g.Group:
+                    g.addObject(body)
+                    break
+        body.BaseFeature = o
+        # The base feature takes the solid's shape without its placement; the body carries it.
+        body.Placement = o.Placement
+        doc.recompute()
+        return body, body.Tip
+
+    def _origin(self, body, role):
+        for f in body.Origin.OriginFeatures:
+            if f.Role == role:
+                return f
+        raise ValueError("%s has no %s" % (body.Label, role))
+
+    def _element(self, o, sub):
+        try:
+            return o.Shape.getElement(sub)
+        except Exception:
+            raise ValueError("%s has no %s" % (o.Label, sub))
+
+    def _flat_face(self, o, sub):
+        if not sub.startswith("Face"):
+            raise ValueError("pick a face")
+        face = self._element(o, sub)
+        if not isinstance(face.Surface, Part.Plane):
+            raise ValueError("%s.%s is not flat" % (o.Label, sub))
+        return face
+
+    def _plane_link(self, body, ref):
+        """A link (object, [element]) to the plane `ref` names, for a feature in `body`."""
+        if "base" in ref:
+            return self._origin(body, ref["base"] + "_Plane"), [""]
+        o = self._obj(ref["obj"])
+        sub = ref.get("sub") or ""
+        if sub:
+            self._flat_face(o, sub)
+        elif not o.isDerivedFrom("PartDesign::Plane"):
+            raise ValueError("%s is not a plane" % o.Label)
+        return o, [sub]
+
+    def _plane_geometry(self, ref):
+        """(point, normal) of the plane `ref` names, in document coordinates."""
+        if "base" in ref:
+            r = FreeCAD.Rotation(*BASE_PLANES[ref["base"]])
+            return FreeCAD.Vector(), r.multVec(FreeCAD.Vector(0, 0, 1))
+        o = self._obj(ref["obj"])
+        sub = ref.get("sub") or ""
+        if not sub:
+            if not o.isDerivedFrom("PartDesign::Plane"):
+                raise ValueError("%s is not a plane" % o.Label)
+            pl = o.getGlobalPlacement()
+            return pl.Base, pl.Rotation.multVec(FreeCAD.Vector(0, 0, 1))
+        placed = placed_shape(o)
+        if placed is None:
+            raise ValueError("%s has no shape" % o.Label)
+        shape, matrix, _ = placed
+        face = shape.getElement(sub).copy()
+        face.transformShape(matrix)
+        if not isinstance(face.Surface, Part.Plane):
+            raise ValueError("%s.%s is not flat" % (o.Label, sub))
+        u0, u1, v0, v1 = face.ParameterRange
+        return face.CenterOfMass, face.normalAt((u0 + u1) / 2, (v0 + v1) / 2)
+
+    def _axis_link(self, body, ref, flat_ok):
+        """A link to the axis `ref` names: an origin axis, the circle of a round face, or (when
+        `flat_ok`, for a direction) a flat face, which stands for its normal."""
+        if "base" in ref:
+            return self._origin(body, ref["base"] + "_Axis"), [""]
+        o = self._obj(ref["obj"])
+        sub = ref.get("sub") or ""
+        if sub.startswith("Edge"):
+            return o, [sub]
+        if not sub.startswith("Face"):
+            raise ValueError("pick a face, or choose X, Y or Z")
+        shape = o.Shape
+        face = self._element(o, sub)
+        if isinstance(face.Surface, Part.Plane):
+            if flat_ok:
+                return o, [sub]
+            raise ValueError("a flat face has no axis: pick a round face, or choose X, Y or Z")
+        # The patterns take a circular edge as an axis; a round face has one on its rim.
+        for i, e in enumerate(shape.Edges):
+            if isinstance(e.Curve, Part.Circle) and any(e.isSame(fe) for fe in face.Edges):
+                return o, ["Edge%d" % (i + 1)]
+        raise ValueError("%s.%s has no circular edge to turn about" % (o.Label, sub))
+
+    def _new_in_body(self, body, type_id, name):
+        """A PartDesign feature after the body's tip, made the new tip."""
+        before = body.Tip
+        f = body.newObject(type_id, name)
+        if body.Tip != f and not f.isDerivedFrom("Part::Datum"):
+            # Patterns are not counted as solid features until they have originals; they
+            # work on the whole body, so chain them in by hand.
+            if "BaseFeature" in f.PropertiesList and f.BaseFeature is None:
+                f.BaseFeature = before
+            body.Tip = f
+        return f
+
+    # ---- commands ---------------------------------------------------------------------
+
+    def cmd_datum_plane(self, req):
+        """A construction plane on a flat face, on another plane or on an origin plane, moved
+        along its normal by "offset" and turned about its own X axis by "angle" (degrees).
+        Placed in the body of what it is attached to; for an origin plane, in the body of
+        "context" (the selection) or, with none, free in the document."""
+        ref = req["ref"]
+        offset = float(req.get("offset", 0.0))
+        angle = float(req.get("angle", 0.0))
+        shift = FreeCAD.Placement(FreeCAD.Vector(0, 0, offset), FreeCAD.Rotation(FreeCAD.Vector(1, 0, 0), angle))
+
+        def build(doc, hide):
+            if "base" in ref:
+                ctx = self._obj(req["context"]) if req.get("context") else None
+                body = None if ctx is None else (ctx if ctx.isDerivedFrom("PartDesign::Body") else self._body_of(ctx))
+                support = [(self._origin(body, ref["base"] + "_Plane"), "")] if body else None
+                mode = "ObjectXY"
+            else:
+                o = self._obj(ref["obj"])
+                sub = ref.get("sub") or ""
+                if sub:
+                    self._flat_face(o, sub)
+                    mode = "FlatFace"
+                elif o.isDerivedFrom("PartDesign::Plane"):
+                    mode = "ObjectXY"
+                else:
+                    raise ValueError("%s is not a plane: pick a flat face or a plane" % o.Label)
+                body = self._body_of(o)
+                support = [(o, sub)]
+            plane = body.newObject("PartDesign::Plane", "DatumPlane") if body else doc.addObject("PartDesign::Plane", "DatumPlane")
+            if support:
+                plane.AttachmentSupport = support
+                plane.MapMode = mode
+                plane.AttachmentOffset = shift
+            else:
+                plane.MapMode = "Deactivated"
+                plane.Placement = FreeCAD.Placement(FreeCAD.Vector(), FreeCAD.Rotation(*BASE_PLANES[ref["base"]])).multiply(shift)
+            return plane
+
+        return self._model_edit("Plane", build)
+
+    def cmd_extrude(self, req):
+        """Push or pull a flat face, or extrude a sketch, by "distance": positive adds material
+        (a Pad), negative cuts it away (a Pocket). "symmetric" extrudes to both sides."""
+        o = self._obj(req["obj"])
+        sub = req.get("sub") or ""
+        distance = float(req["distance"])
+        if not math.isfinite(distance) or abs(distance) < 1e-7:
+            raise ValueError("the distance must not be zero")
+        sketch = o.isDerivedFrom("Part::Part2DObject")
+
+        def build(doc, hide):
+            if sketch:
+                body = self._body_of(o)
+                if body is None:
+                    ext = doc.addObject("Part::Extrusion", "Extrude")
+                    ext.Base = o
+                    ext.DirMode = "Normal"
+                    ext.LengthFwd = abs(distance)
+                    ext.Reversed = distance < 0
+                    ext.Symmetric = bool(req.get("symmetric"))
+                    ext.Solid = True
+                    return ext
+                profile = o
+            else:
+                self._flat_face(o, sub)
+                body, feature = self._feature_place(doc, o)
+                profile = (feature, [sub])
+            f = self._new_in_body(body, "PartDesign::Pad" if distance > 0 else "PartDesign::Pocket",
+                                  "Extrude" if distance > 0 else "Cut")
+            f.Profile = profile
+            f.Length = abs(distance)
+            f.Midplane = bool(req.get("symmetric"))
+            return f
+
+        return self._model_edit("Extrude", build)
+
+    def cmd_fillet(self, req):
+        """Round ("chamfer": false, "radius") or bevel ("chamfer": true, "size") every edge of a
+        picked face."""
+        o = self._obj(req["obj"])
+        sub = req.get("sub") or ""
+        if not sub.startswith("Face"):
+            raise ValueError("pick a face: its edges are rounded")
+        chamfer = bool(req.get("chamfer"))
+        size = float(req["size"])
+        if not (math.isfinite(size) and size > 0):
+            raise ValueError("the size must be above zero")
+
+        def build(doc, hide):
+            self._element(o, sub)
+            body, feature = self._feature_place(doc, o)
+            f = self._new_in_body(body, "PartDesign::Chamfer" if chamfer else "PartDesign::Fillet",
+                                  "Chamfer" if chamfer else "Fillet")
+            f.Base = (feature, [sub])
+            if chamfer:
+                f.Size = size
+            else:
+                f.Radius = size
+            return f
+
+        return self._model_edit("Chamfer" if chamfer else "Fillet", build)
+
+    def cmd_mirror(self, req):
+        """Mirror a part across a plane. "join": the mirror image is added to the part's own
+        body (PartDesign Mirrored of the whole body); otherwise it is a new solid of its own
+        (Part Mirroring), which follows the original."""
+        target = self._whole(req["obj"])
+        ref = req["plane"]
+        join = bool(req.get("join"))
+
+        def build(doc, hide):
+            if join:
+                body, _ = self._feature_place(doc, target)
+                f = self._new_in_body(body, "PartDesign::Mirrored", "Mirror")
+                f.TransformMode = "Transform body"
+                f.MirrorPlane = self._plane_link(body, ref)
+                body.AllowCompound = True
+                return f
+            base, normal = self._plane_geometry(ref)
+            m = doc.addObject("Part::Mirroring", "Mirror")
+            m.Source = target
+            m.Base = base
+            m.Normal = normal
+            m.Label = target.Label + " mirrored"
+            return m
+
+        return self._model_edit("Mirror", build)
+
+    def cmd_pattern(self, req):
+        """Repeat a whole part in its body: "kind" "circular" turns "count" copies about "axis"
+        over "angle" degrees (360: evenly round); "linear" steps them "spacing" apart along it."""
+        target = self._whole(req["obj"])
+        kind = req.get("kind", "circular")
+        ref = req["axis"]
+        count = int(req["count"])
+        if count < 2:
+            raise ValueError("a pattern needs at least 2 copies")
+
+        def build(doc, hide):
+            body, _ = self._feature_place(doc, target)
+            if kind == "circular":
+                f = self._new_in_body(body, "PartDesign::PolarPattern", "CircularPattern")
+                f.TransformMode = "Transform body"
+                f.Axis = self._axis_link(body, ref, flat_ok=False)
+                f.Angle = float(req.get("angle", 360.0))
+            elif kind == "linear":
+                f = self._new_in_body(body, "PartDesign::LinearPattern", "LinearPattern")
+                f.TransformMode = "Transform body"
+                f.Direction = self._axis_link(body, ref, flat_ok=True)
+                spacing = float(req["spacing"])
+                f.Reversed = spacing < 0
+                f.Mode = "offset"
+                f.Offset = abs(spacing)
+            else:
+                raise ValueError("unknown pattern: %s" % kind)
+            f.Occurrences = count
+            body.AllowCompound = True  # copies that do not touch stay separate solids
+            return f
+
+        return self._model_edit("Pattern", build)
+
+    def cmd_copy(self, req):
+        """A copy of a whole part moved by "offset" [x, y, z]: independent (every object it is
+        built from copied too), or with "linked" an App::Link that follows the original."""
+        target = self._whole(req["obj"])
+        move = FreeCAD.Placement(FreeCAD.Vector(*[float(x) for x in req.get("offset", (0, 0, 0))]), FreeCAD.Rotation())
+
+        def build(doc, hide):
+            if req.get("linked"):
+                link = doc.addObject("App::Link", target.Name + "Link")
+                link.LinkedObject = target
+                link.Placement = move.multiply(target.Placement)
+                link.Label = target.Label + " link"
+                return link
+            deps = target.OutListRecursive
+            sources = [o for o in doc.Objects if o in deps] + [target]
+            copies = doc.copyObject(sources, False, True)
+            for src, cp in zip(sources, copies):
+                if not self._visible(src):
+                    hide.append(cp)
+            made = copies[-1]
+            made.Placement = move.multiply(made.Placement)
+            return made
+
+        return self._model_edit("Copy", build)
+
+    def cmd_delete(self, req):
+        """Delete an object, a whole body with what it holds, or a feature of a body (the next
+        feature then builds on the one before). Refused while something else uses it."""
+        o = self._obj(req["obj"])
+
+        def build(doc, hide):
+            body = self._body_of(o)
+            inside = set()
+            if o.isDerivedFrom("PartDesign::Body"):
+                inside = set(o.Group) | {o.Origin} | set(o.Origin.OriginFeatures)
+            elif body is not None:
+                # The next feature only builds on it; one that refers to its faces does use it.
+                inside = {body} | {f for f in body.Group if getattr(f, "BaseFeature", None) == o
+                                   and not _links_to(f, o, skip="BaseFeature")}
+            users = [u for u in o.InList if u not in inside and u not in o.OutListRecursive
+                     and not (_is_container(u) and o in (getattr(u, "Group", None) or []))]
+            if users:
+                raise ValueError("%s is used by %s" % (o.Label, ", ".join(u.Label for u in users)))
+            if o.isDerivedFrom("PartDesign::Body"):
+                origin = o.Origin.Name if o.Origin is not None else None
+                o.removeObjectsFromDocument()
+                doc.removeObject(o.Name)
+                if origin and doc.getObject(origin) is not None:  # FreeCAD may take it with the body
+                    doc.removeObject(origin)
+            else:
+                if body is not None:
+                    body.removeObject(o)
+                doc.removeObject(o.Name)
+            return None
+
+        return self._model_edit("Delete", build)
+
+    # ---- what the window shows of them -------------------------------------------------
+
+    def _shown_planes(self):
+        """Construction planes to draw, as {name: [four corners]} in document coordinates:
+        a square over the model, centred where the model's centre falls on the plane."""
+        doc = self._doc()
+        planes = [o for o in doc.Objects if o.isDerivedFrom("PartDesign::Plane") and self._visible(o)]
+        planes = [p for p in planes if (self._body_of(p) is None or self._visible(self._body_of(p)))]
+        if not planes:
+            return {}
+        bbox = FreeCAD.BoundBox()
+        for o in doc.Objects:
+            shape = getattr(o, "Shape", None)
+            # Origins and construction geometry are infinite; links share their part's box.
+            if shape is None or _is_datum(o) or o.isDerivedFrom("Part::Datum") or o.TypeId in LINK_TYPES:
+                continue
+            bb = shape.BoundBox
+            if bb.isValid() and bb.DiagonalLength < 1e30:
+                bbox.add(bb)
+        if bbox.isValid():
+            center, half = bbox.Center, max(bbox.DiagonalLength * 0.4, 5.0)
+        else:
+            center, half = FreeCAD.Vector(), 50.0
+        out = {}
+        for p in planes:
+            pl = p.getGlobalPlacement()
+            u = pl.Rotation.multVec(FreeCAD.Vector(1, 0, 0))
+            v = pl.Rotation.multVec(FreeCAD.Vector(0, 1, 0))
+            n = pl.Rotation.multVec(FreeCAD.Vector(0, 0, 1))
+            c = center - n * (center - pl.Base).dot(n)
+            corners = [c + u * (su * half) + v * (sv * half) for su, sv in ((-1, -1), (1, -1), (1, 1), (-1, 1))]
+            if all(_finite(x) for q in corners for x in (q.x, q.y, q.z)):
+                out[p.Name] = [[q.x, q.y, q.z] for q in corners]
+        return out
+
+
+def _model_visible(worker, o):
+    """Visibility the document's structure decides, or None: in a body only the tip feature is
+    shown (the others are steps towards it), and a solid a body is built on is hidden."""
+    if o.isDerivedFrom("PartDesign::Feature"):
+        body = worker._body_of(o)
+        if body is not None:
+            return body.Tip == o
+    for p in o.InList:
+        if p.isDerivedFrom("PartDesign::Body") and p.BaseFeature == o:
+            return False
+    # A sketch a feature is made from is hidden under it, as FreeCAD's GUI hides it.
+    if o.isDerivedFrom("Part::Part2DObject"):
+        for p in o.InList:
+            if o in _profiles(p) or (p.TypeId == "Part::Extrusion" and p.Base == o):
+                return False
+    return None
+
+
+def _links_to(obj, target, skip=None):
+    """Whether a link property of `obj` other than `skip` refers to `target`."""
+    def refers(v):
+        if isinstance(v, (list, tuple)):
+            return any(refers(x) for x in v)
+        return v is not None and hasattr(v, "TypeId") and v == target
+    for name in obj.PropertiesList:
+        if name == skip or "Link" not in obj.getTypeIdOfProperty(name):
+            continue
+        try:
+            if refers(getattr(obj, name)):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def placement_entries(obj, name, value, group, readonly):
+    """A placement as six numbers the property panel edits: "Placement.x" ... "Placement.roll"."""
+    yaw, pitch, roll = value.Rotation.toEuler()
+    numbers = (value.Base.x, value.Base.y, value.Base.z, yaw, pitch, roll)
+    return [{"name": "%s.%s" % (name, part), "group": group, "type": "App::PropertyPlacement",
+             "readonly": readonly, "kind": "float", "value": float(x), "unit": "mm" if i < 3 else "°",
+             "text": "%g" % x}
+            for i, (part, x) in enumerate(zip(PLACEMENT_PARTS, numbers))]
+
+
+def set_property(obj, name, value):
+    """obj.name = value, where name may be one of `placement_entries`' parts."""
+    base, _, part = name.partition(".")
+    if not part:
+        setattr(obj, name, value)
+        return
+    if part not in PLACEMENT_PARTS or obj.getTypeIdOfProperty(base) != "App::PropertyPlacement":
+        raise ValueError("no property " + name)
+    pl = FreeCAD.Placement(getattr(obj, base))
+    if part in ("x", "y", "z"):
+        b = pl.Base
+        setattr(b, part, float(value))
+        pl.Base = b
+    else:
+        ypr = list(pl.Rotation.toEuler())
+        ypr[("yaw", "pitch", "roll").index(part)] = float(value)
+        pl.Rotation = FreeCAD.Rotation(*ypr)
+    setattr(obj, base, pl)
+
+
+class Worker(Modelling):
     def __init__(self):
         self.doc = None
         self.path = None
@@ -81,6 +626,10 @@ class Worker:
         self.edited = False
         self.disk = DiskCache(cache_dir())
         self.conn = None       # set by `serve`; a scene streams through it
+        self.pool = None       # Tessellators, set by `start_tessellators`; None meshes here
+        self.jobs = {}         # job sent to a tessellator -> (mesh entry, tolerance, disk key)
+        self.next_job = 1
+        self.crashed = []      # (key, shape) of shapes that stopped two tessellators
         self.states = []       # see `_record`
         self.next_state = 0
 
@@ -150,13 +699,18 @@ class Worker:
         self.mesh_cache.clear()
         self.tol, self.tol_key = None, None
         self.edited = False
+        # Shapes of the document closed or reloaded: not worth waiting for.
+        if self.pool is not None:
+            self.pool.abandon()
+        self.jobs.clear()
 
     # ---- tree and properties ---------------------------------------------------------
 
     def cmd_tree(self, req):
         """The model tree, with what only gets in the way left out: origins with their axes and
         planes (not drawn), hidden objects that App::Links show elsewhere (the source of every
-        occurrence of a part), and groups left empty by that."""
+        occurrence of a part), and groups left empty by that. A construction plane shown in the
+        view carries "plane": the four corners of the square the window draws for it."""
         doc = self._doc()
         objects = doc.Objects
         linked = set()
@@ -176,21 +730,35 @@ class Worker:
                 if name not in omit and members and all(m in omit for m in members):
                     omit.add(name)
                     changed = True
+        # As in FreeCAD's own tree, a feature built from sketches holds them: a Pad shows the
+        # sketch it extrudes under it, not beside it in the Body.
+        claimed = {}
+        for o in objects:
+            for sketch in _profiles(o):
+                if sketch.Name in groups and sketch.Name not in claimed and sketch.Name not in omit:
+                    claimed[sketch.Name] = o.Name
+                    groups[o.Name].append(sketch.Name)
         in_group = set()
         nodes = []
+        planes = self._shown_planes()
         for o in objects:
             if o.Name in omit:
                 continue
-            children = [c for c in groups[o.Name] if c not in omit]
+            children = [c for c in groups[o.Name] if c not in omit and claimed.get(c, o.Name) == o.Name]
             in_group.update(groups[o.Name])
-            nodes.append({
+            node = {
                 "name": o.Name,
                 "label": o.Label,
                 "type": o.TypeId,
                 "children": children,
                 "visible": self._visible(o),
                 "error": "Invalid" in o.State or "Error" in o.State,
-            })
+                # A body's shape is that of its tip: the timeline's rollback marker.
+                "tip": _tip(o),
+            }
+            if o.Name in planes:
+                node["plane"] = planes[o.Name]  # corners of the construction plane drawn
+            nodes.append(node)
         roots = [o.Name for o in objects if o.Name not in in_group and o.Name not in omit]
         return {"nodes": nodes, "roots": roots, "undo": doc.UndoCount, "redo": doc.RedoCount}
 
@@ -229,6 +797,9 @@ class Worker:
             elif ptype in ("App::PropertyString", "App::PropertyFont"):
                 entry["kind"] = "string"
                 entry["value"] = str(value)
+            elif ptype == "App::PropertyPlacement":
+                props.extend(placement_entries(obj, name, value, entry["group"], entry["readonly"]))
+                continue
             elif ptype == "App::PropertyEnumeration":
                 entry["kind"] = "enum"
                 entry["value"] = str(value)
@@ -248,17 +819,14 @@ class Worker:
         self.edited = True
         doc.openTransaction("Set " + name)
         try:
-            setattr(obj, name, value)
+            set_property(obj, name, value)
             doc.recompute()
         except Exception:
             doc.abortTransaction()
             raise
         doc.commitTransaction()
         broken = [o.Name for o in doc.Objects if "Invalid" in o.State]
-        before = self.states[-1]["id"] if self.states else None
-        after = self._record("set %s.%s = %s" % (obj.Name, name, _short(value, 40)))
-        changed = self.states[-1]["changed"] if after else []
-        return {"broken": broken, "state_before": before, "state_after": after or before, "changed_bodies": changed}
+        return dict({"broken": broken}, **self._record_edit("set %s.%s = %s" % (obj.Name, name, _short(value, 40))))
 
     def cmd_set_visible(self, req):
         """Visibility belongs to the drawing, as in FreeCAD's GUI: not an undoable model edit."""
@@ -267,12 +835,52 @@ class Worker:
         self.vis_changes[obj.Name] = bool(req["visible"])
         return {}
 
+    def cmd_set_tip(self, req):
+        """Roll a body back or forward, as FreeCAD's Set tip: its shape becomes that of
+        `feature`, and the features after it no longer count."""
+        doc = self._doc()
+        body, feature = self._obj(req["body"]), self._obj(req["feature"])
+        if not body.isDerivedFrom("PartDesign::Body") or feature not in body.Group:
+            raise ValueError("%s is not a feature of %s" % (feature.Label, body.Label))
+        tips = self._tips()
+        self.edited = True
+        doc.openTransaction("Set tip")
+        try:
+            body.Tip = feature
+            doc.recompute()
+        except Exception:
+            doc.abortTransaction()
+            raise
+        doc.commitTransaction()
+        self._follow_tips(tips)
+        broken = [o.Name for o in doc.Objects if "Invalid" in o.State]
+        return dict({"broken": broken}, **self._record_edit("set tip of %s to %s" % (body.Name, feature.Name)))
+
+    def _tips(self):
+        return {o.Name: _tip(o) for o in self._doc().Objects if o.isDerivedFrom("PartDesign::Body")}
+
+    def _follow_tips(self, before):
+        """A body shows its tip: where the tip moved and the old one was shown, show the new
+        one instead, as FreeCAD's GUI does. Drawing state, like set_visible."""
+        doc = self._doc()
+        for body, tip in self._tips().items():
+            old = before.get(body)
+            if old == tip or old is None or tip is None or doc.getObject(old) is None:
+                continue
+            if self._visible(doc.getObject(old)):
+                for name, shown in ((old, False), (tip, True)):
+                    self.gui.setdefault(name, {})["visible"] = shown
+                    self.vis_changes[name] = shown
+
     def cmd_undo(self, req):
         doc = self._doc()
         if doc.UndoCount:
             self.edited = True
+            tips = self._tips()
             doc.undo()
             doc.recompute()
+            self._follow_tips(tips)
+            self._forget_gone()
             self._record("undo")
         return {"undo": doc.UndoCount, "redo": doc.RedoCount}
 
@@ -280,8 +888,11 @@ class Worker:
         doc = self._doc()
         if doc.RedoCount:
             self.edited = True
+            tips = self._tips()
             doc.redo()
             doc.recompute()
+            self._follow_tips(tips)
+            self._forget_gone()
             self._record("redo")
         return {"undo": doc.UndoCount, "redo": doc.RedoCount}
 
@@ -521,12 +1132,16 @@ class Worker:
         # Biggest boxes first: the silhouette comes in before the screws.
         order = sorted(range(len(meshes)), key=lambda k: -meshes[k]["size"])
         stats = {"meshes": len(meshes), "memory_hits": 0, "disk_hits": 0, "tessellated": 0,
+                 "tessellators": 0, "brep_s": 0.0,
                  "boxes_s": round(boxes_at - started, 3), "first_mesh_s": None}
         batch, blobs, size, last_sent = [], [], 0, time.time()
         done, skipped, failed, cancelled = 0, [], [], False
 
         def progress(obj):
             return {"done_faces": done, "total_faces": total, "obj": obj}
+
+        def begun(m):
+            self._send({"id": rid, "partial": True, "stream": "progress", "progress": progress(m["label"])})
 
         def flush():
             nonlocal batch, blobs, size, last_sent
@@ -537,31 +1152,30 @@ class Worker:
                             "progress": progress(None)}, b"".join(blobs))
             batch, blobs, size, last_sent = [], [], 0, time.time()
 
-        for k in order:
-            if self._scene_ended():
-                cancelled = True
-                break
-            m = meshes[k]
-            try:
-                enc = self._cached_mesh(m, tol, stats)
-                if enc is None:
-                    self._send({"id": rid, "partial": True, "stream": "progress", "progress": progress(m["label"])})
-                    enc = encode_mesh(m["shape"], tol)
-                    stats["tessellated"] += 1
-                    self._store_mesh(m, tol, enc)
-            except Exception as e:
-                failed.append(k)
-                skipped.extend({"obj": name, "error": error_text(e)} for name in m["objs"])
-                done += m["faces"]
-                continue
-            meta, blob = enc
-            batch.append(dict(meta, index=k, offset=size, size=len(blob)))
-            blobs.append(blob)
-            size += len(blob)
-            done += m["faces"]
-            if time.time() - last_sent >= BATCH_SECONDS:
-                flush()
+        results = self._meshes(meshes, order, tol, stats, begun)
+        try:
+            for k, enc in results:
+                if self._scene_ended():
+                    cancelled = True
+                    break
+                self._answer_waiting_reads()
+                if k is not None:
+                    m = meshes[k]
+                    done += m["faces"]
+                    if isinstance(enc, Exception):
+                        failed.append(k)
+                        skipped.extend({"obj": name, "error": error_text(enc)} for name in m["objs"])
+                    else:
+                        meta, blob = enc
+                        batch.append(dict(meta, index=k, offset=size, size=len(blob)))
+                        blobs.append(blob)
+                        size += len(blob)
+                if time.time() - last_sent >= BATCH_SECONDS:
+                    flush()
+        finally:
+            results.close()
         flush()
+        stats["brep_s"] = round(stats["brep_s"], 3)
         if not cancelled:
             live = set(mesh_index)
             for key in [key for key in self.mesh_cache if key not in live]:
@@ -614,11 +1228,173 @@ class Worker:
             return enc
         return None
 
-    def _store_mesh(self, m, tol, enc):
+    def _store_mesh(self, m, enc, disk_key):
+        """Keep a mesh in memory and, under `disk_key` (taken when its tessellation began, so a
+        later edit or save cannot file it under the wrong document state), on disk."""
         self.mesh_cache[m["key"]] = (m["shape"], enc)
-        key = self._disk_key(m, tol)
-        if key:
-            self.disk.put(key, enc)
+        if disk_key:
+            self.disk.put(disk_key, enc)
+
+    def _meshes(self, meshes, order, tol, stats, begun):
+        """(k, encoded mesh or the exception that stopped it) for each mesh in `order`, as each is
+        ready: from the caches at once, the others from the tessellators as they finish, handed
+        out biggest first (or meshed here, in order, without tessellators). While it waits it
+        yields (None, None) at least every BATCH_SECONDS and whenever a request comes in, so the
+        caller can answer it, notice the scene is out of date or send what it has.
+
+        A job outlives a scene that stops early: its mesh still goes to the caches when it
+        comes, and a later scene that needs the same shape waits for it instead of starting
+        it again (an edit leaves most shapes as they were).
+
+        A shape whose tessellator died is tried once more (that process may have died before,
+        while idle); one that kills a second is remembered and never meshed again this session,
+        here least of all."""
+        pool = self.pool if self.pool is not None and self.pool.usable() else None
+        stats["tessellators"] = len(pool.ready) + len(pool.starting) if pool else 0
+        queue = collections.deque()  # k waiting for a tessellator
+        mine = {}                    # job -> k, for this scene's jobs
+        tries = collections.Counter()  # k -> tessellators lost on it
+
+        def here(k):
+            m = meshes[k]
+            begun(m)
+            try:
+                enc = encode_mesh(m["shape"], tol)
+            except Exception as e:
+                return e
+            stats["tessellated"] += 1
+            self._store_mesh(m, enc, self._disk_key(m, tol))
+            return enc
+
+        def hand_out():
+            """Give queued shapes to idle tessellators; (k, exception) for those that could not go."""
+            failed = []
+            for t in pool.idle():
+                while queue and t.job is None:
+                    k = queue.popleft()
+                    m = meshes[k]
+                    try:
+                        t0 = time.time()
+                        brep = m["shape"].exportBrepToString().encode("utf-8")
+                        stats["brep_s"] += time.time() - t0
+                    except Exception as e:
+                        failed.append((k, e))
+                        continue
+                    job = self.next_job
+                    self.next_job += 1
+                    if pool.submit(t, job, brep, tol):
+                        self.jobs[job] = (m, tol, self._disk_key(m, tol))
+                        mine[job] = k
+                        begun(m)
+                    else:
+                        queue.appendleft(k)
+                        break
+            return failed
+
+        def take(finished):
+            """File what the tessellators sent, all of it before anything is yielded (the caller
+            may stop at any yield); (k, result) for this scene's shapes that are done."""
+            out = []
+            for job, res, lost in finished:
+                entry = self.jobs.pop(job, None)
+                if entry is not None and not isinstance(res, Exception):
+                    self._store_mesh(entry[0], res, entry[2])
+                if job not in mine:
+                    continue
+                k = mine.pop(job)
+                if lost:
+                    tries[k] += 1
+                    if tries[k] < 2:
+                        queue.appendleft(k)
+                        continue
+                    self.crashed.append((meshes[k]["key"], meshes[k]["shape"]))
+                    res = RuntimeError("this shape stopped two tessellators; it is not meshed again")
+                elif not isinstance(res, Exception):
+                    stats["tessellated"] += 1
+                stats["pooled"] += not isinstance(res, Exception)
+                out.append((k, res))
+            return out
+
+        stats["pooled"] = stats["joined"] = 0
+        for k in order:
+            m = meshes[k]
+            if any(key == m["key"] and shape.isSame(m["shape"]) for key, shape in self.crashed):
+                yield k, RuntimeError("this shape stopped two tessellators; it is not meshed again")
+                continue
+            try:
+                enc = self._cached_mesh(m, tol, stats)
+            except Exception as e:
+                yield k, e
+                continue
+            if enc is not None:
+                yield k, enc
+                continue
+            # A job a stopped scene left running on a live tessellator.
+            job = None if pool is None else next(
+                (j for j, (jm, jtol, _) in self.jobs.items()
+                 if jtol == tol and jm["key"] == m["key"] and pool.holds(j) and jm["shape"].isSame(m["shape"])), None)
+            if job is not None:
+                mine[job] = k
+                stats["joined"] += 1
+            elif pool is None:
+                yield k, here(k)
+            else:
+                queue.append(k)
+                yield from hand_out()
+        while pool is not None and (queue or mine):
+            if not pool.usable():
+                # No tessellator is left (or none ever started): mesh the rest here, as before
+                # there were tessellators. Shapes known to crash OCCT were filtered out above.
+                for job in list(mine):
+                    self.jobs.pop(job, None)
+                    yield mine.pop(job), RuntimeError("the tessellator stopped while meshing this shape")
+                while queue:
+                    k = queue.popleft()
+                    if tries[k]:  # it may be what stopped them
+                        yield k, RuntimeError("the tessellator stopped while meshing this shape")
+                    else:
+                        yield k, here(k)
+                break
+            watched = pool.sockets() + ([self.conn.sock] if self.conn is not None else [])
+            readable = select.select(watched, [], [], BATCH_SECONDS)[0]
+            done = take(pool.finished(readable))
+            done.extend(hand_out())
+            yield from done
+            yield None, None
+
+    def _answer_waiting_reads(self):
+        """Answer the requests that only read, waiting while a scene streams, up to the first
+        that does not (it waits for the scene, and so do those behind it)."""
+        while self.conn is not None and self.conn.pending \
+                and self.conn.pending[0].get("cmd") in ANSWERED_DURING_SCENE:
+            self.conn.send(*self.answer(self.conn.pending.popleft()))
+
+    def answer(self, req):
+        """The reply to one request: (encoded header, payload)."""
+        rid = req.get("id")
+        handler = getattr(self, "cmd_" + str(req.get("cmd")), None)
+        try:
+            if handler is None:
+                raise ValueError("unknown command: %s" % req.get("cmd"))
+            result = handler(req)
+            payload = b""
+            if isinstance(result, tuple):
+                result, payload = result
+            reply = {"id": rid, "ok": True}
+            reply.update(result)
+            return encode_header(reply), payload
+        except Exception as e:  # report to the window, keep serving
+            return encode_header({"id": rid, "ok": False, "error": error_text(e),
+                                  "trace": traceback.format_exc(limit=6)}), b""
+
+    def start_tessellators(self):
+        count = tessellator_count()
+        if count and SOURCE:
+            try:
+                self.pool = Tessellators(count, SOURCE)
+            except Exception as e:
+                print("VibeCAD: tessellators not started, meshing here:", error_text(e), file=sys.stderr)
+                self.pool = None
 
     # ---- helpers ---------------------------------------------------------------------
 
@@ -634,6 +1410,11 @@ class Worker:
         return obj
 
     def _visible(self, o):
+        if o.Name in self.vis_changes:
+            return self.vis_changes[o.Name]
+        decided = _model_visible(self, o)
+        if decided is not None:
+            return decided
         vp = self.gui.get(o.Name)
         if vp is not None and "visible" in vp:
             return vp["visible"]
@@ -648,7 +1429,8 @@ class Worker:
                 parents.setdefault(child.Name, []).append(o)
         out = []
         for o in doc.Objects:
-            if not self._visible(o) or _is_container(o) or _is_datum(o):
+            # Construction planes are infinite; the window draws them from the tree's corners.
+            if not self._visible(o) or _is_container(o) or _is_datum(o) or o.isDerivedFrom("Part::Datum"):
                 continue
             chain, seen, ok = list(parents.get(o.Name, [])), set(), True
             while chain:
@@ -1200,6 +1982,218 @@ class DiskCache:
         self.size = total
 
 
+class Tessellator:
+    """One tessellator process and its connection; `job` is the job it is meshing, or None."""
+
+    def __init__(self, sock, proc):
+        self.sock, self.proc, self.job = sock, proc, None
+
+
+class Tessellators:
+    """Processes that tessellate shapes for this worker, one shape at a time each.
+
+    Each is a freecadcmd running this script with VIBECAD_ROLE=tessellator. It connects back to
+    a listener here and greets with its pid and a token from its environment, so nothing else on
+    the machine can pose as one; the listener closes once every started process has connected
+    or died. A job is a header {"job", "tol"} with the shape as BREP text for payload; the answer
+    is {"job", "ok": true, "meta"} with `encode_mesh`'s blob, or {"job", "ok": false, "error"}.
+    A crash in OCCT costs one tessellator, not the document: the process is started again, up
+    to `restarts` times in all. On Windows the tessellators sit in a job object that ends them
+    with this process, however it ends; elsewhere they end when their connection does (after
+    the shape they are on).
+    """
+
+    def __init__(self, count, source):
+        exe = os.environ.get("VIBECAD_FREECAD_CMD") or sys.executable
+        if not exe or "freecad" not in os.path.basename(exe).lower():
+            raise RuntimeError("FreeCAD's console is not known (VIBECAD_FREECAD_CMD)")
+        self.exe, self.count, self.source = exe, count, source
+        self.token = os.urandom(16).hex()
+        self.ready = []                 # connected Tessellators
+        self.starting = {}              # pid -> (Popen, time started), not connected yet
+        self.listener, self.dir = None, None
+        self.restarts = 4 * count
+        self.contain = _kill_with_this_process()
+        self._start(count)
+
+    def usable(self):
+        """Some are connected or still starting; otherwise shapes are meshed in this process."""
+        return bool(self.ready or self.starting)
+
+    def idle(self):
+        return [t for t in self.ready if t.job is None]
+
+    def holds(self, job):
+        return any(t.job == job for t in self.ready)
+
+    def sockets(self):
+        return ([self.listener] if self.listener is not None else []) + [t.sock for t in self.ready]
+
+    def submit(self, t, job, brep, tol):
+        """Send `t` a job; False when it is gone."""
+        try:
+            send_frame(t.sock, {"job": job, "tol": tol}, brep)
+        except OSError:
+            self._lost(t)
+            return False
+        t.job = job
+        return True
+
+    def finished(self, readable):
+        """(job, (meta, blob) or the exception that stopped it, whether its tessellator died)
+        for each job answered in `readable`; also takes in tessellators that connected, and
+        starts new ones for those that died."""
+        out = []
+        if self.listener is not None and self.listener in readable:
+            self._accept()
+        for t in [t for t in self.ready if t.sock in readable]:
+            try:
+                header, payload = recv_frame(t.sock)
+            except (EOFError, OSError, ValueError):
+                job = t.job
+                self._lost(t)
+                if job is not None:
+                    out.append((job, RuntimeError("the tessellator stopped while meshing this shape"), True))
+                continue
+            job, t.job = header.get("job"), None
+            if header.get("ok"):
+                out.append((job, (header["meta"], payload), False))
+            else:
+                out.append((job, RuntimeError(header.get("error") or "tessellation failed"), False))
+        self._settle()
+        return out
+
+    def abandon(self):
+        """Stop the jobs under way (of a document closed since): their tessellators start anew."""
+        for t in [t for t in self.ready if t.job is not None]:
+            self.restarts += 1  # not a crash
+            self._lost(t)
+
+    def _start(self, n):
+        if self.listener is None:
+            self.listener = socket.socket()
+            self.listener.bind(("127.0.0.1", 0))
+            self.listener.listen(n + 4)
+            self.listener.setblocking(False)
+        if self.dir is None:
+            self.dir = tempfile.mkdtemp(prefix="vibecad-tessellator-")  # private to this user
+        script = os.path.join(self.dir, "vibecad_worker.py")
+        if not os.path.exists(script):  # a process starting now may be reading it
+            with open(script, "wb") as f:
+                f.write(self.source)
+        env = dict(os.environ, VIBECAD_ROLE="tessellator", VIBECAD_TOKEN=self.token,
+                   VIBECAD_ADDR="127.0.0.1:%d" % self.listener.getsockname()[1])
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        for _ in range(n):
+            try:
+                # stderr goes where this process's goes: the window's log.
+                p = subprocess.Popen([self.exe, script], env=env, stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.DEVNULL, creationflags=flags)
+            except OSError:
+                break
+            if self.contain is not None:
+                self.contain(p)
+            self.starting[p.pid] = (p, time.time())
+        self._settle()
+
+    def _accept(self):
+        while True:
+            try:
+                sock, _ = self.listener.accept()
+            except OSError:  # BlockingIOError: nobody else is waiting
+                return
+            try:
+                sock.setblocking(True)
+                sock.settimeout(2)  # a process of ours greets at once
+                hello, _ = recv_frame(sock)
+                sock.settimeout(None)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                token = str(hello.get("token", "")).encode("utf-8", "replace")
+                pid = hello.get("pid")
+                ours = hmac.compare_digest(token, self.token.encode()) and isinstance(pid, int) and pid in self.starting
+            except Exception:
+                ours = False
+            if not ours:
+                sock.close()
+                continue
+            proc, _ = self.starting.pop(pid)
+            self.ready.append(Tessellator(sock, proc))
+
+    def _lost(self, t):
+        try:
+            t.sock.close()
+        except OSError:
+            pass
+        try:
+            t.proc.kill()
+        except OSError:
+            pass
+        self.ready.remove(t)
+        if self.restarts > 0:
+            self.restarts -= 1
+            self._start(1)
+
+    def _settle(self):
+        """Forget processes that died or never connected; close the listener and remove the
+        script once nobody is left to connect."""
+        now = time.time()
+        for pid, (p, started) in list(self.starting.items()):
+            late = now - started > TESSELLATOR_START_SECONDS
+            if p.poll() is not None or late:
+                if late:
+                    p.kill()
+                del self.starting[pid]
+        if not self.starting:
+            if self.listener is not None:
+                self.listener.close()
+                self.listener = None
+            if self.dir is not None:
+                shutil.rmtree(self.dir, ignore_errors=True)
+                self.dir = None
+
+
+def _kill_with_this_process():
+    """On Windows, a function that puts a started process into a job object ending it with this
+    process, even when this one is killed; None elsewhere or when that fails."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class Basic(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                        ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                        ("SchedulingClass", wintypes.DWORD)]
+
+        class Io(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_uint64) for n in ("Reads", "Writes", "Others", "ReadBytes", "WriteBytes", "OtherBytes")]
+
+        class Extended(ctypes.Structure):
+            _fields_ = [("Basic", Basic), ("Io", Io), ("ProcessMemoryLimit", ctypes.c_size_t),
+                        ("JobMemoryLimit", ctypes.c_size_t), ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        job = k32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        info = Extended()
+        info.Basic.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):  # ExtendedLimitInformation
+            return None
+        # The handle stays open as long as this process does: when it ends, so do they.
+        return lambda proc: k32.AssignProcessToJobObject(job, int(proc._handle))
+    except Exception:
+        return None
+
+
 def _finite(x):
     try:
         return math.isfinite(float(x))
@@ -1218,6 +2212,26 @@ def _is_container(o):
     """Groups whose members are drawn rather than the group itself. A Body shows its tip feature."""
     return o.isDerivedFrom("App::Part") or o.isDerivedFrom("App::DocumentObjectGroup") \
         or o.isDerivedFrom("PartDesign::Body")
+
+
+def _profiles(o):
+    """The sketches a feature is built from: a Pad's or Pocket's profile, a loft's sections, a
+    sweep's spine."""
+    links = []
+    for prop in ("Profile", "Spine"):
+        v = getattr(o, prop, None) if prop in o.PropertiesList else None
+        links.append(v[0] if isinstance(v, tuple) else v)
+    if "Sections" in o.PropertiesList:
+        links.extend(v[0] if isinstance(v, tuple) else v for v in (o.Sections or []))
+    return [x for x in links if x is not None and hasattr(x, "TypeId") and x.isDerivedFrom("Part::Part2DObject")]
+
+
+def _tip(o):
+    """The name of a body's tip feature, or None (an empty body, or not a body)."""
+    if not o.isDerivedFrom("PartDesign::Body"):
+        return None
+    tip = getattr(o, "Tip", None)
+    return tip.Name if tip is not None else None
 
 
 def _is_datum(o):
@@ -1460,30 +2474,43 @@ def serve(addr):
     conn = worker.conn = Conn(sock)
     send_frame(sock, {"id": 0, "ok": True, "hello": True, "token": os.environ.get("VIBECAD_TOKEN", ""),
                       "freecad": ".".join(FreeCAD.Version()[:3]), "python": sys.version.split()[0]})
+    # They start while the window asks for its document.
+    worker.start_tessellators()
     while True:
         try:
             req = conn.next()
         except (EOFError, ConnectionError):
             return
-        rid = req.get("id")
-        handler = getattr(worker, "cmd_" + str(req.get("cmd")), None)
+        conn.send(*worker.answer(req))
+
+
+def serve_tessellator(addr):
+    """A tessellator (see `Tessellators`): mesh the shapes the worker sends until it goes away."""
+    host, port = addr.rsplit(":", 1)
+    sock = socket.create_connection((host, int(port)))
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    send_frame(sock, {"token": os.environ.get("VIBECAD_TOKEN", ""), "pid": os.getpid()})
+    while True:
         try:
-            if handler is None:
-                raise ValueError("unknown command: %s" % req.get("cmd"))
-            result = handler(req)
-            payload = b""
-            if isinstance(result, tuple):
-                result, payload = result
-            reply = {"id": rid, "ok": True}
-            reply.update(result)
-            encoded = encode_header(reply)
-        except Exception as e:  # report to the window, keep serving
-            payload = b""
-            encoded = encode_header({"id": rid, "ok": False, "error": error_text(e),
-                                     "trace": traceback.format_exc(limit=6)})
-        send_frame(sock, encoded, payload)
+            header, brep = recv_frame(sock)
+        except (EOFError, OSError):
+            return
+        job = header.get("job")
+        try:
+            shape = Part.Shape()
+            shape.importBrepFromString(brep.decode("utf-8"))
+            meta, blob = encode_mesh(shape, header["tol"])
+            reply, payload = {"job": job, "ok": True, "meta": meta}, blob
+        except Exception as e:
+            reply, payload = {"job": job, "ok": False, "error": error_text(e)}, b""
+        try:
+            send_frame(sock, reply, payload)
+        except OSError:
+            return
 
 
 addr = os.environ.get("VIBECAD_ADDR")
-if addr:
+if addr and os.environ.get("VIBECAD_ROLE") == "tessellator":
+    serve_tessellator(addr)
+elif addr:
     serve(addr)

@@ -4,8 +4,9 @@ A small native window over FreeCAD's modelling core. FreeCAD runs headless in it
 VibeCAD draws its shapes with wgpu and edits its documents through it. Documents stay ordinary
 `.FCStd` files that FreeCAD opens as before, colours included.
 
-Prototype. It opens, shows, picks, edits properties, undoes, saves and exports. There is no
-sketcher and no way to create features yet.
+Prototype. It opens, shows, picks, edits properties, undoes, saves and exports, and models with
+a first set of operations (construction planes, extrude, fillet, chamfer, mirror, circular and
+linear patterns, copy, delete). There is no sketcher yet.
 
 ## Run
 
@@ -50,7 +51,38 @@ EDGE WIDTH slider sets the edge width from 1 to 4 pixels (default 1.5).
 | `O` | orthographic / perspective |
 | Ctrl+O, Ctrl+S, Ctrl+Shift+S, Ctrl+E | open, save, save as, export |
 | Ctrl+Z, Ctrl+Y | undo, redo |
-| Esc | clear the selection |
+| Esc | close the open command, else clear the selection |
+| Del | delete the selected object |
+
+## Modelling
+
+EDIT holds the operations. Each opens a dialog where the properties are; it starts from what is
+selected, and while it is open a click in the view or the tree fills its lit field (the part, or
+a face or plane). OK makes one undoable step; the new object is selected, so its numbers can be
+changed in the property panel afterwards. Everything made is a native FreeCAD object, so FreeCAD
+opens the document as before.
+
+| Command | Takes | Makes |
+| --- | --- | --- |
+| Plane | a flat face, a construction plane or XY/XZ/YZ; offset, angle | `PartDesign::Plane` attached to it |
+| Extrude | a flat face (or a sketch from the tree); distance, both sides | `Pad` (positive) or `Pocket` (negative) |
+| Fillet, Chamfer | a face: all its edges; radius or size | `PartDesign::Fillet` / `Chamfer` |
+| Mirror | a part, a plane; new solid or join | `Part::Mirroring`, or `PartDesign::Mirrored` of the whole body |
+| Circular | a part, X/Y/Z or a round face (its axis); count, angle | `PartDesign::PolarPattern` of the whole body |
+| Linear | a part, X/Y/Z or a flat face (its normal); count, spacing | `PartDesign::LinearPattern` of the whole body |
+| Copy | a part; move X/Y/Z, linked | an independent copy, or an `App::Link` |
+| Delete | the selection | removes it; refused while another object uses it |
+
+- A feature goes after its body's tip and becomes the tip; only the tip of a body is drawn, as in
+  FreeCAD. Patterns and joined mirrors work on the whole body, which may then hold several solids.
+- A plain solid (a Part feature, an imported shape, a mirror image) that gets a PartDesign
+  feature first becomes the base of a new body, as FreeCAD's "body from a solid" does; its face
+  numbers stay the same. A link shows another part, so it is mirrored and copied, not changed.
+- A step whose result fails to compute, or leaves no solid, is undone at once and its error is
+  shown; nothing half-made stays in the document.
+- Construction planes are drawn as translucent orange squares over the model, centred where
+  the model's centre falls on them, and can be clicked. A placement (a plane's
+  `AttachmentOffset`, an object's `Placement`) shows as six numbers: x, y, z, yaw, pitch, roll.
 
 Typed numbers apply on Enter or when the field loses focus. Opening another file or closing the
 window asks before unsaved edits are lost. If FreeCAD crashes, File → Restart FreeCAD starts a new
@@ -73,9 +105,30 @@ one and reopens the file.
   random `VIBECAD_TOKEN`; the script connects back and must greet with the token. The listener
   closes after that one connection, and the directory is removed once FreeCAD has read the script. Every message is a JSON header plus an optional binary payload, both
   length-prefixed (see the script's docstring). Commands: `open`, `new`, `tree`, `props`,
-  `set_prop`, `set_visible`, `undo`, `redo`, `scene`, `save_as`, `export`, `snapshot`,
-  `timeline`, `slice`, `diff`. Requests go out as
-  they are made; replies come back in order, a scene's stream frames before its reply.
+  `set_prop`, `set_visible`, `undo`, `redo`, `scene`, `save_as`, `export`, the modelling
+  ones (`datum_plane`, `extrude`, `fillet`, `mirror`, `pattern`, `copy`, `delete`), and the
+  agent's (`snapshot`, `timeline`, `slice`, `diff`). Requests go out as
+  they are made; replies come back in order, a scene's stream frames before its reply, except
+  that `tree` and `props` asked while a scene streams are answered at once, between its frames,
+  so the tree and the properties of a selected part do not wait for a large assembly to load.
+  The window writes each request from a thread of its own the moment it is made, and matches
+  replies to requests by id.
+- **Tessellators.** The worker does not tessellate itself: it starts processes of its own
+  (`VIBECAD_TESSELLATORS`; by default one per core but one, at most 4; 0 meshes in the worker), each a
+  `freecadcmd` running the same script with `VIBECAD_ROLE=tessellator` and connecting back to
+  the worker with a token, as the worker does to the window. A shape goes to an idle one as
+  BREP text (`exportBrepToString`) with the tolerance, and its mesh comes back in the same
+  format as the scene's. Faces keep their order through BREP, so face numbers, colours and
+  picking are unchanged; OCCT may split a face along the other diagonal or add a point or two
+  on a curved one, within the tolerance. A crash in OCCT costs a process, which is started
+  again, not the document: the shape is tried once more, and one that stops a second
+  tessellator is reported in `skipped` and not meshed again in that session. On Windows the
+  tessellators sit in a job object that ends them with the worker, even when the window kills
+  it; elsewhere they end once the worker's connection closes, after the shape they are on. On
+  `open` and `new` the shapes still being meshed for the old document are dropped. If no
+  tessellator can be started (`freecadcmd` unknown: the window passes its path in
+  `VIBECAD_FREECAD_CMD`) the worker meshes itself, as before. The scene's `stats` say how many
+  tessellators there were and how many meshes they made (`pooled`).
 - **Scene.** The worker tessellates each distinct shape once (`MeshPart.meshFromShape` with one
   segment per face) and sends instances that place it, so the 265 links of an assembly with 121
   parts cost 121 meshes. Curves are cut into segments of at most 10° (0.17 rad), so circles are round on screen.
@@ -88,19 +141,24 @@ one and reopens the file.
 - **Loading in stages.** `scene` streams: first, before any tessellation, every instance's
   placement, colours and its shape's box (FreeCAD's `BoundBox`); the window draws those as
   translucent boxes and fits the view, so the tree, selection and orbiting work at once. Then
-  the meshes, biggest box first, in batches about every 0.3 s; each batch is uploaded as its
+  the meshes, handed to the tessellators biggest box first and sent as they finish, in batches
+  about every 0.3 s; each batch is uploaded as its
   own chunk of GPU buffers and replaces its boxes, and faces are numbered in arrival order, so
   picking, highlight and culling work on a partial scene. Progress frames count faces, not
   objects; the view shows a bar with the percentage, the part being tessellated and the time
   left. After an edit the old scene stays until the new one's first meshes arrive. A request
   that changes the scene (`scene`, `open`, `set_prop`, `undo`, …) arriving mid-stream ends the
-  stream (the worker looks between two meshes) and the window ignores what was left of it.
+  stream (the worker looks between two meshes, and at least every 0.3 s while it waits for the
+  tessellators) and the window ignores what was left of it. Shapes already handed out are
+  meshed to the end and go to the caches; the next scene waits for those it still needs instead
+  of meshing them again, so an edit during a load costs little.
 - **Mesh caches.** In memory by shape hash, so after an edit only changed shapes are
   tessellated again. On disk in `%LOCALAPPDATA%\VibeCAD\cache` (`$XDG_CACHE_HOME/vibecad`,
   `~/Library/Caches/VibeCAD`; `VIBECAD_CACHE_DIR` overrides), keyed by the SHA-256 of the
   `.FCStd` file the shape comes from, the object's name, the tolerance, FreeCAD's version and a
   cache version. A document edited in this session (`set_prop`, undo, redo) uses no disk entry
-  until it is saved, so an edited shape is never served from a stale one. Entries past 1 GB are
+  until it is saved, so an edited shape is never served from a stale one (the key is taken when
+  a shape is handed out, so a save or an undo while it is meshed cannot misfile it). Entries past 1 GB are
   dropped, least recently used first. Hashing each shape's BREP instead was measured and
   rejected: 3 s and 76 MB of strings for the Orbiter assembly, against 13 ms for its file.
 - **Drawing.** Each mesh is uploaded once (vertices split per face, so faces keep sharp normals
@@ -113,13 +171,15 @@ one and reopens the file.
   (so they face outward); such meshes are drawn with back faces culled, with the winding
   flipped for mirrored instances. Open shells, sketches and anything else are drawn from both
   sides. The status line shows how many objects and triangles the last frame drew.
-- **Shading.** Matte: sky/ground ambient, a headlight and a key light from above, no highlight,
-  two-sided. The view is drawn with 4x MSAA (1x where the GPU's formats lack it, or with
-  `VIBECAD_NO_MSAA` set) and resolved into the texture egui shows. Edges are not GPU lines:
-  each segment becomes a screen-facing quad in the vertex shader (from the edge points in a
-  storage buffer), clipped at the near plane before the divide, with a soft falloff across its
-  width and alpha blending; the ends reach half the width past the points so corners close.
-  Faces carry a depth bias so the edges on them win; hidden edges stay hidden.
+- **Shading.** Plastic lit in linear light and written back as sRGB: a soft sky and ground, a
+  headlight, a key light from above-front, a soft highlight and a faint fresnel rim, with a gentle
+  shoulder so light parts do not burn out. (Lighting the sRGB values directly darkened and greyed
+  every face turned from the light.) Two-sided. The view is drawn with 4x MSAA (1x where the
+  GPU's formats lack it, or with `VIBECAD_NO_MSAA` set) and resolved into the texture egui shows.
+  Edges are not GPU lines: each segment becomes a screen-facing quad in the vertex shader (from
+  the edge points in a storage buffer), clipped at the near plane before the divide, with a soft
+  falloff across its width and alpha blending; the ends reach half the width past the points so
+  corners close. Faces carry a depth bias so the edges on them win; hidden edges stay hidden.
 - **Picking.** Face ids are drawn in their own single-sample pass into an `R32Uint` target,
   without lighting, only when a click asks: the pass replays the last frame's camera and
   culled instances, scissored to the clicked pixel, and the pixel is read back and mapped to
@@ -173,18 +233,34 @@ with the agent's next tool result.
 ```
 cargo test                                         # scene decoding, the camera, the shader (naga)
 python worker/test_worker.py examples/plate.FCStd  # the worker protocol, against a real FreeCAD
+python worker/test_modelling.py                    # the modelling commands, against a real FreeCAD
 python worker/test_mcp.py                          # MCP end to end: opens the window, drives it, closes it
 ```
 
+`test_modelling.py` runs every modelling command on the example plate and checks what is drawn
+and where (planes on faces and origin planes, extrude both ways, fillet, chamfer, mirror three
+ways, patterns about an axis and a hole, copies, deletes), that refused and failed steps leave
+nothing behind, and undoes each step.
+
 `test_worker.py` gives the worker an empty disk cache, checks the scene stream (boxes first,
-progress in faces, each mesh once, biggest first), opens every file again in a new process to
-check that all meshes come from the disk cache, that an edited shape does not, and that a second
-`scene` sent mid-stream ends the first.
+progress in faces, each mesh once, biggest first when nothing was tessellated), that a `tree`
+sent during a scene longer than a second is answered before it, opens every file again in a new
+process to check that all meshes come from the disk cache, that an edited shape does not, and
+that a second `scene` sent mid-stream ends the first. Last it loads every file twice more from
+an empty cache, meshed in the worker (`VIBECAD_TESSELLATORS=0`) and by the tessellators, and
+checks that the tessellators made every mesh and that the meshes agree: the same faces and
+flags, triangle counts within 1 %, the same box within the tolerance. Give it a large assembly
+too, so the tessellators run in parallel:
+
+```
+python worker/test_worker.py examples/plate.FCStd path/to/assembly.FCStd
+```
 
 `VIBECAD_SELFTEST=<dir> vibecad examples/plate.FCStd` drives the window itself: it keeps a frame
 of the boxes and one of a partly loaded scene while the document streams in, zooms in and back,
 picks faces (a grid of points and two inside the first object's box), selects `Pad`, sets
-`Length` to 12, undoes, writes frames as BMP and `report.json` to `<dir>`, and quits. The
+`Length` to 12, undoes, extrudes the top face and puts a construction plane over it through the
+modelling commands, writes frames as BMP and `report.json` to `<dir>`, and quits. The
 report's `load` entry is the timeline of the first scene (boxes, first meshes, all meshes, in
 ms after the request, and the worker's cache hits); `perf` gives the GPU memory of the scene,
 the time to decode and upload it, the objects and triangles drawn and the time per frame (30
@@ -193,14 +269,22 @@ documents, where the `Pad` steps just report an error.
 
 ## Limits
 
-- No sketcher, no new features, no deleting objects yet. Properties of type length, angle,
-  number, integer, bool, string and enumeration are editable; others are shown as text.
+- No sketcher, and edges cannot be picked: fillets and chamfers take every edge of a face, and
+  a construction plane cannot be put on an edge. Properties of type length, angle, number,
+  integer, bool, string, enumeration and placement are editable; others are shown as text.
+- Construction planes are drawn over the view without depth, so they show through parts in
+  front of them.
 - The first view of a large assembly takes time: the 158 000-face Orbiter assembly shows its
   boxes 0.5 s after it is open, its first mesh after 2.3 s and all of it after about 19 s
   (some 3 s of that checking which shapes are closed solids); from the disk cache all of it
-  takes 0.6 s. OCCT meshes each shape on one thread here: `MeshPart` has no parallel option,
-  and tessellating shapes on four Python threads saved only 17 % (9.6 s instead of 11.5 s for
-  the meshing alone, at twice the CPU), so it is not done.
+  takes 0.6 s. OCCT meshes each shape on one thread: `MeshPart` has no parallel option, and
+  four Python threads saved only 17 % (9.6 s instead of 11.5 s for the meshing alone), hence
+  processes. On the Orbiter assembly as it is now (51 distinct shapes, 93 500 faces, 16 cores)
+  a cold load took 12.8 s meshed in the worker, 7.5 s with 2 tessellators, 4.5 s with 4 and 4.0 s
+  with 8; past 4 the biggest parts set the pace. Writing the shapes as BREP costs the worker
+  about 1.8 s of that, spread over the load. Each tessellator is a FreeCAD of about 70 MB, and
+  the first scene after start waits for them to connect (some 0.1 s). A shape on which OCCT
+  hangs keeps its tessellator, and the scene waits for it, without a time limit.
 - Boxes are FreeCAD's bounding boxes, which for some curved shapes are much larger than the
   shape; they are only a placeholder until the mesh arrives.
 - Meshes share one vertex, one index and one edge buffer per batch. The window asks the GPU

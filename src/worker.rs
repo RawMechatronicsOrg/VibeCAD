@@ -1,7 +1,8 @@
 //! The FreeCAD worker: a headless `freecadcmd` running `worker/vibecad_worker.py`, reached over a
 //! localhost socket. One thread owns the socket; the UI never blocks. Requests are written as
-//! they come, so one can reach the worker while a scene streams (and end that stream); replies
-//! come back in request order, a scene's partial frames before its reply.
+//! they come, so one can reach the worker while a scene streams (and end that stream, or, for
+//! `tree` and `props`, be answered between its frames); replies are matched to requests by id,
+//! a scene's partial frames before its reply. The worker tessellates in processes of its own.
 //!
 //! The script is written to a fresh private directory for each run, and the worker must greet
 //! with a random token passed in its environment, so another local user can neither swap the
@@ -14,6 +15,7 @@ use std::net::{TcpListener, TcpStream};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -206,6 +208,8 @@ fn run(
     push_log(log, format!("starting {} {}", exe.display(), script.display()));
     let mut child = Command::new(&exe)
         .arg(&script)
+        // The worker starts its tessellators with the same FreeCAD.
+        .env("VIBECAD_FREECAD_CMD", &exe)
         .env("VIBECAD_ADDR", addr.to_string())
         .env("VIBECAD_TOKEN", &token)
         .stdin(Stdio::null())
@@ -264,38 +268,48 @@ fn run(
     let _ = events.send(Event::Ready { freecad });
     repaint();
 
-    // Requests written and not yet answered, oldest first: the worker answers in that order.
-    let mut waiting: VecDeque<u64> = VecDeque::new();
-    loop {
-        if waiting.is_empty() {
-            let Ok((id, req)) = requests.recv() else { break };
-            send_frame(&mut sock, &req)?;
-            waiting.push_back(id);
-        }
-        // Anything asked meanwhile goes out now, so the worker sees it between two meshes.
-        while let Ok((id, req)) = requests.try_recv() {
-            send_frame(&mut sock, &req)?;
-            waiting.push_back(id);
-        }
-        let id = waiting[0];
-        let (raw, payload) = recv_frame(&mut sock).context("worker connection lost")?;
-        let header = match serde_json::from_slice::<Value>(&raw) {
-            Ok(h) => h,
-            Err(e) => {
-                waiting.pop_front();
-                if events.send(Event::Reply(Reply { id, result: Err(format!("unreadable reply from the worker: {e}")) })).is_err() {
-                    break;
+    // Requests written and not yet answered, oldest first: the worker answers in that order,
+    // except for the reads it answers while a scene streams. A thread of its own writes each
+    // request the moment it is made, so it reaches the worker even while a long scene sends
+    // nothing; it notes the id here before the request goes out, so every reply finds its id.
+    let waiting = Arc::new(Mutex::new(VecDeque::<u64>::new()));
+    let window_gone = Arc::new(AtomicBool::new(false));
+    {
+        let (waiting, window_gone, mut out) = (waiting.clone(), window_gone.clone(), sock.try_clone()?);
+        std::thread::Builder::new().name("freecad-requests".into()).spawn(move || {
+            for (id, req) in requests {
+                waiting.lock().unwrap().push_back(id);
+                if send_frame(&mut out, &req).is_err() {
+                    return; // the worker is gone; the reader finds out by itself
                 }
-                continue;
             }
+            // The window dropped the worker: wake the reader, which stops quietly.
+            window_gone.store(true, Ordering::SeqCst);
+            let _ = out.shutdown(std::net::Shutdown::Both);
+        })?;
+    }
+    loop {
+        let (raw, payload) = match recv_frame(&mut sock) {
+            Ok(frame) => frame,
+            Err(_) if window_gone.load(Ordering::SeqCst) => break,
+            Err(e) => return Err(e.context("worker connection lost")),
         };
-        if header["id"].as_u64() != Some(id) {
-            bail!("worker replied to request {} while {id} was waiting", header["id"]);
-        }
+        // Without its id a reply cannot be matched any more: give up on this worker.
+        let header = serde_json::from_slice::<Value>(&raw).context("unreadable reply from the worker")?;
+        let id = {
+            let mut waiting = waiting.lock().unwrap();
+            let Some(at) = waiting.iter().position(|w| header["id"].as_u64() == Some(*w)) else {
+                bail!("worker replied to request {}, which is not waiting", header["id"]);
+            };
+            let id = waiting[at];
+            if header["partial"].as_bool() != Some(true) {
+                waiting.remove(at);
+            }
+            id
+        };
         let event = if header["partial"].as_bool() == Some(true) {
             Event::Stream { id, part: decode_part(&header, &payload) }
         } else {
-            waiting.pop_front();
             let result = if header["ok"].as_bool() == Some(true) {
                 Ok(Body::Json(header))
             } else {

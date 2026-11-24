@@ -5,8 +5,10 @@ use eframe::egui::{self, Align2, Color32, Id, Pos2, Rect, RichText, Sense, Strok
 use glam::Vec3;
 
 use crate::camera::Camera;
+use crate::modelling::{self, Op};
+use crate::navigation::Scheme;
 
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Tab {
     #[default]
     File,
@@ -27,9 +29,8 @@ pub enum Action {
     Undo,
     Redo,
     Fit,
-    /// Look along minus this direction (the camera sits on its side).
-    ViewFrom(Vec3),
-    ToggleOrtho,
+    /// Orthographic (true) or perspective projection.
+    Projection(bool),
     ToggleEdges,
     ToggleLog,
     ToggleGrid,
@@ -43,11 +44,20 @@ pub enum Action {
     ClearFeed,
     /// Put the command that adds this MCP server to Claude Code on the clipboard.
     CopyMcpSetup,
+    /// How mouse drags move the camera.
+    Navigation(Scheme),
+    /// Open a modelling command's dialog.
+    Command(Op),
+    /// Delete the selected object.
+    Delete,
 }
 
 /// What the ribbon needs to know to enable and mark its buttons.
 pub struct RibbonState {
     pub has_doc: bool,
+    pub has_selection: bool,
+    /// The modelling command whose dialog is open.
+    pub command: Option<Op>,
     pub can_open: bool,
     pub undo: u64,
     pub redo: u64,
@@ -63,6 +73,7 @@ pub struct RibbonState {
     pub agent: Result<u16, String>,
     pub agent_calls: usize,
     pub agent_running: bool,
+    pub navigation: Scheme,
 }
 
 pub fn ribbon(ui: &mut egui::Ui, tab: &mut Tab, s: &RibbonState, status: impl FnOnce(&mut egui::Ui)) -> Vec<Action> {
@@ -106,23 +117,56 @@ pub fn ribbon(ui: &mut egui::Ui, tab: &mut Tab, s: &RibbonState, status: impl Fn
                     button(ui, &mut out, Action::Undo, Icon::Undo, &undo, s.undo > 0, false, "Ctrl+Z");
                     button(ui, &mut out, Action::Redo, Icon::Redo, &redo, s.redo > 0, false, "Ctrl+Y");
                 });
+                let mut command = |ui: &mut egui::Ui, op: Op| {
+                    button(ui, &mut out, Action::Command(op), Icon::Op(op), op.label(), s.has_doc, s.command == Some(op), op.hint());
+                };
+                group(ui, "CONSTRUCT", |ui| command(ui, Op::Plane));
+                group(ui, "CREATE", |ui| command(ui, Op::Extrude));
+                group(ui, "MODIFY", |ui| {
+                    command(ui, Op::Fillet);
+                    command(ui, Op::Chamfer);
+                });
+                group(ui, "PATTERN", |ui| {
+                    command(ui, Op::Mirror);
+                    command(ui, Op::Circular);
+                    command(ui, Op::Linear);
+                    command(ui, Op::Copy);
+                });
+                group(ui, "DELETE", |ui| {
+                    button(ui, &mut out, Action::Delete, Icon::Delete, "Delete", s.has_selection, false, "Delete the selected object (Del)");
+                });
             }
             Tab::View => {
                 group(ui, "NAVIGATE", |ui| {
                     button(ui, &mut out, Action::Fit, Icon::Fit, "Fit all", true, false, "F, or double-click the view");
                 });
-                group(ui, "STANDARD VIEWS", |ui| {
-                    for (label, key, dir) in [
-                        ("Iso", "0", Vec3::new(1.0, -1.0, 1.0)),
-                        ("Front", "1", Vec3::NEG_Y),
-                        ("Top", "2", Vec3::Z),
-                        ("Right", "3", Vec3::X),
-                    ] {
-                        button(ui, &mut out, Action::ViewFrom(dir), Icon::ViewFrom(dir), label, true, false, key);
-                    }
+                group(ui, "MOUSE", |ui| {
+                    ui.vertical(|ui| {
+                        ui.add_space(12.0);
+                        let mut n = s.navigation;
+                        egui::ComboBox::from_id_salt("navigation")
+                            .width(130.0)
+                            .selected_text(n.name())
+                            .show_ui(ui, |ui| {
+                                for scheme in Scheme::ALL {
+                                    ui.selectable_value(&mut n, scheme, scheme.name()).on_hover_text(scheme.hint());
+                                }
+                            })
+                            .response
+                            .on_hover_text(format!("How the mouse moves the camera, after the program you know.
+{}", n.hint()));
+                        if n != s.navigation {
+                            out.push(Action::Navigation(n));
+                        }
+                    });
+                });
+                // Two buttons, one lit: which projection is on reads at a glance.
+                group(ui, "PROJECTION", |ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    button(ui, &mut out, Action::Projection(true), Icon::Ortho, "Ortho", true, s.ortho, "Orthographic: parallel lines stay parallel, sizes do not shrink with distance (O switches)");
+                    button(ui, &mut out, Action::Projection(false), Icon::Perspective, "Perspective", true, !s.ortho, "Perspective: farther things look smaller, as to the eye (O switches)");
                 });
                 group(ui, "DISPLAY", |ui| {
-                    button(ui, &mut out, Action::ToggleOrtho, Icon::Ortho, "Ortho", true, s.ortho, "Orthographic projection (O); off: perspective");
                     button(ui, &mut out, Action::ToggleEdges, Icon::Edges, "Edges", true, s.edges, "");
                     button(
                         ui,
@@ -199,8 +243,8 @@ enum Icon {
     Undo,
     Redo,
     Fit,
-    ViewFrom(Vec3),
     Ortho,
+    Perspective,
     Edges,
     Palette,
     Log,
@@ -209,6 +253,8 @@ enum Icon {
     Pause,
     Clear,
     Copy,
+    Op(Op),
+    Delete,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -297,28 +343,20 @@ fn paint_icon(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
             }
             p.rect_stroke(Rect::from_min_max(at(0.32, 0.32), at(0.68, 0.68)), 1.0, s, egui::StrokeKind::Middle);
         }
-        Icon::ViewFrom(dir) => {
-            // A small cube in the isometric view, with the face the view looks at filled.
-            let iso = [(0.5, 0.05), (0.92, 0.27), (0.92, 0.73), (0.5, 0.95), (0.08, 0.73), (0.08, 0.27)];
-            let centre = (0.5, 0.5);
-            let faces: [(Vec3, [(f32, f32); 4]); 3] = [
-                (Vec3::Z, [iso[0], iso[1], centre, iso[5]]),
-                (Vec3::NEG_Y, [iso[5], centre, iso[3], iso[4]]),
-                (Vec3::X, [centre, iso[1], iso[2], iso[3]]),
-            ];
-            for (n, quad) in faces {
-                let pts: Vec<Pos2> = quad.iter().map(|&(x, y)| at(x, y)).collect();
-                let lit = n.dot(dir.normalize_or(Vec3::Z)) > 0.3;
-                let fill = if lit { c.gamma_multiply(0.55) } else { Color32::TRANSPARENT };
-                p.add(egui::Shape::convex_polygon(pts, fill, s));
+        Icon::Ortho | Icon::Perspective => {
+            // A wire cube: the back face as big as the front one and its edges parallel, or
+            // smaller and its edges running toward a vanishing point.
+            let front = [(0.05, 0.35), (0.6, 0.35), (0.6, 0.9), (0.05, 0.9)];
+            let back = if let Icon::Ortho = icon {
+                [(0.4, 0.1), (0.95, 0.1), (0.95, 0.65), (0.4, 0.65)]
+            } else {
+                [(0.62, 0.08), (0.92, 0.08), (0.92, 0.38), (0.62, 0.38)]
+            };
+            poly(&back, true);
+            for (f, b) in front.iter().zip(&back) {
+                p.line_segment([at(f.0, f.1), at(b.0, b.1)], Stroke::new(1.0, c));
             }
-        }
-        Icon::Ortho => {
-            poly(&[(0.25, 0.1), (0.95, 0.1), (0.75, 0.9), (0.05, 0.9)], true);
-            for t in [0.37, 0.63] {
-                p.line_segment([at(0.25 + 0.7 * t, 0.1), at(0.05 + 0.7 * t, 0.9)], Stroke::new(1.0, c));
-                p.line_segment([at(0.25 - 0.2 * t, 0.1 + 0.8 * t), at(0.95 - 0.2 * t, 0.1 + 0.8 * t)], Stroke::new(1.0, c));
-            }
+            poly(&front, true);
         }
         Icon::Edges => {
             poly(&[(0.1, 0.3), (0.6, 0.3), (0.6, 0.9), (0.1, 0.9)], true);
@@ -364,6 +402,8 @@ fn paint_icon(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
             p.rect_stroke(Rect::from_min_max(at(0.1, 0.25), at(0.65, 0.95)), 1.0, s, egui::StrokeKind::Middle);
             poly(&[(0.35, 0.25), (0.35, 0.05), (0.9, 0.05), (0.9, 0.75), (0.65, 0.75)], false);
         }
+        Icon::Op(op) => modelling::paint_icon(p, r, op, c),
+        Icon::Delete => modelling::paint_delete(p, r, c),
         Icon::Log => {
             poly(&[(0.15, 0.05), (0.85, 0.05), (0.85, 0.95), (0.15, 0.95)], true);
             for y in [0.3, 0.5, 0.7] {
@@ -762,7 +802,7 @@ pub fn ground_labels(painter: &egui::Painter, grid: crate::render::GroundGrid, v
 }
 
 /// Whether `p` is inside the convex polygon `poly`, whichever way round its points go.
-fn inside_convex(p: Pos2, poly: &[Pos2]) -> bool {
+pub fn inside_convex(p: Pos2, poly: &[Pos2]) -> bool {
     let mut sign = 0.0f32;
     for (i, a) in poly.iter().enumerate() {
         let b = poly[(i + 1) % poly.len()];
@@ -777,6 +817,175 @@ fn inside_convex(p: Pos2, poly: &[Pos2]) -> bool {
         }
     }
     sign != 0.0
+}
+
+/// The families of objects in the model tree, each with its own badge.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Family {
+    Body,
+    Sketch,
+    /// Adds material: pad, revolve, loft, sweep.
+    Add,
+    /// Removes material: pocket, groove, hole.
+    Cut,
+    /// Works on edges and faces: fillet, chamfer, draft, shell.
+    Finish,
+    Pattern,
+    /// A shape of the Part workbench: primitive, boolean, imported solid.
+    Solid,
+    Group,
+    Link,
+    Other,
+}
+
+/// What a FreeCAD object is, said for someone who does not know FreeCAD's words.
+pub struct ObjectKind {
+    pub family: Family,
+    /// A short name, shown after the label.
+    pub name: &'static str,
+    /// One sentence, in the tooltip.
+    pub about: &'static str,
+}
+
+pub fn object_kind(type_id: &str) -> ObjectKind {
+    use Family::*;
+    let k = |family, name, about| ObjectKind { family, name, about };
+    match type_id {
+        "PartDesign::Body" => k(Body, "body", "A solid part, built step by step by the features inside it; the last one is its shape."),
+        "App::Part" => k(Group, "part", "A container that places bodies and other objects together."),
+        "App::DocumentObjectGroup" => k(Group, "group", "A folder for organising objects; it has no shape of its own."),
+        "Sketcher::SketchObject" => k(Sketch, "sketch", "A 2D drawing on a plane. Features such as Pad and Pocket turn it into solid."),
+        "PartDesign::Pad" => k(Add, "extrude", "Pad: pushes a sketch out into solid, adding material to the body."),
+        "PartDesign::Revolution" => k(Add, "revolve", "Revolution: spins a sketch around an axis into solid, adding material."),
+        "PartDesign::AdditiveLoft" => k(Add, "loft", "Loft: joins several sketches into one solid, adding material."),
+        "PartDesign::AdditivePipe" => k(Add, "sweep", "Sweep: moves a sketch along a path into solid, adding material."),
+        "PartDesign::AdditiveHelix" => k(Add, "helix", "Helix: sweeps a sketch along a spiral, adding material (springs, threads)."),
+        "PartDesign::Pocket" => k(Cut, "cut", "Pocket: cuts the shape of a sketch into the body, removing material."),
+        "PartDesign::Groove" => k(Cut, "revolve cut", "Groove: spins a sketch around an axis and removes what it sweeps."),
+        "PartDesign::Hole" => k(Cut, "hole", "Hole: drills holes at the circles of a sketch, with depth, countersink or thread."),
+        "PartDesign::SubtractiveLoft" => k(Cut, "loft cut", "Subtractive loft: removes the solid joining several sketches."),
+        "PartDesign::SubtractivePipe" => k(Cut, "sweep cut", "Subtractive sweep: removes what a sketch sweeps along a path."),
+        "PartDesign::SubtractiveHelix" => k(Cut, "helix cut", "Subtractive helix: removes a spiral sweep (threads)."),
+        "PartDesign::Fillet" => k(Finish, "fillet", "Fillet: rounds the chosen edges."),
+        "PartDesign::Chamfer" => k(Finish, "chamfer", "Chamfer: bevels the chosen edges."),
+        "PartDesign::Draft" => k(Finish, "draft", "Draft: tilts faces so the part comes out of a mould."),
+        "PartDesign::Thickness" => k(Finish, "shell", "Thickness: hollows the body out to walls of a given thickness."),
+        "PartDesign::Mirrored" => k(Pattern, "mirror", "Mirrored: copies features to the other side of a plane."),
+        "PartDesign::LinearPattern" => k(Pattern, "linear pattern", "Linear pattern: repeats features in a row."),
+        "PartDesign::PolarPattern" => k(Pattern, "polar pattern", "Polar pattern: repeats features around an axis."),
+        "PartDesign::MultiTransform" => k(Pattern, "pattern", "MultiTransform: several mirrors and patterns in one."),
+        "PartDesign::Scaled" => k(Pattern, "scaled", "Scaled: copies features at another size."),
+        "App::Link" | "App::LinkElement" | "App::LinkGroup" => k(Link, "link", "Shows another object again, in its own place; editing the original changes both."),
+        "Part::Box" => k(Solid, "box", "A box primitive."),
+        "Part::Cylinder" => k(Solid, "cylinder", "A cylinder primitive."),
+        "Part::Sphere" => k(Solid, "sphere", "A sphere primitive."),
+        "Part::Cone" => k(Solid, "cone", "A cone primitive."),
+        "Part::Torus" => k(Solid, "torus", "A torus primitive."),
+        "Part::Cut" => k(Solid, "boolean cut", "Takes one shape away from another."),
+        "Part::Fuse" | "Part::MultiFuse" => k(Solid, "union", "Joins shapes into one."),
+        "Part::Common" | "Part::MultiCommon" => k(Solid, "intersection", "Keeps what the shapes have in common."),
+        "Part::Extrusion" => k(Solid, "extrude", "Extrudes a 2D shape into a solid (Part workbench)."),
+        "Part::Revolution" => k(Solid, "revolve", "Spins a 2D shape into a solid (Part workbench)."),
+        "Part::Feature" => k(Solid, "shape", "A solid stored as it is, often imported from STEP."),
+        "Mesh::Feature" => k(Solid, "mesh", "A triangle mesh, often imported from STL."),
+        t if t.starts_with("PartDesign::Additive") => k(Add, "added shape", "Adds a primitive shape to the body."),
+        t if t.starts_with("PartDesign::Subtractive") => k(Cut, "cut shape", "Removes a primitive shape from the body."),
+        t if t.starts_with("Part::") => k(Solid, "shape", "A shape of the Part workbench."),
+        _ => k(Other, "", "A FreeCAD object without a shape of its own here."),
+    }
+}
+
+impl Family {
+    fn color(self) -> Color32 {
+        match self {
+            Family::Body => Color32::from_rgb(70, 130, 200),
+            Family::Sketch => Color32::from_rgb(214, 92, 72),
+            Family::Add => Color32::from_rgb(76, 160, 92),
+            Family::Cut => Color32::from_rgb(224, 140, 50),
+            Family::Finish => Color32::from_rgb(150, 110, 200),
+            Family::Pattern => Color32::from_rgb(48, 160, 160),
+            Family::Solid => Color32::from_rgb(110, 125, 150),
+            Family::Group => Color32::from_rgb(200, 170, 70),
+            Family::Link => Color32::from_rgb(130, 130, 130),
+            Family::Other => Color32::from_rgb(160, 160, 160),
+        }
+    }
+}
+
+/// A small badge for the object's family: a rounded square in its colour with a white sign.
+pub fn kind_badge(ui: &mut egui::Ui, family: Family, dim: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+    if ui.is_rect_visible(rect) {
+        paint_badge(ui.painter(), rect.shrink(1.0), family, dim);
+    }
+    resp
+}
+
+/// A step of the timeline: the feature's badge on a tile that lights up when hovered or
+/// selected, outlined in red when the feature failed.
+pub fn timeline_step(ui: &mut egui::Ui, family: Family, selected: bool, error: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(26.0, 26.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let v = ui.style().interact_selectable(&resp, selected);
+        let p = ui.painter();
+        if selected || resp.hovered() {
+            p.rect(rect, 4.0, v.weak_bg_fill, v.bg_stroke, egui::StrokeKind::Inside);
+        }
+        if error {
+            p.rect_stroke(rect, 4.0, Stroke::new(1.5, Color32::LIGHT_RED), egui::StrokeKind::Inside);
+        }
+        paint_badge(p, Rect::from_center_size(rect.center(), Vec2::splat(18.0)), family, false);
+    }
+    resp
+}
+
+fn paint_badge(p: &egui::Painter, r: Rect, family: Family, dim: bool) {
+    let fill = if dim { family.color().gamma_multiply(0.45) } else { family.color() };
+    p.rect_filled(r, 3.0, fill);
+    let w = Stroke::new(1.4, Color32::WHITE);
+    let at = |x: f32, y: f32| pos2(r.left() + x * r.width(), r.top() + y * r.height());
+    let line = |pts: &[(f32, f32)]| {
+        p.add(egui::Shape::line(pts.iter().map(|&(x, y)| at(x, y)).collect(), w));
+    };
+    match family {
+        Family::Body | Family::Solid => {
+            // a cube
+            line(&[(0.2, 0.35), (0.5, 0.2), (0.8, 0.35), (0.8, 0.7), (0.5, 0.85), (0.2, 0.7), (0.2, 0.35)]);
+            line(&[(0.2, 0.35), (0.5, 0.5), (0.8, 0.35)]);
+            line(&[(0.5, 0.5), (0.5, 0.85)]);
+        }
+        Family::Sketch => {
+            // a profile: two lines and a circle
+            line(&[(0.2, 0.8), (0.2, 0.25), (0.55, 0.25)]);
+            p.circle_stroke(at(0.6, 0.62), r.width() * 0.2, w);
+        }
+        Family::Add => {
+            line(&[(0.5, 0.22), (0.5, 0.78)]);
+            line(&[(0.22, 0.5), (0.78, 0.5)]);
+        }
+        Family::Cut => {
+            line(&[(0.22, 0.5), (0.78, 0.5)]);
+        }
+        Family::Finish => {
+            // a rounded corner
+            line(&[(0.22, 0.8), (0.22, 0.5), (0.27, 0.35), (0.35, 0.27), (0.5, 0.22), (0.8, 0.22)]);
+        }
+        Family::Pattern => {
+            for (x, y) in [(0.3, 0.3), (0.7, 0.3), (0.3, 0.7), (0.7, 0.7)] {
+                p.circle_filled(at(x, y), r.width() * 0.1, Color32::WHITE);
+            }
+        }
+        Family::Group => {
+            line(&[(0.18, 0.3), (0.42, 0.3), (0.5, 0.4), (0.82, 0.4), (0.82, 0.76), (0.18, 0.76), (0.18, 0.3)]);
+        }
+        Family::Link => {
+            line(&[(0.25, 0.75), (0.75, 0.25)]);
+            line(&[(0.45, 0.25), (0.75, 0.25), (0.75, 0.55)]);
+        }
+        Family::Other => {
+            p.circle_filled(r.center(), r.width() * 0.12, Color32::WHITE);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -824,5 +1033,16 @@ mod tests {
         let f = c.forward();
         assert!(f.x < 0.0 && f.y > 0.0 && f.z < 0.0);
     }
-}
 
+    #[test]
+    fn tree_objects_say_what_they_are() {
+        assert_eq!(object_kind("PartDesign::Body").family, Family::Body);
+        assert_eq!(object_kind("Sketcher::SketchObject").family, Family::Sketch);
+        assert_eq!(object_kind("PartDesign::Pad").family, Family::Add);
+        assert_eq!(object_kind("PartDesign::Pocket").family, Family::Cut);
+        assert_eq!(object_kind("PartDesign::AdditiveCylinder").family, Family::Add);
+        assert_eq!(object_kind("PartDesign::SubtractiveBox").family, Family::Cut);
+        assert_eq!(object_kind("Part::Wedge").family, Family::Solid);
+        assert_eq!(object_kind("Spreadsheet::Sheet").family, Family::Other);
+    }
+}

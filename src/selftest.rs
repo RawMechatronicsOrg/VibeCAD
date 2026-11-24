@@ -1,4 +1,5 @@
-//! `VIBECAD_SELFTEST=<dir>`: drive the window through zoom, pick, select, edit and undo with the
+//! `VIBECAD_SELFTEST=<dir>`: drive the window through zoom, pick, select, edit, undo, an extrude
+//! and a construction plane with the
 //! same code the mouse and the property panel use, write frames as BMP and a `report.json`, then
 //! quit. The edit steps are meant for the sample `examples/plate.FCStd` (a Pad under a Pocket);
 //! the view and performance steps work on any document.
@@ -15,6 +16,8 @@ pub enum Stage {
     SelectPad,
     Edit,
     Undo,
+    Extrude,
+    Plane,
     Done,
 }
 

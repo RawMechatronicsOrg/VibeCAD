@@ -4,12 +4,15 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use eframe::egui::{self, Color32, KeyboardShortcut, Modifiers, PointerButton, RichText, Sense};
-use glam::Vec2;
+use eframe::egui::{self, Color32, KeyboardShortcut, Modifiers, PointerButton, Sense};
+use glam::{Vec2, Vec3};
 use serde_json::{Value, json};
 
 use crate::agent::{self, Bridge, Call, FeedEntry, Status, ToolResult};
 use crate::camera::{Camera, View};
+use crate::modelling::{self, Command, Op, Outcome, Pick};
+use crate::navigation::{Gesture, Held, Scheme};
+use crate::profile::{Profile, Settings};
 use crate::render::{Frame, GroundGrid, Renderer};
 use crate::scene::SceneData;
 use crate::selftest::{SelfTest, Stage, write_bmp};
@@ -23,6 +26,8 @@ enum Pending {
     Scene { fit: bool },
     Props,
     Edit,
+    /// A modelling command; its reply names the object it made.
+    Create,
     Save,
     Export,
     /// A read-only call of the agent; its answer goes back to the agent only.
@@ -43,14 +48,65 @@ struct Node {
     children: Vec<String>,
     visible: bool,
     error: bool,
+    /// The corners of a construction plane the view draws, in document coordinates.
+    plane: Option<[Vec3; 4]>,
 }
 
 #[derive(Default)]
 struct Tree {
     nodes: HashMap<String, Node>,
     roots: Vec<String>,
+    /// The bodies' features in the order they are built, body by body: the timeline.
+    history: Vec<String>,
+    /// The body each feature of the timeline belongs to.
+    owner: HashMap<String, String>,
     undo: u64,
     redo: u64,
+}
+
+const BODY: &str = "PartDesign::Body";
+
+impl Tree {
+    /// The tree lists parts; what a body is built from goes to the timeline. A feature holds
+    /// the sketches it is made from, so they come just before it.
+    fn build_history(&mut self) {
+        fn steps(t: &Tree, name: &str, body: &str, depth: usize, out: &mut Vec<(String, String)>) {
+            let Some(n) = t.nodes.get(name) else { return };
+            if depth > 32 || out.iter().any(|(o, _)| o == name) {
+                return;
+            }
+            for c in &n.children {
+                steps(t, c, body, depth + 1, out);
+            }
+            out.push((name.to_string(), body.to_string()));
+        }
+        fn bodies<'a>(t: &'a Tree, name: &'a str, depth: usize, seen: &mut HashSet<&'a str>, out: &mut Vec<&'a str>) {
+            let Some(n) = t.nodes.get(name) else { return };
+            if depth > 32 || !seen.insert(name) {
+                return;
+            }
+            if n.kind == BODY {
+                out.push(name);
+                return;
+            }
+            for c in &n.children {
+                bodies(t, c, depth + 1, seen, out);
+            }
+        }
+        let mut found = Vec::new();
+        let mut seen = HashSet::new();
+        for r in &self.roots {
+            bodies(self, r, 0, &mut seen, &mut found);
+        }
+        let mut out = Vec::new();
+        for b in found {
+            for c in &self.nodes[b].children {
+                steps(self, c, b, 1, &mut out);
+            }
+        }
+        self.history = out.iter().map(|(f, _)| f.clone()).collect();
+        self.owner = out.into_iter().collect();
+    }
 }
 
 /// What picking needs from the scene shown; the vertices themselves live on the GPU. It grows
@@ -123,6 +179,8 @@ pub struct App {
     palette: bool,
     show_log: bool,
     show_grid: bool,
+    /// How mouse drags move the camera.
+    navigation: Scheme,
     open_on_ready: Option<PathBuf>,
     /// The document has edits that are not saved.
     modified: bool,
@@ -145,10 +203,22 @@ pub struct App {
     agent_note: String,
     note_sent: Option<String>,
     started: Instant,
+    /// The user's settings, kept between runs.
+    profile: Profile,
+    /// The window's inner size in points when last not maximized, and whether it is now.
+    window_size: [f32; 2],
+    maximized: bool,
+    /// The box the ground grid is sized for: the document's last drawn extent, so the grid
+    /// stays put when everything is hidden.
+    ground: Option<(Vec3, Vec3)>,
+    /// The modelling command whose dialog is open.
+    command: Option<Command>,
+    /// Construction planes as drawn last frame, in points, for clicks on them.
+    plane_outlines: Vec<(String, Vec<egui::Pos2>)>,
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, open: Option<PathBuf>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, open: Option<PathBuf>, profile: Profile, s: Settings, problem: Option<String>) -> Self {
         let rs = cc.wgpu_render_state.as_ref().expect("VibeCAD needs the wgpu renderer");
         let ctx = cc.egui_ctx.clone();
         App {
@@ -157,7 +227,7 @@ impl App {
             freecad: None,
             worker_error: None,
             renderer: Renderer::new(rs),
-            camera: Camera::default(),
+            camera: Camera { ortho: s.ortho, ..Camera::default() },
             pending: HashMap::new(),
             doc_label: None,
             doc_path: None,
@@ -166,16 +236,17 @@ impl App {
             selection: None,
             props: None,
             edits: HashMap::new(),
-            error: None,
+            error: problem,
             info: None,
-            show_edges: true,
-            edge_width: 1.5,
-            palette: true,
-            show_log: false,
-            show_grid: true,
+            show_edges: s.show_edges,
+            edge_width: s.edge_width,
+            palette: s.palette,
+            show_log: s.show_log,
+            show_grid: s.show_grid,
+            navigation: s.navigation,
             open_on_ready: open,
             modified: false,
-            tab: Tab::default(),
+            tab: s.tab,
             view_rect: None,
             loading: None,
             opened_at: None,
@@ -189,11 +260,17 @@ impl App {
             selftest: SelfTest::from_env(),
             agent_jobs: HashMap::new(),
             feed: Vec::new(),
-            show_feed: false,
+            show_feed: s.tab == Tab::Agentic,
             agent_paused: false,
             agent_note: String::new(),
             note_sent: None,
             started: Instant::now(),
+            profile,
+            window_size: s.window_size,
+            maximized: s.maximized,
+            ground: None,
+            command: None,
+            plane_outlines: Vec::new(),
         }
     }
 
@@ -334,23 +411,138 @@ impl App {
         }
     }
 
+    // ---- modelling ---------------------------------------------------------------------
+
+    /// What `obj` (and its face `sub`) reads as in a command's dialog.
+    fn pick_of(&self, obj: &str, sub: Option<&str>) -> Pick {
+        let node = self.tree.nodes.get(obj);
+        let label = node.map_or(obj, |n| n.label.as_str());
+        Pick {
+            obj: obj.to_string(),
+            sub: sub.map(str::to_string),
+            text: match sub {
+                Some(s) => format!("{label}.{s}"),
+                None => label.to_string(),
+            },
+            whole: node.is_some_and(|n| n.kind == "PartDesign::Plane" || n.kind == "Sketcher::SketchObject"),
+        }
+    }
+
+    fn start_command(&mut self, op: Op) {
+        let selection = self.selection.as_ref().map(|s| self.pick_of(&s.obj, s.sub.as_deref()));
+        // The selected part's size, else the scene's: a copy moves by about its width.
+        let scene = self.scene.as_ref();
+        let bbox = self
+            .selection
+            .as_ref()
+            .and_then(|s| scene?.data.instances.get(*scene?.by_obj.get(&s.obj)? as usize - 1)?.bbox)
+            .or_else(|| scene?.data.bbox);
+        let size = bbox.map(|(lo, hi)| (hi - lo).to_array());
+        self.command = Some(Command::new(op, selection, size));
+    }
+
+    fn run_command(&mut self) {
+        let Some(c) = &self.command else { return };
+        let context = self.selection.as_ref().map(|s| s.obj.as_str());
+        match c.request(context).map_err(|e| format!("{}: {e}", c.op.title())) {
+            Ok((cmd, args)) => {
+                self.request(cmd, args, Pending::Create);
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    fn delete_selected(&mut self) {
+        if let Some(sel) = self.selection.clone() {
+            self.request("delete", json!({ "obj": sel.obj }), Pending::Edit);
+            self.select(None);
+        }
+    }
+
+    /// A click in the view or the tree: it fills the open command's field, or selects.
+    fn picked(&mut self, sel: Option<Selection>) {
+        if self.command.is_none() {
+            self.select(sel);
+            return;
+        }
+        // While a command is open, a click on empty space changes nothing.
+        let Some(s) = sel else { return };
+        let pick = self.pick_of(&s.obj, s.sub.as_deref());
+        if let Some(c) = self.command.as_mut() {
+            c.take(pick);
+        }
+        self.select(Some(s));
+    }
+
+    /// The construction plane drawn under a point of the view, if any.
+    fn plane_at(&self, pos: egui::Pos2) -> Option<Selection> {
+        self.plane_outlines
+            .iter()
+            .rev()
+            .find(|(_, outline)| ui_chrome::inside_convex(pos, outline))
+            .map(|(name, _)| Selection { obj: name.clone(), sub: None, face_id: 0 })
+    }
+
+    /// Construction planes over the view, translucent; lit when selected or used by the command.
+    fn paint_planes(&mut self, painter: &egui::Painter, rect: egui::Rect, view_proj: glam::Mat4) {
+        let project = |p: Vec3| -> Option<egui::Pos2> {
+            let c = view_proj * p.extend(1.0);
+            (c.w > 1e-6).then(|| {
+                let n = c.truncate() / c.w;
+                egui::pos2(rect.left() + (n.x * 0.5 + 0.5) * rect.width(), rect.top() + (0.5 - n.y * 0.5) * rect.height())
+            })
+        };
+        let lit = |name: &str| {
+            self.selection.as_ref().is_some_and(|s| s.obj == name) || self.command.as_ref().and_then(Command::referenced) == Some(name)
+        };
+        let mut outlines = Vec::new();
+        for (name, node) in &self.tree.nodes {
+            let Some(corners) = node.plane else { continue };
+            let Some(outline) = corners.iter().map(|&c| project(c)).collect::<Option<Vec<_>>>() else { continue };
+            modelling::paint_plane(painter, &outline, lit(name));
+            outlines.push((name.clone(), outline));
+        }
+        self.plane_outlines = outlines;
+    }
+
     fn set_prop(&mut self, obj: &str, prop: &str, value: Value) -> Option<u64> {
         self.request("set_prop", json!({ "obj": obj, "prop": prop, "value": value }), Pending::Edit)
     }
 
     /// Select what is under a pixel of the 3D view (or clear the selection on empty space).
     fn pick_at(&mut self, px: u32, py: u32) -> Option<String> {
-        let id = self.renderer.pick(px, py);
-        let picked = self.scene.as_ref().and_then(|s| {
-            let f = s.data.faces.get((id as usize).checked_sub(1)?)?;
-            let inst = &s.data.instances[f.instance as usize];
-            let sub = format!("Face{}", f.face + 1);
-            Some((Selection { obj: inst.obj.clone(), sub: Some(sub.clone()), face_id: id }, format!("{}.{sub}", inst.label)))
-        });
+        let picked = self.face_at(px, py);
         let text = picked.as_ref().map(|(_, t)| t.clone());
         self.info = text.as_ref().map(|t| format!("picked {t}"));
         self.select(picked.map(|(sel, _)| sel));
         text
+    }
+
+    /// The face under a pixel of the 3D view, and how it reads ("Pad.Face6").
+    fn face_at(&mut self, px: u32, py: u32) -> Option<(Selection, String)> {
+        let id = self.renderer.pick(px, py);
+        self.scene.as_ref().and_then(|s| {
+            let f = s.data.faces.get((id as usize).checked_sub(1)?)?;
+            let inst = &s.data.instances[f.instance as usize];
+            let sub = format!("Face{}", f.face + 1);
+            Some((Selection { obj: inst.obj.clone(), sub: Some(sub.clone()), face_id: id }, format!("{}.{sub}", inst.label)))
+        })
+    }
+
+    /// A click in the view at `pos`, pixel (`px`, `py`): a face, else a construction plane.
+    /// A command asking for a plane takes a plane in front of a face.
+    fn click_view(&mut self, pos: egui::Pos2, px: u32, py: u32) {
+        let plane = self.plane_at(pos);
+        let plane_first = plane.is_some() && self.command.as_ref().is_some_and(Command::wants_plane);
+        let face = if plane_first { None } else { self.face_at(px, py) };
+        let hit = match face {
+            Some((sel, text)) => {
+                self.info = Some(format!("picked {text}"));
+                Some(sel)
+            }
+            None => plane,
+        };
+        self.picked(hit);
     }
 
     fn fit(&mut self) {
@@ -403,7 +595,7 @@ impl App {
                                 self.loading = None;
                             }
                             // A failed edit may still have touched the model.
-                            if matches!(kind, Pending::Edit) {
+                            if matches!(kind, Pending::Edit | Pending::Create) {
                                 self.refresh();
                             }
                         }
@@ -446,6 +638,22 @@ impl App {
                     self.modified = true;
                     self.refresh();
                 }
+                Pending::Create => {
+                    // The command did its step: close its dialog and select what it made.
+                    self.command = None;
+                    self.modified = true;
+                    if let Some(made) = v["created"].as_str() {
+                        // `refresh` asks for its properties.
+                        self.selection = Some(Selection { obj: made.to_string(), sub: None, face_id: 0 });
+                        self.props = None;
+                        self.edits.clear();
+                    }
+                    if let Some(broken) = v["broken"].as_array().filter(|b| !b.is_empty()) {
+                        let names: Vec<&str> = broken.iter().filter_map(Value::as_str).collect();
+                        self.error = Some(format!("recompute left these objects invalid: {}", names.join(", ")));
+                    }
+                    self.refresh();
+                }
                 Pending::Save => {
                     self.modified = false;
                     let restored = v["gui_entries_restored"].as_array().map_or(0, Vec::len);
@@ -479,8 +687,13 @@ impl App {
                 children: n["children"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default(),
                 visible: n["visible"].as_bool().unwrap_or(true),
                 error: n["error"].as_bool().unwrap_or(false),
+                plane: n["plane"].as_array().and_then(|c| {
+                    let p: Vec<Vec3> = c.iter().filter_map(|q| Some(Vec3::new(q[0].as_f64()? as f32, q[1].as_f64()? as f32, q[2].as_f64()? as f32))).collect();
+                    p.try_into().ok()
+                }),
             });
         }
+        t.build_history();
         if self.selection.as_ref().is_some_and(|s| !t.nodes.contains_key(&s.obj)) {
             self.selection = None;
             self.props = None;
@@ -551,6 +764,8 @@ impl App {
         if let Some(l) = self.loading.as_mut()
             && l.fit
         {
+            // Another document: its own extent, not the last one's.
+            self.ground = None;
             if let Some((lo, hi)) = self.scene.as_ref().and_then(|s| s.data.bbox) {
                 self.camera.fit(lo, hi);
             }
@@ -651,13 +866,21 @@ impl App {
             self.camera.ortho = !self.camera.ortho;
         }
         if pressed(egui::Key::Escape) {
-            self.select(None);
+            // Esc closes an open command's dialog first, then clears the selection.
+            if self.command.take().is_none() {
+                self.select(None);
+            }
+        }
+        if pressed(egui::Key::Delete) && self.command.is_none() {
+            self.delete_selected();
         }
     }
 
     fn ribbon(&mut self, ui: &mut egui::Ui) {
         let state = RibbonState {
             has_doc: self.doc_label.is_some(),
+            has_selection: self.selection.is_some(),
+            command: self.command.as_ref().map(|c| c.op),
             can_open: self.freecad.is_some() && self.worker_error.is_none(),
             undo: self.tree.undo,
             redo: self.tree.redo,
@@ -672,6 +895,7 @@ impl App {
             agent: self.bridge.as_ref().map(|b| b.port).map_err(Clone::clone),
             agent_calls: self.feed.len(),
             agent_running: !self.agent_jobs.is_empty(),
+            navigation: self.navigation,
         };
         let tab_before = self.tab;
         let (busy, freecad, dead) = (self.busy(), self.freecad.clone(), self.worker_error.is_some());
@@ -708,8 +932,7 @@ impl App {
                     self.undo(true);
                 }
                 Action::Fit => self.fit(),
-                Action::ViewFrom(dir) => ui_chrome::look_from(&mut self.camera, dir),
-                Action::ToggleOrtho => self.camera.ortho = !self.camera.ortho,
+                Action::Projection(ortho) => self.camera.ortho = ortho,
                 Action::ToggleEdges => self.show_edges = !self.show_edges,
                 Action::ToggleLog => self.show_log = !self.show_log,
                 Action::ToggleGrid => self.show_grid = !self.show_grid,
@@ -729,6 +952,9 @@ impl App {
                     ui.ctx().copy_text(cmd.clone());
                     self.info = Some(format!("copied: {cmd}"));
                 }
+                Action::Navigation(n) => self.navigation = n,
+                Action::Command(op) => self.start_command(op),
+                Action::Delete => self.delete_selected(),
             }
         }
     }
@@ -740,12 +966,26 @@ impl App {
         ui_chrome::overlay(ctx, "tree", view, view.left_top() + egui::vec2(10.0, 10.0), egui::Align2::LEFT_TOP, 260.0, view.height() - 20.0, &title, |ui| {
             self.tree_panel(ui)
         });
-        // The feed takes the lower part of the right side; the properties keep the rest.
+        // The feed takes the lower part of the right side; a command's dialog or the properties keep the rest.
         let feed_height = (view.height() * 0.55).max(200.0);
-        if self.selection.is_some() {
-            let top = view.right_top() + egui::vec2(-10.0, 150.0);
-            let height = if self.show_feed { (view.height() - feed_height - 190.0).max(120.0) } else { view.height() - 200.0 };
-            ui_chrome::overlay(ctx, "props", view, top, egui::Align2::RIGHT_TOP, 290.0, height, "Properties", |ui| {
+        let right_height = if self.show_feed { (view.height() - feed_height - 190.0).max(120.0) } else { view.height() - 200.0 };
+        let top = view.right_top() + egui::vec2(-10.0, 150.0);
+        if let Some(op) = self.command.as_ref().map(|c| c.op) {
+            // A command's dialog stands where the properties do, as in the big CAD tools.
+            let mut outcome = Outcome::Open;
+            ui_chrome::overlay(ctx, "command", view, top, egui::Align2::RIGHT_TOP, 290.0, right_height, op.title(), |ui| {
+                if let Some(c) = self.command.as_mut() {
+                    outcome = c.ui(ui);
+                }
+            });
+            match outcome {
+                // One step per OK: a second press before the reply would make it twice.
+                Outcome::Ok if !self.pending.values().any(|p| matches!(p, Pending::Create)) => self.run_command(),
+                Outcome::Cancel => self.command = None,
+                Outcome::Ok | Outcome::Open => {}
+            }
+        } else if self.selection.is_some() {
+            ui_chrome::overlay(ctx, "props", view, top, egui::Align2::RIGHT_TOP, 290.0, right_height, "Properties", |ui| {
                 self.props_panel(ui)
             });
         }
@@ -764,7 +1004,7 @@ impl App {
         }
         for a in actions {
             match a {
-                TreeAction::Select(obj) => self.select(Some(Selection { obj, sub: None, face_id: 0 })),
+                TreeAction::Select(obj) => self.picked(Some(Selection { obj, sub: None, face_id: 0 })),
                 TreeAction::Visible(obj, v) => {
                     if let Some(n) = self.tree.nodes.get_mut(&obj) {
                         n.visible = v;
@@ -780,25 +1020,38 @@ impl App {
         if !seen.insert(name.to_string()) || depth > 32 {
             return;
         }
-        let selected = self.selection.as_ref().is_some_and(|s| s.obj == name);
+        // A body is lit while one of its features is selected in the timeline or the view.
+        let selected = self.selection.as_ref().is_some_and(|s| s.obj == name || self.tree.owner.get(&s.obj).is_some_and(|b| b == name));
         let mut row = |ui: &mut egui::Ui| {
             let mut vis = node.visible;
             if ui.checkbox(&mut vis, "").on_hover_text("Show in the 3D view").changed() {
                 actions.push(TreeAction::Visible(name.to_string(), vis));
             }
-            let mut text = RichText::new(&node.label);
-            if node.error {
-                text = text.color(Color32::LIGHT_RED);
-            } else if !node.visible {
-                text = text.weak();
+            let kind = ui_chrome::object_kind(&node.kind);
+            let tip = format!("{}\n{}\n\n{name} · {}", node.label, kind.about, node.kind);
+            ui_chrome::kind_badge(ui, kind.family, !node.visible).on_hover_text(&tip);
+            // The label, then what the object is, smaller and greyed.
+            let visuals = &ui.style().visuals;
+            let label_color = if node.error {
+                Color32::LIGHT_RED
+            } else if node.visible {
+                visuals.text_color()
+            } else {
+                visuals.weak_text_color()
+            };
+            let body = egui::TextStyle::Body.resolve(ui.style());
+            let mut text = egui::text::LayoutJob::default();
+            text.append(&node.label, 0.0, egui::TextFormat::simple(body.clone(), label_color));
+            if !kind.name.is_empty() {
+                let small = egui::FontId::new(body.size * 0.8, body.family);
+                text.append(kind.name, 6.0, egui::TextFormat::simple(small, visuals.weak_text_color()));
             }
             // Cut long names to the panel's width; the full one is in the tooltip.
-            let tip = format!("{}\n{}\n{}", node.label, name, node.kind);
             if ui.add(egui::Button::selectable(selected, text).truncate()).on_hover_text(tip).clicked() {
                 actions.push(TreeAction::Select(name.to_string()));
             }
         };
-        if node.children.is_empty() {
+        if node.children.is_empty() || node.kind == BODY {
             ui.horizontal(|ui| {
                 ui.add_space(18.0);
                 row(ui);
@@ -812,6 +1065,41 @@ impl App {
                         self.tree_node(ui, c, depth + 1, seen, actions);
                     }
                 });
+        }
+    }
+
+    /// Along the bottom, as in Fusion: every body's features in the order they are built.
+    fn timeline_panel(&mut self, ui: &mut egui::Ui) {
+        let mut chosen = None;
+        egui::ScrollArea::horizontal().auto_shrink([false, true]).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                let several = self.tree.history.first().map(|f| &self.tree.owner[f]) != self.tree.history.last().map(|f| &self.tree.owner[f]);
+                let mut body: Option<&String> = None;
+                for f in &self.tree.history {
+                    let Some(node) = self.tree.nodes.get(f) else { continue };
+                    let owner = &self.tree.owner[f];
+                    if several && body != Some(owner) {
+                        if body.is_some() {
+                            ui.add_space(6.0);
+                            ui.separator();
+                        }
+                        let label = self.tree.nodes.get(owner).map_or(owner.as_str(), |n| n.label.as_str());
+                        ui.weak(label);
+                        body = Some(owner);
+                    }
+                    let kind = ui_chrome::object_kind(&node.kind);
+                    let selected = self.selection.as_ref().is_some_and(|s| &s.obj == f);
+                    let tip = format!("{}  ({})
+{}", node.label, if kind.name.is_empty() { &node.kind } else { kind.name }, kind.about);
+                    if ui_chrome::timeline_step(ui, kind.family, selected, node.error).on_hover_text(tip).clicked() {
+                        chosen = Some(f.clone());
+                    }
+                }
+            });
+        });
+        if let Some(obj) = chosen {
+            self.select(Some(Selection { obj, sub: None, face_id: 0 }));
         }
     }
 
@@ -963,14 +1251,28 @@ impl App {
         let ppp = ui.ctx().pixels_per_point();
         let size = ((rect.width() * ppp).round().max(1.0) as u32, (rect.height() * ppp).round().max(1.0) as u32);
         self.camera.aspect = rect.width() / rect.height().max(1.0);
+        if let Some(b) = self.scene.as_ref().and_then(|s| s.data.bbox) {
+            self.ground = Some(b);
+        }
 
         let d = resp.drag_delta();
         let delta = Vec2::new(d.x, d.y);
-        let shift = ui.input(|i| i.modifiers.shift);
-        if resp.dragged_by(PointerButton::Primary) && !shift {
-            self.camera.orbit(delta);
-        } else if resp.dragged_by(PointerButton::Secondary) || resp.dragged_by(PointerButton::Middle) || (resp.dragged_by(PointerButton::Primary) && shift) {
-            self.camera.pan(delta, rect.height());
+        if resp.dragged() {
+            let held = ui.input(|i| Held {
+                left: i.pointer.button_down(PointerButton::Primary),
+                middle: i.pointer.button_down(PointerButton::Middle),
+                right: i.pointer.button_down(PointerButton::Secondary),
+                shift: i.modifiers.shift,
+                ctrl: i.modifiers.command,
+            });
+            match self.navigation.gesture(held) {
+                Some(Gesture::Orbit) => self.camera.orbit(delta),
+                Some(Gesture::Look) => self.camera.look(delta),
+                Some(Gesture::Pan) => self.camera.pan(delta, rect.height()),
+                // Up zooms in, about twice per 100 points.
+                Some(Gesture::Zoom) => self.camera.zoom(-delta.y * 4.6),
+                None => {}
+            }
         }
         if resp.hovered() {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
@@ -983,7 +1285,7 @@ impl App {
         } else if resp.clicked()
             && let Some(pos) = resp.interact_pointer_pos()
         {
-            self.pick_at(((pos.x - rect.min.x) * ppp) as u32, ((pos.y - rect.min.y) * ppp) as u32);
+            self.click_view(pos, ((pos.x - rect.min.x) * ppp) as u32, ((pos.y - rect.min.y) * ppp) as u32);
         }
 
         let dark = ui.visuals().dark_mode;
@@ -996,6 +1298,7 @@ impl App {
         if let Some(grid) = f.grid {
             ui_chrome::ground_labels(&ui.painter_at(rect), grid, rect, f.view_proj, f.forward);
         }
+        self.paint_planes(&ui.painter_at(rect), rect, f.view_proj);
         self.view_rect = Some(rect);
         if let CubeAction::Home = ui_chrome::view_cube(ui, rect, &mut self.camera) {
             self.camera.set_view(View::Iso);
@@ -1021,7 +1324,7 @@ impl App {
         painter.text(
             rect.left_bottom() + egui::vec2(8.0, -6.0),
             egui::Align2::LEFT_BOTTOM,
-            "drag: orbit · right/shift-drag: pan · wheel: zoom · double-click/F: fit · 0-3: views · cube: click a face, edge or corner",
+            format!("{} · double-click/F: fit · 0-3: views · cube: click a face, edge or corner", self.navigation.hint()),
             egui::FontId::proportional(11.0),
             ui.visuals().weak_text_color(),
         );
@@ -1085,7 +1388,7 @@ impl App {
         let Some(s) = self.scene.as_ref() else { return Vec::new() };
         let Some((lo, hi)) = s.data.instances.iter().find(|i| i.face_base.is_some()).and_then(|i| i.bbox) else { return Vec::new() };
         let Some((w, h)) = self.renderer.size() else { return Vec::new() };
-        let vp = self.camera.view_proj(w as f32 / h.max(1) as f32);
+        let vp = self.camera.view_proj(w as f32 / h.max(1) as f32, self.drawn_box());
         [0.5, 0.75]
             .into_iter()
             .map(|t| {
@@ -1181,6 +1484,25 @@ impl App {
             }
             Stage::Undo => {
                 t.log("undo", json!({ "top_z": self.top_z(), "undo": self.tree.undo, "redo": self.tree.redo }));
+                // The top face pulled up by the dialog's default 10 mm, as the ribbon's Extrude does.
+                self.select(Some(Selection { obj: "Pocket".into(), sub: Some("Face5".into()), face_id: 0 }));
+                self.start_command(Op::Extrude);
+                self.run_command();
+                t.stage = Stage::Extrude;
+            }
+            Stage::Extrude => {
+                let shot = self.capture(&t, "3-extruded.bmp");
+                let made = self.selection.as_ref().map(|s| s.obj.clone());
+                t.log("extrude Pocket.Face5", json!({ "top_z": self.top_z(), "made": made, "dialog_open": self.command.is_some(), "error": self.error, "frame": shot }));
+                // A construction plane 10 mm over the same face.
+                self.select(Some(Selection { obj: "Pocket".into(), sub: Some("Face5".into()), face_id: 0 }));
+                self.start_command(Op::Plane);
+                self.run_command();
+                t.stage = Stage::Plane;
+            }
+            Stage::Plane => {
+                let planes: Vec<Value> = self.tree.nodes.iter().filter_map(|(n, node)| Some(json!({ "obj": n, "z": node.plane?.map(|c| c.z) }))).collect();
+                t.log("plane over Pocket.Face5", json!({ "planes": planes, "drawn": self.plane_outlines.len(), "error": self.error }));
                 t.stage = Stage::Done;
             }
             Stage::Done => {
@@ -1200,8 +1522,19 @@ impl App {
             .as_ref()
             .and_then(|s| self.scene.as_ref()?.by_obj.get(&s.obj).copied())
             .unwrap_or(0);
+        let grid = self
+            .show_grid
+            // Nothing drawn yet in this document (all hidden, or empty): a 100 mm square.
+            .then(|| self.ground.unwrap_or((Vec3::new(-50.0, -50.0, 0.0), Vec3::new(50.0, 50.0, 0.0))))
+            .map(|(lo, hi)| GroundGrid::around(lo, hi).for_scale(self.camera.px_per_unit(size.1 as f32)));
+        let mut drawn = self.drawn_box();
+        if let Some(g) = grid {
+            // The square is drawn a little past its outline.
+            let h = g.half * 1.01;
+            drawn = (drawn.0.min(Vec3::new(-h, -h, 0.0)), drawn.1.max(Vec3::new(h, h, 0.0)));
+        }
         Frame {
-            view_proj: self.camera.view_proj(size.0 as f32 / size.1.max(1) as f32),
+            view_proj: self.camera.view_proj(size.0 as f32 / size.1.max(1) as f32, drawn),
             forward: self.camera.forward(),
             selected_face: self.selection.as_ref().map_or(0, |s| s.face_id),
             selected_instance,
@@ -1209,12 +1542,16 @@ impl App {
             edge_width: self.edge_width,
             palette: self.palette,
             background,
-            grid: self
-                .show_grid
-                .then(|| self.scene.as_ref().and_then(|s| s.data.bbox))
-                .flatten()
-                .map(|(lo, hi)| GroundGrid::around(lo, hi).for_scale(self.camera.px_per_unit(size.1 as f32))),
+            grid,
         }
+    }
+
+    /// The scene's box, or the camera's own sphere while there is no scene.
+    fn drawn_box(&self) -> (Vec3, Vec3) {
+        self.scene.as_ref().and_then(|s| s.data.bbox).unwrap_or_else(|| {
+            let r = Vec3::splat(self.camera.radius);
+            (self.camera.target - r, self.camera.target + r)
+        })
     }
 
     /// Redraw the view with the current selection (the self-test captures between frames).
@@ -1389,10 +1726,10 @@ impl App {
         if let Err(e) = &self.bridge {
             ui.colored_label(Color32::LIGHT_RED, e);
         }
-        ui.label(RichText::new("Note to the agent, sent with its next result:").small().weak());
+        ui.label(egui::RichText::new("Note to the agent, sent with its next result:").small().weak());
         ui.add(egui::TextEdit::multiline(&mut self.agent_note).desired_rows(2).desired_width(f32::INFINITY).hint_text("e.g. the hole should go through the flange"));
         if let Some(n) = &self.note_sent {
-            ui.label(RichText::new(format!("sent: {n}")).small().weak());
+            ui.label(egui::RichText::new(format!("sent: {n}")).small().weak());
         }
         ui.separator();
         if self.feed.is_empty() {
@@ -1411,16 +1748,16 @@ impl App {
                     if e.status == Status::Running {
                         ui.spinner();
                     } else {
-                        ui.label(RichText::new(text).small().color(color));
+                        ui.label(egui::RichText::new(text).small().color(color));
                     }
-                    ui.label(RichText::new(format!("{:.1}s", e.at)).small().weak());
+                    ui.label(egui::RichText::new(format!("{:.1}s", e.at)).small().weak());
                     ui.strong(&e.tool);
                     if let Some(t) = e.took {
-                        ui.label(RichText::new(format!("{} ms", t.as_millis())).small().weak());
+                        ui.label(egui::RichText::new(format!("{} ms", t.as_millis())).small().weak());
                     }
                 });
                 if !e.args.is_empty() {
-                    ui.add(egui::Label::new(RichText::new(&e.args).monospace().small()).truncate()).on_hover_text(&e.args);
+                    ui.add(egui::Label::new(egui::RichText::new(&e.args).monospace().small()).truncate()).on_hover_text(&e.args);
                 }
                 for tex in &e.images {
                     let w = ui.available_width().min(tex.size_vec2().x);
@@ -1428,8 +1765,8 @@ impl App {
                     ui.add(img).on_hover_text("What the agent got: same scale in every tile; grey both states, green added, red removed");
                 }
                 if !e.text.is_empty() {
-                    egui::CollapsingHeader::new(RichText::new("result").small()).id_salt(("feed", i)).show(ui, |ui| {
-                        ui.add(egui::Label::new(RichText::new(&e.text).monospace().small()).wrap());
+                    egui::CollapsingHeader::new(egui::RichText::new("result").small()).id_salt(("feed", i)).show(ui, |ui| {
+                        ui.add(egui::Label::new(egui::RichText::new(&e.text).monospace().small()).wrap());
                     });
                 }
                 ui.separator();
@@ -1456,7 +1793,51 @@ enum TreeAction {
     Visible(String, bool),
 }
 
+impl App {
+    /// The settings as they are now, for the profile.
+    fn settings(&self) -> Settings {
+        Settings {
+            navigation: self.navigation,
+            show_edges: self.show_edges,
+            edge_width: self.edge_width,
+            palette: self.palette,
+            show_grid: self.show_grid,
+            show_log: self.show_log,
+            ortho: self.camera.ortho,
+            tab: self.tab,
+            window_size: self.window_size,
+            maximized: self.maximized,
+        }
+    }
+
+    /// Follow the window's size and keep the settings.
+    fn keep_settings(&mut self, ctx: &egui::Context) {
+        let (maximized, inner) = ctx.input(|i| (i.viewport().maximized, i.viewport().inner_rect));
+        if let Some(m) = maximized {
+            self.maximized = m;
+        }
+        // Minimized windows report a tiny or empty size; keep the last real one.
+        if let Some(r) = inner.filter(|r| !self.maximized && r.width() >= 200.0 && r.height() >= 200.0) {
+            self.window_size = [r.width().round(), r.height().round()];
+        }
+        let (wait, problem) = self.profile.keep(self.settings(), Instant::now());
+        if let Some(w) = wait {
+            ctx.request_repaint_after(w);
+        }
+        if problem.is_some() {
+            self.error = problem;
+        }
+    }
+}
+
 impl eframe::App for App {
+    fn on_exit(&mut self) {
+        self.profile.keep(self.settings(), Instant::now());
+        if let Some(e) = self.profile.flush() {
+            eprintln!("{e}");
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if ctx.input(|i| i.viewport().close_requested()) && self.selftest.is_none() && !self.may_discard() {
@@ -1467,8 +1848,12 @@ impl eframe::App for App {
         self.shortcuts(&ctx);
         egui::Panel::top("ribbon").show(ui, |ui| self.ribbon(ui));
         egui::Panel::bottom("status").resizable(false).show(ui, |ui| self.status_panel(ui));
+        if !self.tree.history.is_empty() {
+            egui::Panel::bottom("timeline").resizable(false).show(ui, |ui| self.timeline_panel(ui));
+        }
         egui::CentralPanel::no_frame().show(ui, |ui| self.viewport(ui));
         self.overlays(&ctx);
+        self.keep_settings(&ctx);
         if self.selftest.is_some() {
             self.selftest_step(&ctx);
             ctx.request_repaint();
@@ -1476,5 +1861,37 @@ impl eframe::App for App {
         if self.busy() || !self.agent_jobs.is_empty() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(kind: &str, children: &[&str]) -> Node {
+        Node { label: String::new(), kind: kind.into(), children: children.iter().map(|c| c.to_string()).collect(), visible: true, error: false, plane: None }
+    }
+
+    #[test]
+    fn the_timeline_holds_what_bodies_are_built_from_in_order() {
+        let mut t = Tree { roots: vec!["Part".into(), "Box".into()], ..Default::default() };
+        for (name, kind, children) in [
+            ("Part", "App::Part", &["Body", "Body001"][..]),
+            ("Body", BODY, &["Pad", "Pocket"]),
+            ("Pad", "PartDesign::Pad", &["Sketch"]),
+            ("Sketch", "Sketcher::SketchObject", &[]),
+            ("Pocket", "PartDesign::Pocket", &["Sketch001"]),
+            ("Sketch001", "Sketcher::SketchObject", &[]),
+            ("Body001", BODY, &["Fillet"]),
+            ("Fillet", "PartDesign::Fillet", &[]),
+            ("Box", "Part::Box", &[]),
+        ] {
+            t.nodes.insert(name.into(), node(kind, children));
+        }
+        t.build_history();
+        assert_eq!(t.history, ["Sketch", "Pad", "Sketch001", "Pocket", "Fillet"]);
+        assert_eq!(t.owner["Pocket"], "Body");
+        assert_eq!(t.owner["Fillet"], "Body001");
+        assert!(!t.owner.contains_key("Box") && !t.owner.contains_key("Body"));
     }
 }
