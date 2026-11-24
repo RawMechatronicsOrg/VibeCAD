@@ -45,9 +45,9 @@ impl Op {
     pub fn hint(self) -> &'static str {
         match self {
             Op::Plane => "A plane on a flat face, another plane or an origin plane, moved along its normal and tilted",
-            Op::Extrude => "Pull a flat face out, or push it in to cut (a negative distance); or extrude a sketch",
-            Op::Fillet => "Round every edge of a face",
-            Op::Chamfer => "Bevel every edge of a face",
+            Op::Extrude => "Pull a flat face out or push it in to cut: drag the arrow, or type the distance; or extrude a sketch",
+            Op::Fillet => "Round edges: click them in the view (a face stands for all its edges), drag the arrow for the radius",
+            Op::Chamfer => "Bevel edges: click them in the view (a face stands for all its edges), drag the arrow for the size",
             Op::Mirror => "Mirror a part across a plane: a new solid, or joined into its body",
             Op::Circular => "Repeat a part around an axis",
             Op::Linear => "Repeat a part in a row along a direction",
@@ -65,7 +65,7 @@ impl Op {
         match self {
             Op::Plane | Op::Mirror => Some(RefKind::Plane),
             Op::Extrude => Some(RefKind::Profile),
-            Op::Fillet | Op::Chamfer => Some(RefKind::Face),
+            Op::Fillet | Op::Chamfer => Some(RefKind::Edges),
             Op::Circular => Some(RefKind::Axis),
             Op::Linear => Some(RefKind::Direction),
             Op::Copy => None,
@@ -79,8 +79,8 @@ enum RefKind {
     Plane,
     /// A flat face, or a sketch.
     Profile,
-    /// Any face: its edges.
-    Face,
+    /// Edges of one object; a face stands for all its edges.
+    Edges,
     /// An origin axis, or a round face (its axis).
     Axis,
     /// An origin axis, or a flat face (its normal).
@@ -92,7 +92,7 @@ impl RefKind {
         match self {
             RefKind::Plane => &["XY", "XZ", "YZ"],
             RefKind::Axis | RefKind::Direction => &["X", "Y", "Z"],
-            RefKind::Profile | RefKind::Face => &[],
+            RefKind::Profile | RefKind::Edges => &[],
         }
     }
 
@@ -100,7 +100,7 @@ impl RefKind {
         match self {
             RefKind::Plane => "click a flat face or a plane",
             RefKind::Profile => "click a flat face, or a sketch in the tree",
-            RefKind::Face => "click a face",
+            RefKind::Edges => "click edges",
             RefKind::Axis => "click a round face",
             RefKind::Direction => "click a flat face",
         }
@@ -110,7 +110,7 @@ impl RefKind {
         match self {
             RefKind::Plane => "Plane",
             RefKind::Profile => "Profile",
-            RefKind::Face => "Face",
+            RefKind::Edges => "Edges",
             RefKind::Axis => "Axis",
             RefKind::Direction => "Direction",
         }
@@ -154,6 +154,8 @@ pub struct Command {
     pub op: Op,
     target: Option<Pick>,
     reference: Ref,
+    /// Fillet and chamfer: the edges (or faces) picked, all of one object.
+    edges: Vec<Pick>,
     active: Slot,
     /// Extrude distance, or the fillet radius / chamfer size.
     distance: f64,
@@ -177,6 +179,7 @@ impl Command {
         let mut c = Command {
             op,
             target: None,
+            edges: Vec::new(),
             // The usual first guesses: a plane on XY, mirror across YZ, turn about Z, step along X.
             reference: match op {
                 Op::Plane => Ref::Base("XY"),
@@ -210,6 +213,11 @@ impl Command {
         self.active == Slot::Reference && self.op.reference() == Some(RefKind::Plane)
     }
 
+    /// Whether a click near an edge picks the edge (else the face under it) for this command.
+    pub fn wants_edges(&self) -> bool {
+        self.active == Slot::Reference && matches!(self.op.reference(), Some(RefKind::Edges | RefKind::Axis | RefKind::Direction))
+    }
+
     /// The object or plane the command highlights, beside the selection.
     pub fn referenced(&self) -> Option<&str> {
         match &self.reference {
@@ -231,16 +239,63 @@ impl Command {
             }
             Slot::Reference => {
                 let Some(kind) = self.op.reference() else { return };
+                if kind == RefKind::Edges {
+                    self.toggle_edge(p);
+                    return;
+                }
+                let face = p.sub.as_deref().is_some_and(|s| s.starts_with("Face"));
+                let edge = p.sub.as_deref().is_some_and(|s| s.starts_with("Edge"));
                 let fits = match kind {
                     // The worker says when a face is not flat.
-                    RefKind::Plane | RefKind::Profile => p.sub.is_some() || p.whole,
-                    RefKind::Face | RefKind::Axis | RefKind::Direction => p.sub.is_some(),
+                    RefKind::Plane | RefKind::Profile => face || (p.sub.is_none() && p.whole),
+                    // A straight or circular edge is an axis too.
+                    RefKind::Axis | RefKind::Direction => face || edge,
+                    RefKind::Edges => false,
                 };
                 if fits {
                     self.reference = Ref::Picked(p);
                 }
             }
         }
+    }
+
+    /// A click on an edge or face for a fillet: added, or taken out when it was in. Picks on
+    /// another object start the list again.
+    fn toggle_edge(&mut self, p: Pick) {
+        let Some(sub) = &p.sub else { return };
+        if self.edges.first().is_some_and(|e| e.obj != p.obj) {
+            self.edges.clear();
+        }
+        match self.edges.iter().position(|e| e.sub.as_ref() == Some(sub)) {
+            Some(i) => {
+                self.edges.remove(i);
+            }
+            None => self.edges.push(p),
+        }
+    }
+
+    /// The object and the edges ("Edge3") of a fillet or chamfer, for the view to draw.
+    pub fn picked_edges(&self) -> Option<(&str, Vec<u32>)> {
+        let first = self.edges.first()?;
+        let edges = self.edges.iter().filter_map(|e| e.sub.as_deref()?.strip_prefix("Edge")?.parse().ok()).collect();
+        Some((&first.obj, edges))
+    }
+
+    /// The face an extrude pushes or pulls, when one is picked.
+    pub fn extrude_face(&self) -> Option<(&str, &str)> {
+        match (&self.reference, self.op) {
+            (Ref::Picked(p), Op::Extrude) => Some((&p.obj, p.sub.as_deref().filter(|s| s.starts_with("Face"))?)),
+            _ => None,
+        }
+    }
+
+    /// What a drag handle changes: the extrude distance, or the fillet radius / chamfer size.
+    pub fn amount(&self) -> f64 {
+        self.distance
+    }
+
+    pub fn amount_mut(&mut self) -> &mut f64 {
+        &mut self.distance
     }
 
     /// The worker command and its arguments; an error says what is missing.
@@ -265,8 +320,9 @@ impl Command {
                 ("extrude", json!({ "obj": p.obj, "sub": p.sub, "distance": self.distance, "symmetric": self.symmetric }))
             }
             Op::Fillet | Op::Chamfer => {
-                let p = picked()?;
-                ("fillet", json!({ "obj": p.obj, "sub": p.sub, "size": self.distance, "chamfer": self.op == Op::Chamfer }))
+                let first = self.edges.first().ok_or_else(|| "click the edges to round".to_string())?;
+                let subs: Vec<&str> = self.edges.iter().filter_map(|e| e.sub.as_deref()).collect();
+                ("fillet", json!({ "obj": first.obj, "subs": subs, "size": self.distance, "chamfer": self.op == Op::Chamfer }))
             }
             Op::Mirror => ("mirror", json!({ "obj": target()?, "plane": reference()?, "join": self.join })),
             Op::Circular => ("pattern", json!({ "obj": target()?, "kind": "circular", "axis": reference()?, "count": self.count, "angle": self.sweep })),
@@ -300,8 +356,10 @@ impl Command {
                             self.active = Slot::Reference;
                         }
                     }
-                    let text = match &self.reference {
-                        Ref::Picked(p) => Some(p.text.clone()),
+                    let text = match (&self.reference, self.edges.as_slice()) {
+                        (_, [one]) => Some(one.text.clone()),
+                        (_, [first, ..]) => Some(format!("{}: {} edges", first.text.split('.').next().unwrap_or(""), self.edges.len())),
+                        (Ref::Picked(p), _) => Some(p.text.clone()),
                         _ => None,
                     };
                     let active = self.active == Slot::Reference && !matches!(self.reference, Ref::Base(_));
@@ -551,6 +609,38 @@ mod tests {
         assert_eq!(c.reference, Ref::Base("Z"), "a whole object is no axis");
         c.take(face("Pocket", 7));
         assert_eq!(c.request(None).unwrap().1["axis"], json!({ "obj": "Pocket", "sub": "Face7" }));
+    }
+
+    #[test]
+    fn a_fillet_collects_edges_of_one_object_and_toggles_them() {
+        let edge = |obj: &str, n: u32| Pick { obj: obj.into(), sub: Some(format!("Edge{n}")), text: format!("{obj}.Edge{n}"), whole: false };
+        let mut c = Command::new(Op::Fillet, Some(edge("Pocket", 3)), None);
+        c.take(edge("Pocket", 5));
+        c.take(face("Pocket", 2));
+        assert_eq!(c.request(None).unwrap().1["subs"], json!(["Edge3", "Edge5", "Face2"]));
+        c.take(edge("Pocket", 3));
+        assert_eq!(c.picked_edges(), Some(("Pocket", vec![5])));
+        c.take(edge("Pad", 1));
+        assert_eq!(c.request(None).unwrap().1, json!({ "obj": "Pad", "subs": ["Edge1"], "size": 1.0, "chamfer": false }));
+        let empty = Command::new(Op::Chamfer, None, None);
+        assert!(empty.request(None).is_err());
+    }
+
+    #[test]
+    fn an_edge_is_no_plane_or_profile_but_is_an_axis() {
+        let edge = Pick { obj: "Pocket".into(), sub: Some("Edge7".into()), text: "Pocket.Edge7".into(), whole: false };
+        let mut c = Command::new(Op::Extrude, None, None);
+        c.take(edge.clone());
+        assert!(c.request(None).is_err() && !c.wants_edges());
+        let mut c = Command::new(Op::Mirror, None, None);
+        c.take(Pick { obj: "Body".into(), sub: None, text: "Body".into(), whole: false });
+        c.take(edge.clone());
+        assert_eq!(c.request(None).unwrap().1["plane"], json!({ "base": "YZ" }));
+        let mut c = Command::new(Op::Circular, None, None);
+        c.take(Pick { obj: "Body".into(), sub: None, text: "Body".into(), whole: false });
+        assert!(c.wants_edges());
+        c.take(edge);
+        assert_eq!(c.request(None).unwrap().1["axis"], json!({ "obj": "Pocket", "sub": "Edge7" }));
     }
 
     #[test]

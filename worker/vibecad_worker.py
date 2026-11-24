@@ -75,7 +75,7 @@ ANGULAR_DEFLECTION = 0.17
 CACHE_VERSION = 3  # 2: meshes carry "curved_faces", B-rep edges only for shapes without faces; 3: finer angle
 CACHE_LIMIT = 1 << 30
 # Requests answered while a scene streams, between two of its frames: they only read.
-ANSWERED_DURING_SCENE = {"tree", "props"}
+ANSWERED_DURING_SCENE = {"tree", "props", "edges", "face"}
 # Tessellators that have not connected this long after their start are given up.
 TESSELLATOR_START_SECONDS = 60
 
@@ -356,23 +356,24 @@ class Modelling:
         return self._model_edit("Extrude", build)
 
     def cmd_fillet(self, req):
-        """Round ("chamfer": false, "radius") or bevel ("chamfer": true, "size") every edge of a
-        picked face."""
+        """Round ("chamfer": false) or bevel ("chamfer": true) by "size" the edges "subs" names
+        ("Edge3", ...), all of one object; a face in the list stands for all its edges."""
         o = self._obj(req["obj"])
-        sub = req.get("sub") or ""
-        if not sub.startswith("Face"):
-            raise ValueError("pick a face: its edges are rounded")
+        subs = list(req.get("subs") or [])
+        if not subs or not all(isinstance(x, str) and (x.startswith("Edge") or x.startswith("Face")) for x in subs):
+            raise ValueError("pick the edges to round")
         chamfer = bool(req.get("chamfer"))
         size = float(req["size"])
         if not (math.isfinite(size) and size > 0):
             raise ValueError("the size must be above zero")
 
         def build(doc, hide):
-            self._element(o, sub)
+            for x in subs:
+                self._element(o, x)
             body, feature = self._feature_place(doc, o)
             f = self._new_in_body(body, "PartDesign::Chamfer" if chamfer else "PartDesign::Fillet",
                                   "Chamfer" if chamfer else "Fillet")
-            f.Base = (feature, [sub])
+            f.Base = (feature, subs)
             if chamfer:
                 f.Size = size
             else:
@@ -380,6 +381,89 @@ class Modelling:
             return f
 
         return self._model_edit("Chamfer" if chamfer else "Fillet", build)
+
+    # ---- geometry for picking and handles ----------------------------------------------
+
+    def _placed(self, name):
+        """(object, its shape, matrix into document coordinates) or raise."""
+        o = self._obj(name)
+        placed = placed_shape(o)
+        if placed is None:
+            raise ValueError("%s has no shape" % o.Label)
+        return o, placed[0], placed[1]
+
+    def _detail(self, shape):
+        """Deflection for the outlines the window draws: the scene's, else from the shape's size."""
+        if self.tol:
+            return self.tol
+        bb = shape.BoundBox
+        return max(bb.DiagonalLength * 0.001, 1e-4) if bb.isValid() and bb.DiagonalLength < 1e30 else 0.01
+
+    def cmd_edges(self, req):
+        """The B-rep edges of an object, for picking them in the view: per edge its number
+        ("Edge<i>"), the faces it bounds (0-based), a polyline in document coordinates, and at its
+        middle the point and the direction out of the corner (the sum of its faces' normals)."""
+        o, shape, m = self._placed(req["obj"])
+        tol = self._detail(shape)
+        edges = shape.Edges
+        index = {}
+        for i, e in enumerate(edges):
+            index.setdefault(e.hashCode(), []).append(i)
+        faces_of = [[] for _ in edges]
+        for fi, f in enumerate(shape.Faces):
+            for fe in f.Edges:
+                for i in index.get(fe.hashCode(), []):
+                    if edges[i].isSame(fe) and fi not in faces_of[i]:
+                        faces_of[i].append(fi)
+        out = []
+        for i, e in enumerate(edges):
+            try:
+                pts = e.discretize(Deflection=tol)
+            except Exception:
+                continue
+            if len(pts) < 2:
+                continue
+            mid = e.valueAt(e.FirstParameter + 0.5 * (e.LastParameter - e.FirstParameter))
+            out_dir = FreeCAD.Vector()
+            for fi in faces_of[i]:
+                f = shape.Faces[fi]
+                try:
+                    u, v = f.Surface.parameter(mid)
+                    out_dir = out_dir + f.normalAt(u, v)
+                except Exception:
+                    pass
+            out.append({"i": i + 1, "faces": faces_of[i],
+                        "points": [_vec(m.multVec(p)) for p in pts],
+                        "mid": _vec(m.multVec(mid)),
+                        "out": _vec(_direction(m, mid, out_dir))})
+        return {"obj": o.Name, "edges": out}
+
+    def cmd_face(self, req):
+        """A face as the window draws handles and previews on it: "planar", its "center" and
+        outward "normal", and its triangles ("points", "triangles") in document coordinates."""
+        o, shape, m = self._placed(req["obj"])
+        sub = req["sub"]
+        if not sub.startswith("Face"):
+            raise ValueError("%s is not a face" % sub)
+        try:
+            face = shape.getElement(sub)  # the shape `m` places, as for the edges
+        except Exception:
+            raise ValueError("%s has no %s" % (o.Label, sub))
+        u0, u1, v0, v1 = face.ParameterRange
+        center = face.CenterOfMass
+        u, v = face.Surface.parameter(center)
+        if not (u0 <= u <= u1 and v0 <= v <= v1):
+            u, v = (u0 + u1) / 2, (v0 + v1) / 2
+        pts, tris = face.tessellate(self._detail(shape))
+        if not face.isInside(center, self._detail(shape), True) and tris:
+            # A ring's middle is in its hole: take the middle of the triangle nearest it.
+            mids = [(pts[a] + pts[b] + pts[c]) * (1.0 / 3.0) for a, b, c in tris]
+            center = min(mids, key=lambda q: (q - center).Length)
+            u, v = face.Surface.parameter(center)
+        normal = face.normalAt(u, v)
+        return {"obj": o.Name, "sub": sub, "planar": isinstance(face.Surface, Part.Plane),
+                "center": _vec(m.multVec(center)), "normal": _vec(_direction(m, center, normal)),
+                "points": [_vec(m.multVec(p)) for p in pts], "triangles": [list(t) for t in tris]}
 
     def cmd_mirror(self, req):
         """Mirror a part across a plane. "join": the mirror image is added to the part's own
@@ -531,6 +615,16 @@ class Modelling:
             if all(_finite(x) for q in corners for x in (q.x, q.y, q.z)):
                 out[p.Name] = [[q.x, q.y, q.z] for q in corners]
         return out
+
+
+def _vec(v):
+    return [round(v.x, 6), round(v.y, 6), round(v.z, 6)]
+
+
+def _direction(m, at, d):
+    """Direction `d` at point `at`, moved by matrix `m` and made unit length (zero stays zero)."""
+    w = m.multVec(at + d) - m.multVec(at)
+    return w.normalize() if w.Length > 1e-12 else w
 
 
 def _model_visible(worker, o):
