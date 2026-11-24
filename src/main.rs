@@ -12,6 +12,7 @@
 mod agent;
 mod app;
 mod camera;
+mod cloud;
 mod mcp;
 mod modelling;
 mod navigation;

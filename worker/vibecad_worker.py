@@ -388,6 +388,49 @@ class Modelling:
 
         return self._model_edit("Plane", build)
 
+    def cmd_add_scan(self, req):
+        """A scan (a point cloud or a scanned mesh) in the document, as an App::FeaturePython
+        with the file's path and a Placement. FreeCAD neither reads nor stores the points: the
+        window reads the file, and FreeCAD alone opens the document as before, the scan an
+        empty object in its tree."""
+        path = os.path.abspath(str(req["path"]))
+        if not os.path.isfile(path):
+            raise ValueError("no such file: %s" % path)
+
+        def build(doc, hide):
+            o = doc.addObject("App::FeaturePython", "Scan")
+            o.addProperty("App::PropertyFile", SCAN_FILE, "Scan", "The scan file the VibeCAD window shows (points or a mesh)")
+            o.addProperty("App::PropertyPlacement", "Placement", "Scan", "Where the scan sits in the document")
+            setattr(o, SCAN_FILE, path)
+            o.Label = os.path.splitext(os.path.basename(path))[0]
+            return o
+
+        return self._model_edit("Import scan", build)
+
+    def _scan_ref(self, o, shown):
+        """What the window needs to draw a scan: its file (found again next to the document when
+        the path stored no longer exists), its size and time (a changed file is read again), its
+        placement in the document (with the groups' it sits in) and whether it is shown (it and
+        every group holding it visible)."""
+        stored = getattr(o, SCAN_FILE, "") or ""
+        found = stored
+        if not os.path.isfile(found) and self.path:
+            # The path may have been stored on another system: split at either separator.
+            name = re.split(r"[\\/]", stored)[-1]
+            beside = os.path.join(os.path.dirname(os.path.abspath(self.path)), name)
+            if name and os.path.isfile(beside):
+                found = beside
+        ref = {"file": found, "found": os.path.isfile(found), "shown": shown}
+        if ref["found"]:
+            st = os.stat(found)
+            ref["stamp"] = [st.st_size, st.st_mtime_ns]
+        placement = o.Placement
+        parent = _parent_placement(o)
+        if parent is not None:
+            placement = parent.multiply(placement)
+        ref["matrix"] = list(placement.toMatrix().A)
+        return ref
+
     def cmd_extrude(self, req):
         """Push or pull a flat face, or extrude a sketch, by "distance": positive adds material
         (a Pad), negative cuts it away (a Pocket). "symmetric" extrudes to both sides."""
@@ -1435,6 +1478,7 @@ class Worker(Modelling):
         in_group = set()
         nodes = []
         planes = self._shown_planes()
+        displayed = None  # what the view draws, asked once there is a scan
         for o in objects:
             if o.Name in omit:
                 continue
@@ -1452,6 +1496,10 @@ class Worker(Modelling):
             }
             if o.Name in planes:
                 node["plane"] = planes[o.Name]  # corners of the construction plane drawn
+            if _is_scan(o):
+                if displayed is None:
+                    displayed = {d.Name for d in self._displayed()}
+                node["scan"] = self._scan_ref(o, o.Name in displayed)
             nodes.append(node)
         roots = [o.Name for o in objects if o.Name not in in_group and o.Name not in omit]
         return {"nodes": nodes, "roots": roots, "undo": doc.UndoCount, "redo": doc.RedoCount}
@@ -3627,6 +3675,14 @@ def _tip(o):
         return None
     tip = getattr(o, "Tip", None)
     return tip.Name if tip is not None else None
+
+
+SCAN_FILE = "ScanFile"
+
+
+def _is_scan(o):
+    """A scan the window draws: see cmd_add_scan."""
+    return o.TypeId == "App::FeaturePython" and SCAN_FILE in o.PropertiesList
 
 
 def _is_datum(o):
