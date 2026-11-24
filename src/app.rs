@@ -9,6 +9,7 @@ use glam::{Vec2, Vec3};
 use serde_json::{Value, json};
 
 use crate::camera::{Camera, View};
+use crate::modelling::{self, Command, Op, Outcome, Pick};
 use crate::navigation::{Gesture, Held, Scheme};
 use crate::profile::{Profile, Settings};
 use crate::render::{Frame, GroundGrid, Renderer};
@@ -24,6 +25,8 @@ enum Pending {
     Scene { fit: bool },
     Props,
     Edit,
+    /// A modelling command; its reply names the object it made.
+    Create,
     Save,
     Export,
 }
@@ -34,6 +37,8 @@ struct Node {
     children: Vec<String>,
     visible: bool,
     error: bool,
+    /// The corners of a construction plane the view draws, in document coordinates.
+    plane: Option<[Vec3; 4]>,
 }
 
 #[derive(Default)]
@@ -185,6 +190,10 @@ pub struct App {
     /// The box the ground grid is sized for: the document's last drawn extent, so the grid
     /// stays put when everything is hidden.
     ground: Option<(Vec3, Vec3)>,
+    /// The modelling command whose dialog is open.
+    command: Option<Command>,
+    /// Construction planes as drawn last frame, in points, for clicks on them.
+    plane_outlines: Vec<(String, Vec<egui::Pos2>)>,
 }
 
 impl App {
@@ -226,6 +235,8 @@ impl App {
             window_size: s.window_size,
             maximized: s.maximized,
             ground: None,
+            command: None,
+            plane_outlines: Vec::new(),
         }
     }
 
@@ -367,23 +378,136 @@ impl App {
         }
     }
 
+    // ---- modelling ---------------------------------------------------------------------
+
+    /// What `obj` (and its face `sub`) reads as in a command's dialog.
+    fn pick_of(&self, obj: &str, sub: Option<&str>) -> Pick {
+        let node = self.tree.nodes.get(obj);
+        let label = node.map_or(obj, |n| n.label.as_str());
+        Pick {
+            obj: obj.to_string(),
+            sub: sub.map(str::to_string),
+            text: match sub {
+                Some(s) => format!("{label}.{s}"),
+                None => label.to_string(),
+            },
+            whole: node.is_some_and(|n| n.kind == "PartDesign::Plane" || n.kind == "Sketcher::SketchObject"),
+        }
+    }
+
+    fn start_command(&mut self, op: Op) {
+        let selection = self.selection.as_ref().map(|s| self.pick_of(&s.obj, s.sub.as_deref()));
+        // The selected part's size, else the scene's: a copy moves by about its width.
+        let scene = self.scene.as_ref();
+        let bbox = self
+            .selection
+            .as_ref()
+            .and_then(|s| scene?.data.instances.get(*scene?.by_obj.get(&s.obj)? as usize - 1)?.bbox)
+            .or_else(|| scene?.data.bbox);
+        let size = bbox.map(|(lo, hi)| (hi - lo).to_array());
+        self.command = Some(Command::new(op, selection, size));
+    }
+
+    fn run_command(&mut self) {
+        let Some(c) = &self.command else { return };
+        let context = self.selection.as_ref().map(|s| s.obj.as_str());
+        match c.request(context).map_err(|e| format!("{}: {e}", c.op.title())) {
+            Ok((cmd, args)) => self.request(cmd, args, Pending::Create),
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    fn delete_selected(&mut self) {
+        if let Some(sel) = self.selection.clone() {
+            self.request("delete", json!({ "obj": sel.obj }), Pending::Edit);
+            self.select(None);
+        }
+    }
+
+    /// A click in the view or the tree: it fills the open command's field, or selects.
+    fn picked(&mut self, sel: Option<Selection>) {
+        if self.command.is_none() {
+            self.select(sel);
+            return;
+        }
+        // While a command is open, a click on empty space changes nothing.
+        let Some(s) = sel else { return };
+        let pick = self.pick_of(&s.obj, s.sub.as_deref());
+        if let Some(c) = self.command.as_mut() {
+            c.take(pick);
+        }
+        self.select(Some(s));
+    }
+
+    /// The construction plane drawn under a point of the view, if any.
+    fn plane_at(&self, pos: egui::Pos2) -> Option<Selection> {
+        self.plane_outlines
+            .iter()
+            .rev()
+            .find(|(_, outline)| ui_chrome::inside_convex(pos, outline))
+            .map(|(name, _)| Selection { obj: name.clone(), sub: None, face_id: 0 })
+    }
+
+    /// Construction planes over the view, translucent; lit when selected or used by the command.
+    fn paint_planes(&mut self, painter: &egui::Painter, rect: egui::Rect, view_proj: glam::Mat4) {
+        let project = |p: Vec3| -> Option<egui::Pos2> {
+            let c = view_proj * p.extend(1.0);
+            (c.w > 1e-6).then(|| {
+                let n = c.truncate() / c.w;
+                egui::pos2(rect.left() + (n.x * 0.5 + 0.5) * rect.width(), rect.top() + (0.5 - n.y * 0.5) * rect.height())
+            })
+        };
+        let lit = |name: &str| {
+            self.selection.as_ref().is_some_and(|s| s.obj == name) || self.command.as_ref().and_then(Command::referenced) == Some(name)
+        };
+        let mut outlines = Vec::new();
+        for (name, node) in &self.tree.nodes {
+            let Some(corners) = node.plane else { continue };
+            let Some(outline) = corners.iter().map(|&c| project(c)).collect::<Option<Vec<_>>>() else { continue };
+            modelling::paint_plane(painter, &outline, lit(name));
+            outlines.push((name.clone(), outline));
+        }
+        self.plane_outlines = outlines;
+    }
+
     fn set_prop(&mut self, obj: &str, prop: &str, value: Value) {
         self.request("set_prop", json!({ "obj": obj, "prop": prop, "value": value }), Pending::Edit);
     }
 
     /// Select what is under a pixel of the 3D view (or clear the selection on empty space).
     fn pick_at(&mut self, px: u32, py: u32) -> Option<String> {
-        let id = self.renderer.pick(px, py);
-        let picked = self.scene.as_ref().and_then(|s| {
-            let f = s.data.faces.get((id as usize).checked_sub(1)?)?;
-            let inst = &s.data.instances[f.instance as usize];
-            let sub = format!("Face{}", f.face + 1);
-            Some((Selection { obj: inst.obj.clone(), sub: Some(sub.clone()), face_id: id }, format!("{}.{sub}", inst.label)))
-        });
+        let picked = self.face_at(px, py);
         let text = picked.as_ref().map(|(_, t)| t.clone());
         self.info = text.as_ref().map(|t| format!("picked {t}"));
         self.select(picked.map(|(sel, _)| sel));
         text
+    }
+
+    /// The face under a pixel of the 3D view, and how it reads ("Pad.Face6").
+    fn face_at(&mut self, px: u32, py: u32) -> Option<(Selection, String)> {
+        let id = self.renderer.pick(px, py);
+        self.scene.as_ref().and_then(|s| {
+            let f = s.data.faces.get((id as usize).checked_sub(1)?)?;
+            let inst = &s.data.instances[f.instance as usize];
+            let sub = format!("Face{}", f.face + 1);
+            Some((Selection { obj: inst.obj.clone(), sub: Some(sub.clone()), face_id: id }, format!("{}.{sub}", inst.label)))
+        })
+    }
+
+    /// A click in the view at `pos`, pixel (`px`, `py`): a face, else a construction plane.
+    /// A command asking for a plane takes a plane in front of a face.
+    fn click_view(&mut self, pos: egui::Pos2, px: u32, py: u32) {
+        let plane = self.plane_at(pos);
+        let plane_first = plane.is_some() && self.command.as_ref().is_some_and(Command::wants_plane);
+        let face = if plane_first { None } else { self.face_at(px, py) };
+        let hit = match face {
+            Some((sel, text)) => {
+                self.info = Some(format!("picked {text}"));
+                Some(sel)
+            }
+            None => plane,
+        };
+        self.picked(hit);
     }
 
     fn fit(&mut self) {
@@ -426,7 +550,7 @@ impl App {
                                 self.loading = None;
                             }
                             // A failed edit may still have touched the model.
-                            if matches!(kind, Pending::Edit) {
+                            if matches!(kind, Pending::Edit | Pending::Create) {
                                 self.refresh();
                             }
                         }
@@ -469,6 +593,22 @@ impl App {
                     self.modified = true;
                     self.refresh();
                 }
+                Pending::Create => {
+                    // The command did its step: close its dialog and select what it made.
+                    self.command = None;
+                    self.modified = true;
+                    if let Some(made) = v["created"].as_str() {
+                        // `refresh` asks for its properties.
+                        self.selection = Some(Selection { obj: made.to_string(), sub: None, face_id: 0 });
+                        self.props = None;
+                        self.edits.clear();
+                    }
+                    if let Some(broken) = v["broken"].as_array().filter(|b| !b.is_empty()) {
+                        let names: Vec<&str> = broken.iter().filter_map(Value::as_str).collect();
+                        self.error = Some(format!("recompute left these objects invalid: {}", names.join(", ")));
+                    }
+                    self.refresh();
+                }
                 Pending::Save => {
                     self.modified = false;
                     let restored = v["gui_entries_restored"].as_array().map_or(0, Vec::len);
@@ -501,6 +641,10 @@ impl App {
                 children: n["children"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default(),
                 visible: n["visible"].as_bool().unwrap_or(true),
                 error: n["error"].as_bool().unwrap_or(false),
+                plane: n["plane"].as_array().and_then(|c| {
+                    let p: Vec<Vec3> = c.iter().filter_map(|q| Some(Vec3::new(q[0].as_f64()? as f32, q[1].as_f64()? as f32, q[2].as_f64()? as f32))).collect();
+                    p.try_into().ok()
+                }),
             });
         }
         t.build_history();
@@ -676,13 +820,21 @@ impl App {
             self.camera.ortho = !self.camera.ortho;
         }
         if pressed(egui::Key::Escape) {
-            self.select(None);
+            // Esc closes an open command's dialog first, then clears the selection.
+            if self.command.take().is_none() {
+                self.select(None);
+            }
+        }
+        if pressed(egui::Key::Delete) && self.command.is_none() {
+            self.delete_selected();
         }
     }
 
     fn ribbon(&mut self, ui: &mut egui::Ui) {
         let state = RibbonState {
             has_doc: self.doc_label.is_some(),
+            has_selection: self.selection.is_some(),
+            command: self.command.as_ref().map(|c| c.op),
             can_open: self.freecad.is_some() && self.worker_error.is_none(),
             undo: self.tree.undo,
             redo: self.tree.redo,
@@ -728,6 +880,8 @@ impl App {
                 Action::TogglePalette => self.palette = !self.palette,
                 Action::EdgeWidth(w) => self.edge_width = w,
                 Action::Navigation(n) => self.navigation = n,
+                Action::Command(op) => self.start_command(op),
+                Action::Delete => self.delete_selected(),
             }
         }
     }
@@ -739,8 +893,22 @@ impl App {
         ui_chrome::overlay(ctx, "tree", view, view.left_top() + egui::vec2(10.0, 10.0), egui::Align2::LEFT_TOP, 260.0, view.height() - 20.0, &title, |ui| {
             self.tree_panel(ui)
         });
-        if self.selection.is_some() {
-            let top = view.right_top() + egui::vec2(-10.0, 150.0);
+        let top = view.right_top() + egui::vec2(-10.0, 150.0);
+        if let Some(op) = self.command.as_ref().map(|c| c.op) {
+            // A command's dialog stands where the properties do, as in the big CAD tools.
+            let mut outcome = Outcome::Open;
+            ui_chrome::overlay(ctx, "command", view, top, egui::Align2::RIGHT_TOP, 290.0, view.height() - 200.0, op.title(), |ui| {
+                if let Some(c) = self.command.as_mut() {
+                    outcome = c.ui(ui);
+                }
+            });
+            match outcome {
+                // One step per OK: a second press before the reply would make it twice.
+                Outcome::Ok if !self.pending.values().any(|p| matches!(p, Pending::Create)) => self.run_command(),
+                Outcome::Cancel => self.command = None,
+                Outcome::Ok | Outcome::Open => {}
+            }
+        } else if self.selection.is_some() {
             ui_chrome::overlay(ctx, "props", view, top, egui::Align2::RIGHT_TOP, 290.0, view.height() - 200.0, "Properties", |ui| {
                 self.props_panel(ui)
             });
@@ -756,7 +924,7 @@ impl App {
         }
         for a in actions {
             match a {
-                TreeAction::Select(obj) => self.select(Some(Selection { obj, sub: None, face_id: 0 })),
+                TreeAction::Select(obj) => self.picked(Some(Selection { obj, sub: None, face_id: 0 })),
                 TreeAction::Visible(obj, v) => {
                     if let Some(n) = self.tree.nodes.get_mut(&obj) {
                         n.visible = v;
@@ -1037,7 +1205,7 @@ impl App {
         } else if resp.clicked()
             && let Some(pos) = resp.interact_pointer_pos()
         {
-            self.pick_at(((pos.x - rect.min.x) * ppp) as u32, ((pos.y - rect.min.y) * ppp) as u32);
+            self.click_view(pos, ((pos.x - rect.min.x) * ppp) as u32, ((pos.y - rect.min.y) * ppp) as u32);
         }
 
         let dark = ui.visuals().dark_mode;
@@ -1050,6 +1218,7 @@ impl App {
         if let Some(grid) = f.grid {
             ui_chrome::ground_labels(&ui.painter_at(rect), grid, rect, f.view_proj, f.forward);
         }
+        self.paint_planes(&ui.painter_at(rect), rect, f.view_proj);
         self.view_rect = Some(rect);
         if let CubeAction::Home = ui_chrome::view_cube(ui, rect, &mut self.camera) {
             self.camera.set_view(View::Iso);
@@ -1235,6 +1404,25 @@ impl App {
             }
             Stage::Undo => {
                 t.log("undo", json!({ "top_z": self.top_z(), "undo": self.tree.undo, "redo": self.tree.redo }));
+                // The top face pulled up by the dialog's default 10 mm, as the ribbon's Extrude does.
+                self.select(Some(Selection { obj: "Pocket".into(), sub: Some("Face5".into()), face_id: 0 }));
+                self.start_command(Op::Extrude);
+                self.run_command();
+                t.stage = Stage::Extrude;
+            }
+            Stage::Extrude => {
+                let shot = self.capture(&t, "3-extruded.bmp");
+                let made = self.selection.as_ref().map(|s| s.obj.clone());
+                t.log("extrude Pocket.Face5", json!({ "top_z": self.top_z(), "made": made, "dialog_open": self.command.is_some(), "error": self.error, "frame": shot }));
+                // A construction plane 10 mm over the same face.
+                self.select(Some(Selection { obj: "Pocket".into(), sub: Some("Face5".into()), face_id: 0 }));
+                self.start_command(Op::Plane);
+                self.run_command();
+                t.stage = Stage::Plane;
+            }
+            Stage::Plane => {
+                let planes: Vec<Value> = self.tree.nodes.iter().filter_map(|(n, node)| Some(json!({ "obj": n, "z": node.plane?.map(|c| c.z) }))).collect();
+                t.log("plane over Pocket.Face5", json!({ "planes": planes, "drawn": self.plane_outlines.len(), "error": self.error }));
                 t.stage = Stage::Done;
             }
             Stage::Done => {
@@ -1407,7 +1595,7 @@ mod tests {
     use super::*;
 
     fn node(kind: &str, children: &[&str]) -> Node {
-        Node { label: String::new(), kind: kind.into(), children: children.iter().map(|c| c.to_string()).collect(), visible: true, error: false }
+        Node { label: String::new(), kind: kind.into(), children: children.iter().map(|c| c.to_string()).collect(), visible: true, error: false, plane: None }
     }
 
     #[test]

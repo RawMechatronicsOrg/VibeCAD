@@ -61,7 +61,13 @@ MAX_FACE_COLORS = 20000
 # Finished meshes are sent at most this often, in seconds, so the window keeps up.
 BATCH_SECONDS = 0.3
 # Requests that change what the scene shows; one arriving during a scene stream ends it.
-ENDS_SCENE = {"scene", "open", "new", "set_prop", "undo", "redo", "set_visible"}
+ENDS_SCENE = {"scene", "open", "new", "set_prop", "undo", "redo", "set_visible",
+              "set_tip", "datum_plane", "extrude", "fillet", "mirror", "pattern", "copy", "delete"}
+LINK_TYPES = ("App::Link", "App::LinkElement")
+# How FreeCAD's origin planes turn (yaw, pitch, roll): XY faces +Z, XZ -Y, YZ +X.
+BASE_PLANES = {"XY": (0, 0, 0), "XZ": (0, 0, 90), "YZ": (90, 0, 90)}
+# The parts of a placement the property panel edits as numbers.
+PLACEMENT_PARTS = ("x", "y", "z", "yaw", "pitch", "roll")
 # Part of every disk cache key: bump when `encode_mesh` changes what it writes.
 # Largest angle, in radians, one segment of a curve may turn by: 10 degrees, so circles are
 # round on screen and the rims of parts that sit in each other's holes line up closely.
@@ -91,7 +97,508 @@ def tessellator_count():
         return min(4, max(1, (os.cpu_count() or 2) - 1))
 
 
-class Worker:
+class Modelling:
+    """Commands that add features to the document, each one undoable step.
+
+    Everything they make is a native FreeCAD object (PartDesign features in a body, Part
+    features beside it), so FreeCAD opens the document as before. References name an object and
+    one of its elements as the window picked them: {"obj": "Pocket", "sub": "Face6"}, or one of
+    the origin's planes or axes: {"base": "XY"} / {"base": "Z"}.
+
+    A plain solid that gets a PartDesign feature (extrude, fillet, pattern) is first made the
+    base of a new body, as FreeCAD's "body from a solid" does; its face numbers stay the same.
+    Links show another part: they are mirrored and copied, but not changed.
+    """
+
+    def _model_edit(self, title, build):
+        """Run `build(doc)`, which returns the object it made, as one undoable step. A new
+        object that fails to recompute undoes the whole step: FreeCAD's message is the error."""
+        doc = self._doc()
+        self.edited = True
+        hide = []  # copies of hidden objects, hidden once the step is committed
+        broken_before = {o.Name for o in doc.Objects if "Invalid" in o.State}
+        tips = self._tips()
+        doc.openTransaction(title)
+        try:
+            made = build(doc, hide)
+            doc.recompute()
+            if made is not None and ("Invalid" in made.State or "Error" in made.State):
+                raise RuntimeError("%s: %s" % (made.Label, _object_error(made)))
+            if made is not None and made.isDerivedFrom("PartDesign::Feature") and not made.Shape.Solids:
+                raise RuntimeError("%s: no solid is left" % made.Label)
+        except Exception:
+            doc.abortTransaction()
+            doc.recompute()
+            raise
+        doc.commitTransaction()
+        self._follow_tips(tips)
+        for o in hide:
+            self.gui.setdefault(o.Name, {})["visible"] = False
+            self.vis_changes[o.Name] = False
+        broken = [o.Name for o in doc.Objects if "Invalid" in o.State and o.Name not in broken_before]
+        return {"created": made.Name if made is not None else None, "broken": broken}
+
+    def _forget_gone(self):
+        """Drop window visibility kept for objects an undo removed: FreeCAD gives their names
+        to the next objects made."""
+        doc = self._doc()
+        for name in [n for n in self.vis_changes if doc.getObject(n) is None]:
+            del self.vis_changes[name]
+            self.gui.pop(name, None)
+
+    # ---- references -------------------------------------------------------------------
+
+    def _body_of(self, o):
+        """The PartDesign body that holds `o`, or None."""
+        for p in o.InList:
+            if p.isDerivedFrom("PartDesign::Body") and o in p.Group:
+                return p
+        return None
+
+    def _whole(self, name):
+        """What an operation on a whole part takes: the body of a feature, else the object."""
+        o = self._obj(name)
+        return self._body_of(o) or o
+
+    def _feature_place(self, doc, o):
+        """(body, feature whose shape new PartDesign features refer to) for object `o`. A plain
+        solid becomes the base feature of a new body placed where it was."""
+        if o.isDerivedFrom("PartDesign::Body"):
+            if o.Tip is None:
+                raise ValueError("%s has no features yet" % o.Label)
+            return o, o.Tip
+        body = self._body_of(o)
+        if body is not None:
+            return body, o
+        if o.TypeId in LINK_TYPES:
+            raise ValueError("%s shows another part: change that part instead" % o.Label)
+        shape = getattr(o, "Shape", None)
+        if shape is None or not shape.Solids:
+            raise ValueError("%s is not a solid" % o.Label)
+        body = doc.addObject("PartDesign::Body", "Body")
+        for g in o.InList:  # keep it in the group or part the solid was in
+            if g.isDerivedFrom("App::DocumentObjectGroup") or g.isDerivedFrom("App::Part"):
+                if o in g.Group:
+                    g.addObject(body)
+                    break
+        body.BaseFeature = o
+        # The base feature takes the solid's shape without its placement; the body carries it.
+        body.Placement = o.Placement
+        doc.recompute()
+        return body, body.Tip
+
+    def _origin(self, body, role):
+        for f in body.Origin.OriginFeatures:
+            if f.Role == role:
+                return f
+        raise ValueError("%s has no %s" % (body.Label, role))
+
+    def _element(self, o, sub):
+        try:
+            return o.Shape.getElement(sub)
+        except Exception:
+            raise ValueError("%s has no %s" % (o.Label, sub))
+
+    def _flat_face(self, o, sub):
+        if not sub.startswith("Face"):
+            raise ValueError("pick a face")
+        face = self._element(o, sub)
+        if not isinstance(face.Surface, Part.Plane):
+            raise ValueError("%s.%s is not flat" % (o.Label, sub))
+        return face
+
+    def _plane_link(self, body, ref):
+        """A link (object, [element]) to the plane `ref` names, for a feature in `body`."""
+        if "base" in ref:
+            return self._origin(body, ref["base"] + "_Plane"), [""]
+        o = self._obj(ref["obj"])
+        sub = ref.get("sub") or ""
+        if sub:
+            self._flat_face(o, sub)
+        elif not o.isDerivedFrom("PartDesign::Plane"):
+            raise ValueError("%s is not a plane" % o.Label)
+        return o, [sub]
+
+    def _plane_geometry(self, ref):
+        """(point, normal) of the plane `ref` names, in document coordinates."""
+        if "base" in ref:
+            r = FreeCAD.Rotation(*BASE_PLANES[ref["base"]])
+            return FreeCAD.Vector(), r.multVec(FreeCAD.Vector(0, 0, 1))
+        o = self._obj(ref["obj"])
+        sub = ref.get("sub") or ""
+        if not sub:
+            if not o.isDerivedFrom("PartDesign::Plane"):
+                raise ValueError("%s is not a plane" % o.Label)
+            pl = o.getGlobalPlacement()
+            return pl.Base, pl.Rotation.multVec(FreeCAD.Vector(0, 0, 1))
+        placed = placed_shape(o)
+        if placed is None:
+            raise ValueError("%s has no shape" % o.Label)
+        shape, matrix, _ = placed
+        face = shape.getElement(sub).copy()
+        face.transformShape(matrix)
+        if not isinstance(face.Surface, Part.Plane):
+            raise ValueError("%s.%s is not flat" % (o.Label, sub))
+        u0, u1, v0, v1 = face.ParameterRange
+        return face.CenterOfMass, face.normalAt((u0 + u1) / 2, (v0 + v1) / 2)
+
+    def _axis_link(self, body, ref, flat_ok):
+        """A link to the axis `ref` names: an origin axis, the circle of a round face, or (when
+        `flat_ok`, for a direction) a flat face, which stands for its normal."""
+        if "base" in ref:
+            return self._origin(body, ref["base"] + "_Axis"), [""]
+        o = self._obj(ref["obj"])
+        sub = ref.get("sub") or ""
+        if sub.startswith("Edge"):
+            return o, [sub]
+        if not sub.startswith("Face"):
+            raise ValueError("pick a face, or choose X, Y or Z")
+        shape = o.Shape
+        face = self._element(o, sub)
+        if isinstance(face.Surface, Part.Plane):
+            if flat_ok:
+                return o, [sub]
+            raise ValueError("a flat face has no axis: pick a round face, or choose X, Y or Z")
+        # The patterns take a circular edge as an axis; a round face has one on its rim.
+        for i, e in enumerate(shape.Edges):
+            if isinstance(e.Curve, Part.Circle) and any(e.isSame(fe) for fe in face.Edges):
+                return o, ["Edge%d" % (i + 1)]
+        raise ValueError("%s.%s has no circular edge to turn about" % (o.Label, sub))
+
+    def _new_in_body(self, body, type_id, name):
+        """A PartDesign feature after the body's tip, made the new tip."""
+        before = body.Tip
+        f = body.newObject(type_id, name)
+        if body.Tip != f and not f.isDerivedFrom("Part::Datum"):
+            # Patterns are not counted as solid features until they have originals; they
+            # work on the whole body, so chain them in by hand.
+            if "BaseFeature" in f.PropertiesList and f.BaseFeature is None:
+                f.BaseFeature = before
+            body.Tip = f
+        return f
+
+    # ---- commands ---------------------------------------------------------------------
+
+    def cmd_datum_plane(self, req):
+        """A construction plane on a flat face, on another plane or on an origin plane, moved
+        along its normal by "offset" and turned about its own X axis by "angle" (degrees).
+        Placed in the body of what it is attached to; for an origin plane, in the body of
+        "context" (the selection) or, with none, free in the document."""
+        ref = req["ref"]
+        offset = float(req.get("offset", 0.0))
+        angle = float(req.get("angle", 0.0))
+        shift = FreeCAD.Placement(FreeCAD.Vector(0, 0, offset), FreeCAD.Rotation(FreeCAD.Vector(1, 0, 0), angle))
+
+        def build(doc, hide):
+            if "base" in ref:
+                ctx = self._obj(req["context"]) if req.get("context") else None
+                body = None if ctx is None else (ctx if ctx.isDerivedFrom("PartDesign::Body") else self._body_of(ctx))
+                support = [(self._origin(body, ref["base"] + "_Plane"), "")] if body else None
+                mode = "ObjectXY"
+            else:
+                o = self._obj(ref["obj"])
+                sub = ref.get("sub") or ""
+                if sub:
+                    self._flat_face(o, sub)
+                    mode = "FlatFace"
+                elif o.isDerivedFrom("PartDesign::Plane"):
+                    mode = "ObjectXY"
+                else:
+                    raise ValueError("%s is not a plane: pick a flat face or a plane" % o.Label)
+                body = self._body_of(o)
+                support = [(o, sub)]
+            plane = body.newObject("PartDesign::Plane", "DatumPlane") if body else doc.addObject("PartDesign::Plane", "DatumPlane")
+            if support:
+                plane.AttachmentSupport = support
+                plane.MapMode = mode
+                plane.AttachmentOffset = shift
+            else:
+                plane.MapMode = "Deactivated"
+                plane.Placement = FreeCAD.Placement(FreeCAD.Vector(), FreeCAD.Rotation(*BASE_PLANES[ref["base"]])).multiply(shift)
+            return plane
+
+        return self._model_edit("Plane", build)
+
+    def cmd_extrude(self, req):
+        """Push or pull a flat face, or extrude a sketch, by "distance": positive adds material
+        (a Pad), negative cuts it away (a Pocket). "symmetric" extrudes to both sides."""
+        o = self._obj(req["obj"])
+        sub = req.get("sub") or ""
+        distance = float(req["distance"])
+        if not math.isfinite(distance) or abs(distance) < 1e-7:
+            raise ValueError("the distance must not be zero")
+        sketch = o.isDerivedFrom("Part::Part2DObject")
+
+        def build(doc, hide):
+            if sketch:
+                body = self._body_of(o)
+                if body is None:
+                    ext = doc.addObject("Part::Extrusion", "Extrude")
+                    ext.Base = o
+                    ext.DirMode = "Normal"
+                    ext.LengthFwd = abs(distance)
+                    ext.Reversed = distance < 0
+                    ext.Symmetric = bool(req.get("symmetric"))
+                    ext.Solid = True
+                    return ext
+                profile = o
+            else:
+                self._flat_face(o, sub)
+                body, feature = self._feature_place(doc, o)
+                profile = (feature, [sub])
+            f = self._new_in_body(body, "PartDesign::Pad" if distance > 0 else "PartDesign::Pocket",
+                                  "Extrude" if distance > 0 else "Cut")
+            f.Profile = profile
+            f.Length = abs(distance)
+            f.Midplane = bool(req.get("symmetric"))
+            return f
+
+        return self._model_edit("Extrude", build)
+
+    def cmd_fillet(self, req):
+        """Round ("chamfer": false, "radius") or bevel ("chamfer": true, "size") every edge of a
+        picked face."""
+        o = self._obj(req["obj"])
+        sub = req.get("sub") or ""
+        if not sub.startswith("Face"):
+            raise ValueError("pick a face: its edges are rounded")
+        chamfer = bool(req.get("chamfer"))
+        size = float(req["size"])
+        if not (math.isfinite(size) and size > 0):
+            raise ValueError("the size must be above zero")
+
+        def build(doc, hide):
+            self._element(o, sub)
+            body, feature = self._feature_place(doc, o)
+            f = self._new_in_body(body, "PartDesign::Chamfer" if chamfer else "PartDesign::Fillet",
+                                  "Chamfer" if chamfer else "Fillet")
+            f.Base = (feature, [sub])
+            if chamfer:
+                f.Size = size
+            else:
+                f.Radius = size
+            return f
+
+        return self._model_edit("Chamfer" if chamfer else "Fillet", build)
+
+    def cmd_mirror(self, req):
+        """Mirror a part across a plane. "join": the mirror image is added to the part's own
+        body (PartDesign Mirrored of the whole body); otherwise it is a new solid of its own
+        (Part Mirroring), which follows the original."""
+        target = self._whole(req["obj"])
+        ref = req["plane"]
+        join = bool(req.get("join"))
+
+        def build(doc, hide):
+            if join:
+                body, _ = self._feature_place(doc, target)
+                f = self._new_in_body(body, "PartDesign::Mirrored", "Mirror")
+                f.TransformMode = "Transform body"
+                f.MirrorPlane = self._plane_link(body, ref)
+                body.AllowCompound = True
+                return f
+            base, normal = self._plane_geometry(ref)
+            m = doc.addObject("Part::Mirroring", "Mirror")
+            m.Source = target
+            m.Base = base
+            m.Normal = normal
+            m.Label = target.Label + " mirrored"
+            return m
+
+        return self._model_edit("Mirror", build)
+
+    def cmd_pattern(self, req):
+        """Repeat a whole part in its body: "kind" "circular" turns "count" copies about "axis"
+        over "angle" degrees (360: evenly round); "linear" steps them "spacing" apart along it."""
+        target = self._whole(req["obj"])
+        kind = req.get("kind", "circular")
+        ref = req["axis"]
+        count = int(req["count"])
+        if count < 2:
+            raise ValueError("a pattern needs at least 2 copies")
+
+        def build(doc, hide):
+            body, _ = self._feature_place(doc, target)
+            if kind == "circular":
+                f = self._new_in_body(body, "PartDesign::PolarPattern", "CircularPattern")
+                f.TransformMode = "Transform body"
+                f.Axis = self._axis_link(body, ref, flat_ok=False)
+                f.Angle = float(req.get("angle", 360.0))
+            elif kind == "linear":
+                f = self._new_in_body(body, "PartDesign::LinearPattern", "LinearPattern")
+                f.TransformMode = "Transform body"
+                f.Direction = self._axis_link(body, ref, flat_ok=True)
+                spacing = float(req["spacing"])
+                f.Reversed = spacing < 0
+                f.Mode = "offset"
+                f.Offset = abs(spacing)
+            else:
+                raise ValueError("unknown pattern: %s" % kind)
+            f.Occurrences = count
+            body.AllowCompound = True  # copies that do not touch stay separate solids
+            return f
+
+        return self._model_edit("Pattern", build)
+
+    def cmd_copy(self, req):
+        """A copy of a whole part moved by "offset" [x, y, z]: independent (every object it is
+        built from copied too), or with "linked" an App::Link that follows the original."""
+        target = self._whole(req["obj"])
+        move = FreeCAD.Placement(FreeCAD.Vector(*[float(x) for x in req.get("offset", (0, 0, 0))]), FreeCAD.Rotation())
+
+        def build(doc, hide):
+            if req.get("linked"):
+                link = doc.addObject("App::Link", target.Name + "Link")
+                link.LinkedObject = target
+                link.Placement = move.multiply(target.Placement)
+                link.Label = target.Label + " link"
+                return link
+            deps = target.OutListRecursive
+            sources = [o for o in doc.Objects if o in deps] + [target]
+            copies = doc.copyObject(sources, False, True)
+            for src, cp in zip(sources, copies):
+                if not self._visible(src):
+                    hide.append(cp)
+            made = copies[-1]
+            made.Placement = move.multiply(made.Placement)
+            return made
+
+        return self._model_edit("Copy", build)
+
+    def cmd_delete(self, req):
+        """Delete an object, a whole body with what it holds, or a feature of a body (the next
+        feature then builds on the one before). Refused while something else uses it."""
+        o = self._obj(req["obj"])
+
+        def build(doc, hide):
+            body = self._body_of(o)
+            inside = set()
+            if o.isDerivedFrom("PartDesign::Body"):
+                inside = set(o.Group) | {o.Origin} | set(o.Origin.OriginFeatures)
+            elif body is not None:
+                # The next feature only builds on it; one that refers to its faces does use it.
+                inside = {body} | {f for f in body.Group if getattr(f, "BaseFeature", None) == o
+                                   and not _links_to(f, o, skip="BaseFeature")}
+            users = [u for u in o.InList if u not in inside and u not in o.OutListRecursive
+                     and not (_is_container(u) and o in (getattr(u, "Group", None) or []))]
+            if users:
+                raise ValueError("%s is used by %s" % (o.Label, ", ".join(u.Label for u in users)))
+            if o.isDerivedFrom("PartDesign::Body"):
+                origin = o.Origin.Name if o.Origin is not None else None
+                o.removeObjectsFromDocument()
+                doc.removeObject(o.Name)
+                if origin and doc.getObject(origin) is not None:  # FreeCAD may take it with the body
+                    doc.removeObject(origin)
+            else:
+                if body is not None:
+                    body.removeObject(o)
+                doc.removeObject(o.Name)
+            return None
+
+        return self._model_edit("Delete", build)
+
+    # ---- what the window shows of them -------------------------------------------------
+
+    def _shown_planes(self):
+        """Construction planes to draw, as {name: [four corners]} in document coordinates:
+        a square over the model, centred where the model's centre falls on the plane."""
+        doc = self._doc()
+        planes = [o for o in doc.Objects if o.isDerivedFrom("PartDesign::Plane") and self._visible(o)]
+        planes = [p for p in planes if (self._body_of(p) is None or self._visible(self._body_of(p)))]
+        if not planes:
+            return {}
+        bbox = FreeCAD.BoundBox()
+        for o in doc.Objects:
+            shape = getattr(o, "Shape", None)
+            # Origins and construction geometry are infinite; links share their part's box.
+            if shape is None or _is_datum(o) or o.isDerivedFrom("Part::Datum") or o.TypeId in LINK_TYPES:
+                continue
+            bb = shape.BoundBox
+            if bb.isValid() and bb.DiagonalLength < 1e30:
+                bbox.add(bb)
+        if bbox.isValid():
+            center, half = bbox.Center, max(bbox.DiagonalLength * 0.4, 5.0)
+        else:
+            center, half = FreeCAD.Vector(), 50.0
+        out = {}
+        for p in planes:
+            pl = p.getGlobalPlacement()
+            u = pl.Rotation.multVec(FreeCAD.Vector(1, 0, 0))
+            v = pl.Rotation.multVec(FreeCAD.Vector(0, 1, 0))
+            n = pl.Rotation.multVec(FreeCAD.Vector(0, 0, 1))
+            c = center - n * (center - pl.Base).dot(n)
+            corners = [c + u * (su * half) + v * (sv * half) for su, sv in ((-1, -1), (1, -1), (1, 1), (-1, 1))]
+            if all(_finite(x) for q in corners for x in (q.x, q.y, q.z)):
+                out[p.Name] = [[q.x, q.y, q.z] for q in corners]
+        return out
+
+
+def _model_visible(worker, o):
+    """Visibility the document's structure decides, or None: in a body only the tip feature is
+    shown (the others are steps towards it), and a solid a body is built on is hidden."""
+    if o.isDerivedFrom("PartDesign::Feature"):
+        body = worker._body_of(o)
+        if body is not None:
+            return body.Tip == o
+    for p in o.InList:
+        if p.isDerivedFrom("PartDesign::Body") and p.BaseFeature == o:
+            return False
+    # A sketch a feature is made from is hidden under it, as FreeCAD's GUI hides it.
+    if o.isDerivedFrom("Part::Part2DObject"):
+        for p in o.InList:
+            if o in _profiles(p) or (p.TypeId == "Part::Extrusion" and p.Base == o):
+                return False
+    return None
+
+
+def _links_to(obj, target, skip=None):
+    """Whether a link property of `obj` other than `skip` refers to `target`."""
+    def refers(v):
+        if isinstance(v, (list, tuple)):
+            return any(refers(x) for x in v)
+        return v is not None and hasattr(v, "TypeId") and v == target
+    for name in obj.PropertiesList:
+        if name == skip or "Link" not in obj.getTypeIdOfProperty(name):
+            continue
+        try:
+            if refers(getattr(obj, name)):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def placement_entries(obj, name, value, group, readonly):
+    """A placement as six numbers the property panel edits: "Placement.x" ... "Placement.roll"."""
+    yaw, pitch, roll = value.Rotation.toEuler()
+    numbers = (value.Base.x, value.Base.y, value.Base.z, yaw, pitch, roll)
+    return [{"name": "%s.%s" % (name, part), "group": group, "type": "App::PropertyPlacement",
+             "readonly": readonly, "kind": "float", "value": float(x), "unit": "mm" if i < 3 else "°",
+             "text": "%g" % x}
+            for i, (part, x) in enumerate(zip(PLACEMENT_PARTS, numbers))]
+
+
+def set_property(obj, name, value):
+    """obj.name = value, where name may be one of `placement_entries`' parts."""
+    base, _, part = name.partition(".")
+    if not part:
+        setattr(obj, name, value)
+        return
+    if part not in PLACEMENT_PARTS or obj.getTypeIdOfProperty(base) != "App::PropertyPlacement":
+        raise ValueError("no property " + name)
+    pl = FreeCAD.Placement(getattr(obj, base))
+    if part in ("x", "y", "z"):
+        b = pl.Base
+        setattr(b, part, float(value))
+        pl.Base = b
+    else:
+        ypr = list(pl.Rotation.toEuler())
+        ypr[("yaw", "pitch", "roll").index(part)] = float(value)
+        pl.Rotation = FreeCAD.Rotation(*ypr)
+    setattr(obj, base, pl)
+
+
+class Worker(Modelling):
     def __init__(self):
         self.doc = None
         self.path = None
@@ -181,7 +688,8 @@ class Worker:
     def cmd_tree(self, req):
         """The model tree, with what only gets in the way left out: origins with their axes and
         planes (not drawn), hidden objects that App::Links show elsewhere (the source of every
-        occurrence of a part), and groups left empty by that."""
+        occurrence of a part), and groups left empty by that. A construction plane shown in the
+        view carries "plane": the four corners of the square the window draws for it."""
         doc = self._doc()
         objects = doc.Objects
         linked = set()
@@ -211,12 +719,13 @@ class Worker:
                     groups[o.Name].append(sketch.Name)
         in_group = set()
         nodes = []
+        planes = self._shown_planes()
         for o in objects:
             if o.Name in omit:
                 continue
             children = [c for c in groups[o.Name] if c not in omit and claimed.get(c, o.Name) == o.Name]
             in_group.update(groups[o.Name])
-            nodes.append({
+            node = {
                 "name": o.Name,
                 "label": o.Label,
                 "type": o.TypeId,
@@ -225,7 +734,10 @@ class Worker:
                 "error": "Invalid" in o.State or "Error" in o.State,
                 # A body's shape is that of its tip: the timeline's rollback marker.
                 "tip": _tip(o),
-            })
+            }
+            if o.Name in planes:
+                node["plane"] = planes[o.Name]  # corners of the construction plane drawn
+            nodes.append(node)
         roots = [o.Name for o in objects if o.Name not in in_group and o.Name not in omit]
         return {"nodes": nodes, "roots": roots, "undo": doc.UndoCount, "redo": doc.RedoCount}
 
@@ -264,6 +776,9 @@ class Worker:
             elif ptype in ("App::PropertyString", "App::PropertyFont"):
                 entry["kind"] = "string"
                 entry["value"] = str(value)
+            elif ptype == "App::PropertyPlacement":
+                props.extend(placement_entries(obj, name, value, entry["group"], entry["readonly"]))
+                continue
             elif ptype == "App::PropertyEnumeration":
                 entry["kind"] = "enum"
                 entry["value"] = str(value)
@@ -283,7 +798,7 @@ class Worker:
         self.edited = True
         doc.openTransaction("Set " + name)
         try:
-            setattr(obj, name, value)
+            set_property(obj, name, value)
             doc.recompute()
         except Exception:
             doc.abortTransaction()
@@ -344,6 +859,7 @@ class Worker:
             doc.undo()
             doc.recompute()
             self._follow_tips(tips)
+            self._forget_gone()
         return {"undo": doc.UndoCount, "redo": doc.RedoCount}
 
     def cmd_redo(self, req):
@@ -354,6 +870,7 @@ class Worker:
             doc.redo()
             doc.recompute()
             self._follow_tips(tips)
+            self._forget_gone()
         return {"undo": doc.UndoCount, "redo": doc.RedoCount}
 
     # ---- geometry --------------------------------------------------------------------
@@ -722,6 +1239,11 @@ class Worker:
         return obj
 
     def _visible(self, o):
+        if o.Name in self.vis_changes:
+            return self.vis_changes[o.Name]
+        decided = _model_visible(self, o)
+        if decided is not None:
+            return decided
         vp = self.gui.get(o.Name)
         if vp is not None and "visible" in vp:
             return vp["visible"]
@@ -736,7 +1258,8 @@ class Worker:
                 parents.setdefault(child.Name, []).append(o)
         out = []
         for o in doc.Objects:
-            if not self._visible(o) or _is_container(o) or _is_datum(o):
+            # Construction planes are infinite; the window draws them from the tree's corners.
+            if not self._visible(o) or _is_container(o) or _is_datum(o) or o.isDerivedFrom("Part::Datum"):
                 continue
             chain, seen, ok = list(parents.get(o.Name, [])), set(), True
             while chain:

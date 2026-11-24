@@ -4,8 +4,9 @@ A small native window over FreeCAD's modelling core. FreeCAD runs headless in it
 VibeCAD draws its shapes with wgpu and edits its documents through it. Documents stay ordinary
 `.FCStd` files that FreeCAD opens as before, colours included.
 
-Prototype. It opens, shows, picks, edits properties, undoes, saves and exports. There is no
-sketcher and no way to create features yet.
+Prototype. It opens, shows, picks, edits properties, undoes, saves and exports, and models with
+a first set of operations (construction planes, extrude, fillet, chamfer, mirror, circular and
+linear patterns, copy, delete). There is no sketcher yet.
 
 ## Run
 
@@ -50,7 +51,38 @@ EDGE WIDTH slider sets the edge width from 1 to 4 pixels (default 1.5).
 | `O` | orthographic / perspective |
 | Ctrl+O, Ctrl+S, Ctrl+Shift+S, Ctrl+E | open, save, save as, export |
 | Ctrl+Z, Ctrl+Y | undo, redo |
-| Esc | clear the selection |
+| Esc | close the open command, else clear the selection |
+| Del | delete the selected object |
+
+## Modelling
+
+EDIT holds the operations. Each opens a dialog where the properties are; it starts from what is
+selected, and while it is open a click in the view or the tree fills its lit field (the part, or
+a face or plane). OK makes one undoable step; the new object is selected, so its numbers can be
+changed in the property panel afterwards. Everything made is a native FreeCAD object, so FreeCAD
+opens the document as before.
+
+| Command | Takes | Makes |
+| --- | --- | --- |
+| Plane | a flat face, a construction plane or XY/XZ/YZ; offset, angle | `PartDesign::Plane` attached to it |
+| Extrude | a flat face (or a sketch from the tree); distance, both sides | `Pad` (positive) or `Pocket` (negative) |
+| Fillet, Chamfer | a face: all its edges; radius or size | `PartDesign::Fillet` / `Chamfer` |
+| Mirror | a part, a plane; new solid or join | `Part::Mirroring`, or `PartDesign::Mirrored` of the whole body |
+| Circular | a part, X/Y/Z or a round face (its axis); count, angle | `PartDesign::PolarPattern` of the whole body |
+| Linear | a part, X/Y/Z or a flat face (its normal); count, spacing | `PartDesign::LinearPattern` of the whole body |
+| Copy | a part; move X/Y/Z, linked | an independent copy, or an `App::Link` |
+| Delete | the selection | removes it; refused while another object uses it |
+
+- A feature goes after its body's tip and becomes the tip; only the tip of a body is drawn, as in
+  FreeCAD. Patterns and joined mirrors work on the whole body, which may then hold several solids.
+- A plain solid (a Part feature, an imported shape, a mirror image) that gets a PartDesign
+  feature first becomes the base of a new body, as FreeCAD's "body from a solid" does; its face
+  numbers stay the same. A link shows another part, so it is mirrored and copied, not changed.
+- A step whose result fails to compute, or leaves no solid, is undone at once and its error is
+  shown; nothing half-made stays in the document.
+- Construction planes are drawn as translucent orange squares over the model, centred where
+  the model's centre falls on them, and can be clicked. A placement (a plane's
+  `AttachmentOffset`, an object's `Placement`) shows as six numbers: x, y, z, yaw, pitch, roll.
 
 Typed numbers apply on Enter or when the field loses focus. Opening another file or closing the
 window asks before unsaved edits are lost. If FreeCAD crashes, File → Restart FreeCAD starts a new
@@ -73,7 +105,8 @@ one and reopens the file.
   random `VIBECAD_TOKEN`; the script connects back and must greet with the token. The listener
   closes after that one connection, and the directory is removed once FreeCAD has read the script. Every message is a JSON header plus an optional binary payload, both
   length-prefixed (see the script's docstring). Commands: `open`, `new`, `tree`, `props`,
-  `set_prop`, `set_visible`, `undo`, `redo`, `scene`, `save_as`, `export`. Requests go out as
+  `set_prop`, `set_visible`, `undo`, `redo`, `scene`, `save_as`, `export`, and the modelling
+  ones (`datum_plane`, `extrude`, `fillet`, `mirror`, `pattern`, `copy`, `delete`). Requests go out as
   they are made; replies come back in order, a scene's stream frames before its reply, except
   that `tree` and `props` asked while a scene streams are answered at once, between its frames,
   so the tree and the properties of a selected part do not wait for a large assembly to load.
@@ -160,7 +193,13 @@ one and reopens the file.
 ```
 cargo test                                         # scene decoding, the camera, the shader (naga)
 python worker/test_worker.py examples/plate.FCStd  # the worker protocol, against a real FreeCAD
+python worker/test_modelling.py                    # the modelling commands, against a real FreeCAD
 ```
+
+`test_modelling.py` runs every modelling command on the example plate and checks what is drawn
+and where (planes on faces and origin planes, extrude both ways, fillet, chamfer, mirror three
+ways, patterns about an axis and a hole, copies, deletes), that refused and failed steps leave
+nothing behind, and undoes each step.
 
 `test_worker.py` gives the worker an empty disk cache, checks the scene stream (boxes first,
 progress in faces, each mesh once, biggest first when nothing was tessellated), that a `tree`
@@ -179,7 +218,8 @@ python worker/test_worker.py examples/plate.FCStd path/to/assembly.FCStd
 `VIBECAD_SELFTEST=<dir> vibecad examples/plate.FCStd` drives the window itself: it keeps a frame
 of the boxes and one of a partly loaded scene while the document streams in, zooms in and back,
 picks faces (a grid of points and two inside the first object's box), selects `Pad`, sets
-`Length` to 12, undoes, writes frames as BMP and `report.json` to `<dir>`, and quits. The
+`Length` to 12, undoes, extrudes the top face and puts a construction plane over it through the
+modelling commands, writes frames as BMP and `report.json` to `<dir>`, and quits. The
 report's `load` entry is the timeline of the first scene (boxes, first meshes, all meshes, in
 ms after the request, and the worker's cache hits); `perf` gives the GPU memory of the scene,
 the time to decode and upload it, the objects and triangles drawn and the time per frame (30
@@ -188,8 +228,11 @@ documents, where the `Pad` steps just report an error.
 
 ## Limits
 
-- No sketcher, no new features, no deleting objects yet. Properties of type length, angle,
-  number, integer, bool, string and enumeration are editable; others are shown as text.
+- No sketcher, and edges cannot be picked: fillets and chamfers take every edge of a face, and
+  a construction plane cannot be put on an edge. Properties of type length, angle, number,
+  integer, bool, string, enumeration and placement are editable; others are shown as text.
+- Construction planes are drawn over the view without depth, so they show through parts in
+  front of them.
 - The first view of a large assembly takes time: the 158 000-face Orbiter assembly shows its
   boxes 0.5 s after it is open, its first mesh after 2.3 s and all of it after about 19 s
   (some 3 s of that checking which shapes are closed solids); from the disk cache all of it

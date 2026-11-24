@@ -7,6 +7,7 @@
 
 mod app;
 mod camera;
+mod modelling;
 mod navigation;
 mod profile;
 mod render;

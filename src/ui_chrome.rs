@@ -5,6 +5,7 @@ use eframe::egui::{self, Align2, Color32, Id, Pos2, Rect, RichText, Sense, Strok
 use glam::Vec3;
 
 use crate::camera::Camera;
+use crate::modelling::{self, Op};
 use crate::navigation::Scheme;
 
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug, serde::Serialize, serde::Deserialize)]
@@ -38,11 +39,18 @@ pub enum Action {
     EdgeWidth(f32),
     /// How mouse drags move the camera.
     Navigation(Scheme),
+    /// Open a modelling command's dialog.
+    Command(Op),
+    /// Delete the selected object.
+    Delete,
 }
 
 /// What the ribbon needs to know to enable and mark its buttons.
 pub struct RibbonState {
     pub has_doc: bool,
+    pub has_selection: bool,
+    /// The modelling command whose dialog is open.
+    pub command: Option<Op>,
     pub can_open: bool,
     pub undo: u64,
     pub redo: u64,
@@ -91,6 +99,24 @@ pub fn ribbon(ui: &mut egui::Ui, tab: &mut Tab, s: &RibbonState, status: impl Fn
                     let redo = if s.redo > 0 { format!("Redo ({})", s.redo) } else { "Redo".into() };
                     button(ui, &mut out, Action::Undo, Icon::Undo, &undo, s.undo > 0, false, "Ctrl+Z");
                     button(ui, &mut out, Action::Redo, Icon::Redo, &redo, s.redo > 0, false, "Ctrl+Y");
+                });
+                let mut command = |ui: &mut egui::Ui, op: Op| {
+                    button(ui, &mut out, Action::Command(op), Icon::Op(op), op.label(), s.has_doc, s.command == Some(op), op.hint());
+                };
+                group(ui, "CONSTRUCT", |ui| command(ui, Op::Plane));
+                group(ui, "CREATE", |ui| command(ui, Op::Extrude));
+                group(ui, "MODIFY", |ui| {
+                    command(ui, Op::Fillet);
+                    command(ui, Op::Chamfer);
+                });
+                group(ui, "PATTERN", |ui| {
+                    command(ui, Op::Mirror);
+                    command(ui, Op::Circular);
+                    command(ui, Op::Linear);
+                    command(ui, Op::Copy);
+                });
+                group(ui, "DELETE", |ui| {
+                    button(ui, &mut out, Action::Delete, Icon::Delete, "Delete", s.has_selection, false, "Delete the selected object (Del)");
                 });
             }
             Tab::View => {
@@ -183,6 +209,8 @@ enum Icon {
     Palette,
     Log,
     Grid,
+    Op(Op),
+    Delete,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -308,6 +336,8 @@ fn paint_icon(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
                 p.line_segment([at(a.0, a.1), at(b.0, b.1)], Stroke::new(1.0, c));
             }
         }
+        Icon::Op(op) => modelling::paint_icon(p, r, op, c),
+        Icon::Delete => modelling::paint_delete(p, r, c),
         Icon::Log => {
             poly(&[(0.15, 0.05), (0.85, 0.05), (0.85, 0.95), (0.15, 0.95)], true);
             for y in [0.3, 0.5, 0.7] {
@@ -706,7 +736,7 @@ pub fn ground_labels(painter: &egui::Painter, grid: crate::render::GroundGrid, v
 }
 
 /// Whether `p` is inside the convex polygon `poly`, whichever way round its points go.
-fn inside_convex(p: Pos2, poly: &[Pos2]) -> bool {
+pub fn inside_convex(p: Pos2, poly: &[Pos2]) -> bool {
     let mut sign = 0.0f32;
     for (i, a) in poly.iter().enumerate() {
         let b = poly[(i + 1) % poly.len()];
