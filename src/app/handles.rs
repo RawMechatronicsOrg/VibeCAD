@@ -35,7 +35,7 @@ pub(super) struct Gizmos {
     face: Option<FaceInfo>,
     asked_face: Option<(String, String)>,
     /// The object under the cursor and the edge lit there.
-    hover: Option<(String, Option<u32>)>,
+    pub(super) hover: Option<(String, Option<u32>)>,
     hovered_at: Option<(Pos2, Instant)>,
     /// Looks in a row that took too long; at `SLOW_LOOKS` hovering stops until the model changes.
     slow: u32,

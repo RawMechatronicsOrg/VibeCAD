@@ -7,6 +7,7 @@ use glam::Vec3;
 use crate::camera::Camera;
 use crate::modelling::{self, Op};
 use crate::navigation::Scheme;
+use crate::render::ScanDisplay;
 use crate::sketcher::{Constrain, Tool};
 
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug, serde::Serialize, serde::Deserialize)]
@@ -15,6 +16,8 @@ pub enum Tab {
     File,
     Edit,
     View,
+    /// Working on scans' points.
+    Scan,
     Agentic,
 }
 
@@ -25,6 +28,18 @@ pub enum Action {
     Save,
     SaveAs,
     Export,
+    /// Add a scan (points or a scanned mesh) to the document.
+    ImportScan,
+    /// The tool that selects scan points: a lasso or a click.
+    PointTool,
+    DeletePoints,
+    InvertPoints,
+    ClearPoints,
+    /// Show the deleted points of the selected scan (or of all) again.
+    RestorePoints,
+    /// Write a scan's points that are left to a PLY.
+    SavePoints,
+    ScanDisplay(ScanDisplay),
     Restart,
     Quit,
     Undo,
@@ -63,6 +78,16 @@ pub enum Action {
     FinishSketch,
 }
 
+/// The SCAN tab's state.
+pub struct ScanRibbon {
+    /// The document has scans.
+    pub scans: bool,
+    pub tool: bool,
+    pub selected: usize,
+    pub deleted: usize,
+    pub display: ScanDisplay,
+}
+
 /// The ribbon while a sketch is edited.
 pub struct SketchRibbon {
     pub label: String,
@@ -97,6 +122,7 @@ pub struct RibbonState {
     pub navigation: Scheme,
     /// The validators' panel is open.
     pub validation: bool,
+    pub scan: ScanRibbon,
     /// A sketch is being edited: the ribbon holds its tools instead of the tabs' buttons.
     pub sketch: Option<SketchRibbon>,
 }
@@ -109,7 +135,7 @@ pub fn ribbon(ui: &mut egui::Ui, tab: &mut Tab, s: &RibbonState, status: impl Fn
         if let Some(sk) = &s.sketch {
             let _ = ui.selectable_label(true, RichText::new(format!("SKETCH · {}", sk.label)).small().strong().color(Color32::from_rgb(230, 140, 50)));
         }
-        for (t, name) in [(Tab::File, "FILE"), (Tab::Edit, "EDIT"), (Tab::View, "VIEW"), (Tab::Agentic, "AGENTIC")] {
+        for (t, name) in [(Tab::File, "FILE"), (Tab::Edit, "EDIT"), (Tab::View, "VIEW"), (Tab::Scan, "SCAN"), (Tab::Agentic, "AGENTIC")] {
             let mut text = RichText::new(name).small().strong();
             if t == Tab::Agentic && s.agent_running {
                 text = text.color(ui.visuals().selection.bg_fill); // the agent is working
@@ -136,6 +162,7 @@ pub fn ribbon(ui: &mut egui::Ui, tab: &mut Tab, s: &RibbonState, status: impl Fn
                 });
                 group(ui, "EXCHANGE", |ui| {
                     button(ui, &mut out, Action::Export, Icon::Export, "Export", s.has_doc, false, "STEP, STL, 3MF, OBJ (Ctrl+E)");
+                    button(ui, &mut out, Action::ImportScan, Icon::Scan, "Import scan", s.has_doc, false, "A point cloud or a scanned mesh: PLY, STL, OBJ, E57, XYZ/PTS. Shown beside the model; FreeCAD keeps only its path");
                 });
                 group(ui, "FREECAD", |ui| {
                     button(ui, &mut out, Action::Restart, Icon::Restart, "Restart", true, false, "Start a new FreeCAD process and reopen the file");
@@ -230,6 +257,7 @@ pub fn ribbon(ui: &mut egui::Ui, tab: &mut Tab, s: &RibbonState, status: impl Fn
                     });
                 });
             }
+            Tab::Scan => scan_groups(ui, &mut out, &s.scan, s.has_doc),
             Tab::Agentic => {
                 group(ui, "AGENT", |ui| {
                     button(ui, &mut out, Action::ToggleFeed, Icon::Feed, "Feed", true, s.feed, "The agent's tool calls as they happen, over the view");
@@ -256,6 +284,48 @@ pub fn ribbon(ui: &mut egui::Ui, tab: &mut Tab, s: &RibbonState, status: impl Fn
         }
     });
     out
+}
+
+/// The SCAN tab: select points, act on them, choose how scans are drawn.
+fn scan_groups(ui: &mut egui::Ui, out: &mut Vec<Action>, s: &ScanRibbon, has_doc: bool) {
+    group(ui, "IMPORT", |ui| {
+        button(ui, out, Action::ImportScan, Icon::Scan, "Import scan", has_doc, false, "A point cloud or a scanned mesh: PLY, STL, OBJ, E57, XYZ/PTS");
+    });
+    group(ui, "SELECT", |ui| {
+        button(ui, out, Action::PointTool, Icon::Pick, "Select points", s.scans, s.tool, "Drag around points to select them, or click one; Shift adds, Ctrl removes. The camera stays on the middle and right buttons (Esc)");
+        button(ui, out, Action::InvertPoints, Icon::Construction, "Invert", s.scans, false, "Select the points not selected, and only those");
+        button(ui, out, Action::ClearPoints, Icon::Clear, "Clear", s.selected > 0, false, "Select no points (Esc)");
+    });
+    group(ui, "EDIT", |ui| {
+        button(ui, out, Action::DeletePoints, Icon::Delete, "Delete points", s.selected > 0, false, "Delete the selected points (Del): one undo step, kept in the document, the scan's file left as it is");
+        button(ui, out, Action::RestorePoints, Icon::Undo, "Restore", s.deleted > 0, false, "Show the deleted points of the selected scan again, or of every scan when none is selected");
+        button(ui, out, Action::SavePoints, Icon::Export, "Save as PLY", s.scans, false, "Write the selected scan's points, less those deleted, to a PLY in document coordinates");
+    });
+    group(ui, "DISPLAY", |ui| {
+        let mut d = s.display;
+        ui.vertical(|ui| {
+            ui.add_space(2.0);
+            egui::ComboBox::from_id_salt("scan colour")
+                .width(110.0)
+                .selected_text(d.color.name())
+                .show_ui(ui, |ui| {
+                    for c in crate::render::ScanColor::ALL {
+                        ui.selectable_value(&mut d.color, c, c.name());
+                    }
+                })
+                .response
+                .on_hover_text("How points are coloured: the file's colours, one colour, a ramp from the scan's lowest point to its highest, or the direction of their normals");
+            ui.checkbox(&mut d.lit, "Lit").on_hover_text("Shade points as a surface by their normals; off, each shows its colour flat");
+        });
+        ui.vertical(|ui| {
+            ui.add_space(12.0);
+            let slider = egui::Slider::new(&mut d.size, 0.5..=4.0).step_by(0.25).fixed_decimals(2).prefix("size ×");
+            ui.add_sized(vec2(130.0, 20.0), slider).on_hover_text("Width of the points, times what the view chooses for their spacing");
+        });
+        if d != s.display {
+            out.push(Action::ScanDisplay(d));
+        }
+    });
 }
 
 /// The ribbon in sketch mode: the drawing tools, then what acts on picked elements, then Finish.
@@ -311,6 +381,7 @@ fn group(ui: &mut egui::Ui, caption: &str, add: impl FnOnce(&mut egui::Ui)) {
 #[derive(Clone, Copy)]
 enum Icon {
     Open,
+    Scan,
     Save,
     SaveAs,
     Export,
@@ -396,6 +467,12 @@ fn paint_icon(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
             poly(&[(0.3, 0.4), (0.1, 0.4), (0.1, 0.9), (0.9, 0.9), (0.9, 0.4), (0.7, 0.4)], false);
             p.line_segment([at(0.5, 0.7), at(0.5, 0.05)], s);
             poly(&[(0.3, 0.25), (0.5, 0.05), (0.7, 0.25)], false);
+        }
+        Icon::Scan => {
+            // A curved surface sampled as dots.
+            for (x, y) in [(0.15, 0.7), (0.3, 0.52), (0.45, 0.42), (0.6, 0.4), (0.75, 0.46), (0.88, 0.6), (0.25, 0.85), (0.45, 0.68), (0.65, 0.66), (0.82, 0.8)] {
+                p.circle_filled(at(x, y), 1.6, s.color);
+            }
         }
         Icon::Restart => {
             let pts = arc(0.5, 0.5, 0.38, -1.2, 4.2);
@@ -991,6 +1068,9 @@ pub struct ObjectKind {
     pub about: &'static str,
 }
 
+/// Not a FreeCAD type: what the tree says for a scan (an `App::FeaturePython` with a scan file).
+pub const SCAN: &str = "VibeCAD scan";
+
 pub fn object_kind(type_id: &str) -> ObjectKind {
     use Family::*;
     let k = |family, name, about| ObjectKind { family, name, about };
@@ -1032,6 +1112,7 @@ pub fn object_kind(type_id: &str) -> ObjectKind {
         "Part::Revolution" => k(Solid, "revolve", "Spins a 2D shape into a solid (Part workbench)."),
         "Part::Feature" => k(Solid, "shape", "A solid stored as it is, often imported from STEP."),
         "Mesh::Feature" => k(Solid, "mesh", "A triangle mesh, often imported from STL."),
+        SCAN => k(Other, "scan", "A point cloud or a scanned mesh, read from its file by VibeCAD; FreeCAD keeps only its path and placement."),
         t if t.starts_with("PartDesign::Additive") => k(Add, "added shape", "Adds a primitive shape to the body."),
         t if t.starts_with("PartDesign::Subtractive") => k(Cut, "cut shape", "Removes a primitive shape from the body."),
         t if t.starts_with("Part::") => k(Solid, "shape", "A shape of the Part workbench."),

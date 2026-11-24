@@ -14,6 +14,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use crate::navigation::Scheme;
+use crate::render::ScanDisplay;
 use crate::ui_chrome::Tab;
 
 /// Everything the profile keeps.
@@ -33,6 +34,8 @@ pub struct Settings {
     /// The window's inner size in points when it is not maximized.
     pub window_size: [f32; 2],
     pub maximized: bool,
+    /// How scans are drawn (SCAN tab).
+    pub scan_display: ScanDisplay,
 }
 
 impl Default for Settings {
@@ -49,6 +52,7 @@ impl Default for Settings {
             tab: Tab::default(),
             window_size: [1400.0, 900.0],
             maximized: false,
+            scan_display: ScanDisplay::default(),
         }
     }
 }
@@ -70,6 +74,7 @@ impl Settings {
             "tab": self.tab,
             "window_size": self.window_size,
             "maximized": self.maximized,
+            "scan_display": self.scan_display,
         })
     }
 
@@ -92,6 +97,7 @@ impl Settings {
             tab: get(v, "tab", d.tab),
             window_size: if size.iter().all(|s| s.is_finite() && (200.0..=20000.0).contains(s)) { size } else { d.window_size },
             maximized: get(v, "maximized", d.maximized),
+            scan_display: get(v, "scan_display", d.scan_display),
         }
     }
 }

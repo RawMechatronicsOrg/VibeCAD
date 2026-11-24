@@ -8,17 +8,23 @@
 //! view are packed into an instance buffer (matrix, ids), grouped by mesh, and each group is one
 //! instanced draw. Closed solids are drawn with back faces culled; everything else from both
 //! sides.
+//!
+//! Scans are kept apart from the scene, which is replaced on every edit: each is uploaded once,
+//! a buffer group per frame, and drawn chunk by chunk as discs, as many points of a chunk as its
+//! size on screen needs (see `cloud::level_of_detail`), within a budget of points per frame.
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 use eframe::egui;
 use eframe::egui_wgpu::{self, wgpu};
-use glam::{Mat3, Mat4, Vec3};
+use glam::{DMat4, Mat3, Mat4, Vec3};
 use wgpu::util::DeviceExt as _;
 
 use crate::camera::Frustum;
+use crate::cloud::{self, Cloud};
 use crate::scene::{DEFAULT_COLOR, InstanceInfo, MeshBatch, SceneData, Vertex};
 
 // egui shows a native texture's bytes as they are, so the view is drawn without sRGB encoding
@@ -328,6 +334,117 @@ fn fs_edge(v: EOut) -> @location(0) vec4<f32> {
     }
     return vec4<f32>(0.06, 0.06, 0.08, alpha);
 }
+
+// Scans: every point a disc facing the screen, six vertices per point. A draw is one chunk: its
+// vertex range is its points times six within its group's buffer, its instance the chunk's
+// index, which gives the width its level of detail chose.
+struct CloudU {
+    // Scan coordinates to clip space, composed in f64: a scan far from the origin (a site
+    // grid, a georeferenced survey) keeps the steps between its points.
+    mvp: mat4x4<f32>,
+    // The inverse transpose of the model matrix's 3x3, in the first three columns.
+    normal: mat4x4<f32>,
+    // For points without colours of their own.
+    color: vec4<f32>,
+    // x: the points have colours, y: the scan is selected, z: how points are coloured (0 their
+    // own colours, 1 one colour, 2 by height, 3 by normal), w: lit
+    flags: vec4<u32>,
+    // x, y: the heights the colour ramp runs between, z: the points' width, times
+    ramp: vec4<f32>,
+    // Row 2 of the scan's model matrix: a point's height in the document.
+    zrow: vec4<f32>,
+};
+struct CPoint {
+    x: f32,
+    y: f32,
+    z: f32,
+    color: u32,
+    normal: u32,    // octahedral, two snorm16
+};
+@group(1) @binding(0) var<storage, read> cloud_points: array<CPoint>;
+@group(1) @binding(1) var<uniform> cu: CloudU;
+// Width in pixels per chunk, this frame.
+@group(1) @binding(2) var<storage, read> chunk_sizes: array<f32>;
+// Two bits a point, sixteen a word: 1 selected, 2 deleted (see cloud::marks).
+@group(1) @binding(3) var<storage, read> point_marks: array<u32>;
+
+struct POut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) corner: vec2<f32>,
+    @location(1) color: vec3<f32>,
+    @location(2) normal: vec3<f32>,
+    @location(3) @interpolate(flat) lit: u32,
+};
+
+fn oct_decode(e: u32) -> vec3<f32> {
+    let f = unpack2x16snorm(e);
+    var n = vec3<f32>(f, 1.0 - abs(f.x) - abs(f.y));
+    let t = max(-n.z, 0.0);
+    n.x += select(t, -t, n.x >= 0.0);
+    n.y += select(t, -t, n.y >= 0.0);
+    return normalize(n);
+}
+
+// Blue, cyan, green, yellow, red from 0 to 1.
+fn height_ramp(t: f32) -> vec3<f32> {
+    let stops = array<vec3<f32>, 5>(vec3<f32>(0.16, 0.32, 0.86), vec3<f32>(0.12, 0.74, 0.84), vec3<f32>(0.32, 0.78, 0.32),
+                                    vec3<f32>(0.95, 0.84, 0.22), vec3<f32>(0.90, 0.26, 0.16));
+    let x = clamp(t, 0.0, 1.0) * 4.0;
+    let i = min(u32(x), 3u);
+    return mix(stops[i], stops[i + 1u], x - f32(i));
+}
+
+@vertex
+fn vs_point(@builtin(vertex_index) vi: u32, @builtin(instance_index) chunk: u32) -> POut {
+    var corners = array<vec2<f32>, 6>(vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0),
+                                      vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(-1.0, 1.0));
+    let i = vi / 6u;
+    let p = cloud_points[i];
+    let c = corners[vi % 6u];
+    var o: POut;
+    let mark = (point_marks[i / 16u] >> ((i % 16u) * 2u)) & 3u;
+    if ((mark & 2u) != 0u) {
+        o.clip = vec4<f32>(0.0, 0.0, -1.0, 1.0); // deleted: outside the view
+        return o;
+    }
+    let pos = vec4<f32>(p.x, p.y, p.z, 1.0);
+    let clip = cu.mvp * pos;
+    // `size` pixels across: half of it in NDC units is size / viewport.
+    o.clip = vec4<f32>(clip.xy + c * chunk_sizes[chunk] * cu.ramp.z / u.view.xy * clip.w, clip.zw);
+    o.corner = c;
+    let n = mat3x3<f32>(cu.normal[0].xyz, cu.normal[1].xyz, cu.normal[2].xyz) * oct_decode(p.normal);
+    switch cu.flags.z {
+        case 0u: { o.color = select(cu.color.rgb, unpack4x8unorm(p.color).rgb, cu.flags.x != 0u); }
+        case 2u: { o.color = height_ramp((dot(cu.zrow, pos) - cu.ramp.x) / max(cu.ramp.y - cu.ramp.x, 1e-6)); }
+        // Fitted normals face either way: their direction, not their sense.
+        case 3u: { o.color = abs(normalize(n)) * 0.8 + 0.15; }
+        default: { o.color = cu.color.rgb; }
+    }
+    if (cu.flags.y != 0u) {
+        o.color = mix(o.color, vec3<f32>(0.35, 0.85, 0.45), 0.35);
+    }
+    if ((mark & 1u) != 0u) {
+        o.color = vec3<f32>(1.0, 0.55, 0.08);
+    }
+    o.normal = n;
+    o.lit = cu.flags.w;
+    return o;
+}
+
+@fragment
+fn fs_point(v: POut) -> @location(0) vec4<f32> {
+    if (dot(v.corner, v.corner) > 1.0) {
+        discard;
+    }
+    if (v.lit == 0u) {
+        return vec4<f32>(v.color, 1.0);
+    }
+    var n = select(vec3<f32>(0.0, 0.0, 1.0), normalize(v.normal), dot(v.normal, v.normal) > 1e-20);
+    let to_eye = -u.light.xyz;
+    // A fitted normal may face either way.
+    n = select(n, -n, dot(n, to_eye) < 0.0);
+    return vec4<f32>(shade(v.color, n, to_eye), 1.0);
+}
 "#;
 
 #[repr(C)]
@@ -488,6 +605,118 @@ pub struct Stats {
     pub upload_ms: f64,
     pub drawn_instances: u32,
     pub drawn_triangles: u64,
+    pub drawn_points: u64,
+}
+
+/// Points drawn per frame at most, over all scans; `VIBECAD_POINT_BUDGET` sets another.
+const POINT_BUDGET: u64 = 12_000_000;
+/// About one point per this many pixels across, where a chunk has enough points.
+const POINT_SPACING: f32 = 1.2;
+/// The smallest disc, in pixels.
+const POINT_MIN_SIZE: f32 = 2.0;
+/// Bytes of one buffer of scan points at most: one is uploaded per frame.
+const POINT_GROUP_BYTES: u64 = 128 << 20;
+/// Points without colours of their own: a light grey with a little blue, as scans are shown.
+const SCAN_COLOR: [f32; 4] = [0.74, 0.76, 0.80, 1.0];
+
+/// `CloudU` in the shader.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct CloudUniforms {
+    mvp: [[f32; 4]; 4],
+    normal: [[f32; 4]; 4],
+    color: [f32; 4],
+    flags: [u32; 4],
+    ramp: [f32; 4],
+    zrow: [f32; 4],
+}
+
+/// How points take their colour.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub enum ScanColor {
+    /// The file's colours, else one colour.
+    #[default]
+    File,
+    Single,
+    /// A ramp from the lowest point of the scan to its highest.
+    Height,
+    /// The normal's direction: faces turned alike look alike.
+    Normal,
+}
+
+impl ScanColor {
+    pub const ALL: [ScanColor; 4] = [ScanColor::File, ScanColor::Single, ScanColor::Height, ScanColor::Normal];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ScanColor::File => "File colours",
+            ScanColor::Single => "One colour",
+            ScanColor::Height => "Height",
+            ScanColor::Normal => "Normal",
+        }
+    }
+}
+
+/// How scans are drawn: for all of them, kept with the settings.
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ScanDisplay {
+    pub color: ScanColor,
+    /// Lit as a surface by their normals, or flat.
+    pub lit: bool,
+    /// The points' width, times.
+    pub size: f32,
+}
+
+impl Default for ScanDisplay {
+    fn default() -> Self {
+        ScanDisplay { color: ScanColor::File, lit: true, size: 1.0 }
+    }
+}
+
+/// A scan to draw this frame.
+pub struct CloudDraw {
+    /// As given to `add_cloud`.
+    pub key: u64,
+    /// Scan coordinates (around the scan's origin) to document coordinates.
+    pub model: DMat4,
+    pub selected: bool,
+    /// The scan's lowest and highest point, in document z: the height ramp's ends.
+    pub heights: (f32, f32),
+}
+
+/// Points of consecutive chunks in one storage buffer.
+struct CloudGroup {
+    bind: wgpu::BindGroup,
+    _points: wgpu::Buffer,
+    /// Its points' marks, `marks[first..]` of the scan's.
+    marks: wgpu::Buffer,
+    first: usize,
+}
+
+struct GpuChunk {
+    group: u32,
+    /// The chunk's first point in its group's buffer.
+    start: u32,
+    count: u32,
+    lo: Vec3,
+    hi: Vec3,
+}
+
+struct GpuCloud {
+    /// Until every group is uploaded.
+    source: Option<Arc<Cloud>>,
+    has_color: bool,
+    groups: Vec<CloudGroup>,
+    chunks: Vec<GpuChunk>,
+    /// Points per group (a whole number of chunks).
+    group_points: usize,
+    uniform: wgpu::Buffer,
+    sizes: wgpu::Buffer,
+    sizes_cpu: Vec<f32>,
+    /// This frame: (group, chunk, points to draw).
+    draws: Vec<(u32, u32, u32)>,
+    /// The marks of all its points, two bits each (see cloud::marks).
+    marks: Vec<u32>,
 }
 
 pub struct Renderer {
@@ -500,6 +729,11 @@ pub struct Renderer {
     id_pipelines: [wgpu::RenderPipeline; 3],
     edge_pipeline: wgpu::RenderPipeline,
     box_pipeline: wgpu::RenderPipeline,
+    point_pipeline: wgpu::RenderPipeline,
+    cloud_layout: wgpu::BindGroupLayout,
+    /// Group 0 for draws that use the uniforms only (background, grid, scans).
+    base_bind: wgpu::BindGroup,
+    clouds: HashMap<u64, GpuCloud>,
     background_pipeline: wgpu::RenderPipeline,
     grid_pipeline: wgpu::RenderPipeline,
     /// A unit cube, `[0, 1]³`, for the boxes.
@@ -533,6 +767,8 @@ pub struct Frame {
     /// The colour at the bottom of the view; the top is near white.
     pub background: [f64; 3],
     pub grid: Option<GroundGrid>,
+    pub clouds: Vec<CloudDraw>,
+    pub scan_display: ScanDisplay,
 }
 
 impl Renderer {
@@ -735,6 +971,51 @@ impl Renderer {
             depth_write: false,
             samples,
         });
+        // Scans: group 0 as for everything else, group 1 the points of one buffer group, their
+        // scan's placement and this frame's widths.
+        let read_only = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+            count: None,
+        };
+        let cloud_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("vibecad scan bindings"),
+            entries: &[
+                read_only(0),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                read_only(2),
+                read_only(3),
+            ],
+        });
+        let point_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("vibecad scan layout"),
+            bind_group_layouts: &[Some(&bind_layout), Some(&cloud_layout)],
+            immediate_size: 0,
+        });
+        let point_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("scan points"),
+            layout: Some(&point_layout),
+            vertex: wgpu::VertexState { module: &module, entry_point: Some("vs_point"), compilation_options: Default::default(), buffers: &[] },
+            primitive: triangles((None, wgpu::FrontFace::Ccw)),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState { count: samples, ..Default::default() },
+            fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some("fs_point"), compilation_options: Default::default(), targets: &color_target }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let dummy = |label, size| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
         let cube = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("vibecad box"),
             contents: bytemuck::cast_slice(&unit_cube()),
@@ -746,6 +1027,7 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let base_bind = bind_group(&device, &bind_layout, &ubuf, &dummy("vibecad no colours", 4), &dummy("vibecad no edges", 12));
         let pick_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("vibecad pick"),
             size: 256,
@@ -760,6 +1042,10 @@ impl Renderer {
             id_pipelines,
             edge_pipeline,
             box_pipeline,
+            point_pipeline,
+            cloud_layout,
+            base_bind,
+            clouds: HashMap::new(),
             background_pipeline,
             grid_pipeline,
             cube,
@@ -940,6 +1226,215 @@ impl Renderer {
         }
     }
 
+    /// Keep a scan on the GPU under `key`; its points go up a buffer group per frame.
+    pub fn add_cloud(&mut self, key: u64, cloud: Arc<Cloud>) -> Result<(), String> {
+        if let Some(why) = &self.unsupported {
+            return Err(why.clone());
+        }
+        let limits = self.device.limits();
+        let point = size_of::<cloud::Point>() as u64;
+        let max = POINT_GROUP_BYTES.min(limits.max_buffer_size).min(limits.max_storage_buffer_binding_size as u64);
+        let group_points = ((max / point) as usize / cloud::CHUNK * cloud::CHUNK).max(cloud::CHUNK);
+        let chunks: Vec<GpuChunk> = cloud
+            .header
+            .chunks
+            .iter()
+            .map(|c| GpuChunk {
+                group: (c.start as usize / group_points) as u32,
+                start: (c.start as usize % group_points) as u32,
+                count: c.count,
+                lo: Vec3::from(c.lo),
+                hi: Vec3::from(c.hi),
+            })
+            .collect();
+        let d = &self.device;
+        let uniform = d.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("vibecad scan placement"),
+            size: size_of::<CloudUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let sizes = d.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("vibecad scan point sizes"),
+            size: (chunks.len().max(1) * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let gpu = GpuCloud {
+            marks: vec![0; cloud.points.len().div_ceil(16).max(1)],
+            has_color: cloud.header.has_color,
+            source: Some(cloud),
+            groups: Vec::new(),
+            sizes_cpu: vec![POINT_MIN_SIZE; chunks.len()],
+            chunks,
+            group_points,
+            uniform,
+            sizes,
+            draws: Vec::new(),
+        };
+        self.clouds.insert(key, gpu);
+        Ok(())
+    }
+
+    pub fn remove_cloud(&mut self, key: u64) {
+        self.clouds.remove(&key);
+    }
+
+    /// New marks (selected, deleted) for a scan's points, as `cloud::marks::Marks::words`.
+    pub fn set_cloud_marks(&mut self, key: u64, words: &[u32]) {
+        let Some(c) = self.clouds.get_mut(&key) else { return };
+        let n = words.len().min(c.marks.len());
+        c.marks[..n].copy_from_slice(&words[..n]);
+        for g in &c.groups {
+            let end = (g.first + c.group_points / 16).min(c.marks.len());
+            if g.first < end {
+                self.queue.write_buffer(&g.marks, 0, bytemuck::cast_slice(&c.marks[g.first..end]));
+            }
+        }
+    }
+
+    /// Whether every point of this scan is on the GPU.
+    pub fn cloud_uploaded(&self, key: u64) -> bool {
+        self.clouds.get(&key).is_some_and(|c| c.source.is_none())
+    }
+
+    /// Bytes of scan points on the GPU.
+    pub fn cloud_bytes(&self) -> u64 {
+        let point = size_of::<cloud::Point>() as u64;
+        self.clouds.values().map(|c| c.chunks.iter().filter(|ch| (ch.group as usize) < c.groups.len()).map(|ch| ch.count as u64 * point).sum::<u64>()).sum()
+    }
+
+    /// One buffer group of one scan, so a big scan comes in over frames instead of freezing one.
+    fn upload_clouds(&mut self) {
+        let Some(c) = self.clouds.values_mut().find(|c| c.source.is_some()) else { return };
+        let Some(src) = c.source.as_ref() else { return };
+        let g = c.groups.len();
+        let range = g * c.group_points..((g + 1) * c.group_points).min(src.points.len());
+        // A scan without points still needs a buffer to bind.
+        let zero = [cloud::Point::zeroed()];
+        let contents = if range.is_empty() { &zero[..] } else { &src.points[range.clone()] };
+        let points = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("vibecad scan points"),
+            contents: bytemuck::cast_slice(contents),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let first = range.start / 16;
+        let words = &c.marks[first.min(c.marks.len())..range.end.div_ceil(16).clamp(first + 1, c.marks.len())];
+        let marks = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("vibecad scan marks"),
+            contents: bytemuck::cast_slice(words),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("vibecad scan bindings"),
+            layout: &self.cloud_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: points.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: c.uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: c.sizes.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: marks.as_entire_binding() },
+            ],
+        });
+        c.groups.push(CloudGroup { bind, _points: points, marks, first });
+        if range.end >= src.points.len() {
+            c.source = None;
+        }
+    }
+
+    /// Which chunks of each scan show, how many of their points and how wide; their placement.
+    fn prepare_clouds(&mut self, f: &Frame, size: (u32, u32)) {
+        let vp = f.view_proj;
+        // Pixels per unit of length at clip w = 1: row 1 of view_proj holds the projection's y
+        // scale. An orthographic view has w = 1 everywhere.
+        let y_scale = Vec3::new(vp.x_axis.y, vp.y_axis.y, vp.z_axis.y).length() * size.1 as f32 * 0.5;
+        let perspective = vp.row(3).truncate().length_squared() > 1e-18;
+        let budget = std::env::var("VIBECAD_POINT_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(POINT_BUDGET);
+        let mut wanted = 0u64;
+        // (scan, its draw, pixels across) for the budget pass.
+        let mut spans: Vec<(u64, usize, f32)> = Vec::new();
+        for c in self.clouds.values_mut() {
+            c.draws.clear();
+        }
+        for d in &f.clouds {
+            let Some(c) = self.clouds.get_mut(&d.key) else { continue };
+            let mvp = (vp.as_dmat4() * d.model).as_mat4();
+            let frustum = Frustum::new(mvp);
+            for (k, ch) in c.chunks.iter().enumerate() {
+                if ch.group as usize >= c.groups.len() || ch.count == 0 || !frustum.intersects(ch.lo, ch.hi) {
+                    continue;
+                }
+                let w = (mvp * ((ch.lo + ch.hi) * 0.5).extend(1.0)).w;
+                let diag = (ch.hi - ch.lo).length().max(1e-6);
+                // The eye inside or next to the chunk: taken as half its size away, so the
+                // chunk is drawn whole but its points do not swell to cover the screen.
+                let px = diag * y_scale / if perspective { w.max(diag * 0.5) } else { w };
+                let (count, width) = cloud::level_of_detail(ch.count, px, POINT_SPACING, POINT_MIN_SIZE);
+                c.sizes_cpu[k] = width;
+                spans.push((d.key, c.draws.len(), px));
+                c.draws.push((ch.group, k as u32, count));
+                wanted += count as u64;
+            }
+        }
+        if wanted > budget {
+            // Over budget: fewer points of every chunk, each grown to cover the same.
+            let scale = budget as f32 / wanted as f32;
+            for (key, i, px) in spans {
+                let Some(c) = self.clouds.get_mut(&key) else { continue };
+                let (_, k, count) = &mut c.draws[i];
+                let k = *k as usize;
+                *count = ((*count as f32 * scale) as u32).clamp(1, c.chunks[k].count);
+                c.sizes_cpu[k] = cloud::point_size(*count, px, POINT_MIN_SIZE);
+            }
+        }
+        self.stats.drawn_points = 0;
+        for d in &f.clouds {
+            let Some(c) = self.clouds.get(&d.key) else { continue };
+            let n = Mat3::from_mat4(d.model.as_mat4());
+            let n = if n.determinant().abs() > 1e-20 { n.inverse().transpose() } else { n };
+            let show = f.scan_display;
+            let color = match show.color {
+                ScanColor::File => 0,
+                ScanColor::Single => 1,
+                ScanColor::Height => 2,
+                ScanColor::Normal => 3,
+            };
+            let u = CloudUniforms {
+                mvp: (vp.as_dmat4() * d.model).as_mat4().to_cols_array_2d(),
+                normal: Mat4::from_mat3(n).to_cols_array_2d(),
+                color: SCAN_COLOR,
+                flags: [c.has_color as u32, d.selected as u32, color, show.lit as u32],
+                ramp: [d.heights.0, d.heights.1, show.size.clamp(0.25, 8.0), 0.0],
+                zrow: d.model.row(2).as_vec4().to_array(),
+            };
+            self.queue.write_buffer(&c.uniform, 0, bytemuck::bytes_of(&u));
+            if !c.sizes_cpu.is_empty() {
+                self.queue.write_buffer(&c.sizes, 0, bytemuck::cast_slice(&c.sizes_cpu));
+            }
+            self.stats.drawn_points += c.draws.iter().map(|d| d.2 as u64).sum::<u64>();
+        }
+    }
+
+    fn draw_clouds(&self, pass: &mut wgpu::RenderPass<'_>, f: &Frame) {
+        let mut set = false;
+        for d in &f.clouds {
+            let Some(c) = self.clouds.get(&d.key) else { continue };
+            let mut group = None;
+            for &(g, k, count) in &c.draws {
+                if !set {
+                    pass.set_pipeline(&self.point_pipeline);
+                    pass.set_bind_group(0, &self.base_bind, &[]);
+                    set = true;
+                }
+                if group != Some(g) {
+                    pass.set_bind_group(1, &c.groups[g as usize].bind, &[]);
+                    group = Some(g);
+                }
+                let start = c.chunks[k as usize].start;
+                pass.draw(start * 6..(start + count) * 6, k..k + 1);
+            }
+        }
+    }
+
     fn bind(&self, colors: &wgpu::Buffer, edges: &wgpu::Buffer) -> wgpu::BindGroup {
         bind_group(&self.device, &self.bind_layout, &self.ubuf, colors, edges)
     }
@@ -1030,6 +1525,8 @@ impl Renderer {
         self.stats.drawn_instances = 0;
         self.stats.drawn_triangles = 0;
         self.cull(f.view_proj);
+        self.upload_clouds();
+        self.prepare_clouds(f, size);
         let t = self.targets.as_ref().unwrap();
         let u = Uniforms {
             view_proj: f.view_proj.to_cols_array_2d(),
@@ -1072,20 +1569,20 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            // The background and the grid use the uniforms only; any bind group of the layout does.
-            let any_bind = self.scene.as_ref().map(|s| &s.box_bind);
-            if let Some(bind) = any_bind {
-                pass.set_pipeline(&self.background_pipeline);
-                pass.set_bind_group(0, bind, &[]);
-                pass.draw(0..3, 0..1);
-            }
+            // The background and the grid use the uniforms only.
+            pass.set_pipeline(&self.background_pipeline);
+            pass.set_bind_group(0, &self.base_bind, &[]);
+            pass.draw(0..3, 0..1);
             if let Some(s) = self.scene.as_ref() {
                 draw_faces(&mut pass, s, &self.face_pipelines);
-                if f.grid.is_some() {
-                    pass.set_pipeline(&self.grid_pipeline);
-                    pass.set_bind_group(0, &s.box_bind, &[]);
-                    pass.draw(0..6, 0..1);
-                }
+            }
+            self.draw_clouds(&mut pass, f);
+            if f.grid.is_some() && (self.scene.is_some() || !f.clouds.is_empty()) {
+                pass.set_pipeline(&self.grid_pipeline);
+                pass.set_bind_group(0, &self.base_bind, &[]);
+                pass.draw(0..6, 0..1);
+            }
+            if let Some(s) = self.scene.as_ref() {
                 if f.show_edges && !s.runs.is_empty() {
                     // Six vertices per segment, two points per segment: three per point.
                     pass.set_pipeline(&self.edge_pipeline);

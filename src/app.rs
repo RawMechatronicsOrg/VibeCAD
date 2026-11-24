@@ -17,11 +17,13 @@ use crate::render::{Frame, GroundGrid, Renderer};
 use crate::scene::SceneData;
 use crate::selftest::{SelfTest, Stage, write_bmp};
 use crate::sketcher::{Constrain, Tool};
-use crate::ui_chrome::{self, Action, CubeAction, RibbonState, SketchRibbon, Tab};
+use crate::ui_chrome::{self, Action, CubeAction, RibbonState, ScanRibbon, SketchRibbon, Tab};
 use crate::update;
 use crate::worker::{Body, Event, Part, Progress, Worker};
 
 mod handles;
+mod scan_edit;
+mod scans;
 mod sketch_mode;
 mod validation;
 
@@ -51,6 +53,9 @@ enum Pending {
     SketchEdit(usize),
     /// A dry run of a drag in the sketch: where the solver would put everything.
     SketchPreview,
+    /// A scan's new mask of deleted points: a file written for the worker to take in, or none
+    /// to restore them all.
+    ScanMask { obj: String, file: Option<PathBuf> },
 }
 
 /// A tool call of the agent waiting for the worker.
@@ -71,6 +76,8 @@ struct Node {
     plane: Option<[Vec3; 4]>,
     /// A body's tip: the feature whose shape is the body's, where the rollback marker sits.
     tip: Option<String>,
+    /// A scan: its file and placement (see scans.rs).
+    scan: Option<scans::ScanRef>,
 }
 
 #[derive(Default)]
@@ -247,6 +254,8 @@ pub struct App {
     sketch: Option<sketch_mode::SketchMode>,
     /// Whether GitHub has a newer release; a default one once its notice is dismissed.
     update: update::Check,
+    /// The scans of the document, read or being read.
+    scans: scans::Scans,
 }
 
 impl App {
@@ -307,6 +316,7 @@ impl App {
             gizmos: handles::Gizmos::default(),
             validation: validation::Validation::new(s.show_check),
             sketch: None,
+            scans: scans::Scans::new(s.scan_display),
             update: if SelfTest::from_env().is_some() {
                 update::Check::default()
             } else {
@@ -584,8 +594,17 @@ impl App {
     }
 
     fn fit(&mut self) {
-        if let Some((lo, hi)) = self.scene.as_ref().and_then(|s| s.data.bbox) {
+        if let Some((lo, hi)) = self.model_box() {
             self.camera.fit(lo, hi);
+        }
+    }
+
+    /// What the view shows: the scene's shapes and the scans, in document coordinates.
+    fn model_box(&self) -> Option<(Vec3, Vec3)> {
+        let shapes = self.scene.as_ref().and_then(|s| s.data.bbox);
+        match (shapes, self.scans_box()) {
+            (Some(a), Some(b)) => Some((a.0.min(b.0), a.1.max(b.1))),
+            (a, b) => a.or(b),
         }
     }
 
@@ -629,6 +648,9 @@ impl App {
                     match r.result {
                         Err(_) if matches!(kind, Pending::Edges(..) | Pending::Face(_)) => self.on_geometry_error(&kind),
                         Err(e) => {
+                            if let Pending::ScanMask { obj, file } = &kind {
+                                self.scan_mask_done(obj, file.as_deref());
+                            }
                             if matches!(kind, Pending::Validate) {
                                 self.validation.failed(r.id, &e);
                             }
@@ -640,7 +662,7 @@ impl App {
                                 self.loading = None;
                             }
                             // A failed edit may still have touched the model.
-                            if matches!(kind, Pending::Edit | Pending::Create | Pending::SketchEdit(_)) {
+                            if matches!(kind, Pending::Edit | Pending::Create | Pending::SketchEdit(_) | Pending::ScanMask { .. }) {
                                 self.refresh();
                             }
                             if matches!(kind, Pending::SketchEdit(_) | Pending::SketchData | Pending::SketchPreview) {
@@ -667,6 +689,7 @@ impl App {
                     self.props = None;
                     self.scene = None;
                     self.modified = false;
+                    self.clear_points();
                     self.error = None;
                     let title = format!("VibeCAD — {}", self.doc_label.as_deref().unwrap_or(""));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
@@ -736,6 +759,10 @@ impl App {
                 Pending::SketchData => self.on_sketch_data(&v),
                 Pending::SketchEdit(adds) => self.on_sketch_edit(adds, &v),
                 Pending::SketchPreview => self.on_sketch_preview(Some(&v)),
+                Pending::ScanMask { obj, file } => {
+                    self.scan_mask_done(&obj, file.as_deref());
+                    self.on_reply(ctx, id, Pending::Edit, Body::Json(v));
+                }
             }
         }
     }
@@ -760,6 +787,7 @@ impl App {
                     p.try_into().ok()
                 }),
                 tip: n["tip"].as_str().map(String::from),
+                scan: scans::ScanRef::parse(&n["scan"]),
             });
         }
         t.build_history();
@@ -768,6 +796,7 @@ impl App {
             self.props = None;
         }
         self.tree = t;
+        self.sync_scans();
     }
 
     /// A frame of the scene stream being received; frames of a replaced stream are dropped.
@@ -884,6 +913,8 @@ impl App {
         // Fitted to the boxes while loading: fit to the exact bounds now, if the view was left alone.
         if l.fitted.is_some_and(|f| f == self.camera_state()) {
             self.fit();
+            // Scans still being read are fitted to as they come, while the view is left alone.
+            self.scans.auto_fit = Some(self.camera_state());
         }
         // Times count from the scene request; the open before it took `scene_after_open_ms`.
         let after_open = self.opened_at.filter(|_| l.fit).map(|t| l.started.duration_since(t).as_secs_f64() * 1e3);
@@ -954,6 +985,9 @@ impl App {
             }
             return;
         }
+        if self.point_keys(pressed(egui::Key::Escape), pressed(egui::Key::Delete) && self.command.is_none()) {
+            return;
+        }
         if pressed(egui::Key::Escape) {
             // Esc closes an open command's dialog first, then clears the selection.
             if self.command.take().is_none() {
@@ -986,6 +1020,13 @@ impl App {
             agent_running: !self.agent_jobs.is_empty(),
             navigation: self.navigation,
             validation: self.validation.show,
+            scan: ScanRibbon {
+                scans: !self.scans.slots.is_empty(),
+                tool: self.scans.tool,
+                selected: self.points_selected(),
+                deleted: self.points_deleted(),
+                display: self.scans.display,
+            },
             sketch: self.sketch.as_ref().map(|m| SketchRibbon {
                 label: m.data.as_ref().map_or_else(|| m.obj.clone(), |d| d.label.clone()),
                 tool: m.drawing.as_ref().map(|d| d.tool),
@@ -1020,6 +1061,14 @@ impl App {
                 Action::Save => self.save(false),
                 Action::SaveAs => self.save(true),
                 Action::Export => self.export_dialog(),
+                Action::ImportScan => self.import_scan_dialog(),
+                Action::PointTool => self.toggle_point_tool(),
+                Action::DeletePoints => self.delete_points(),
+                Action::InvertPoints => self.invert_points(),
+                Action::ClearPoints => self.clear_points(),
+                Action::RestorePoints => self.restore_points(),
+                Action::SavePoints => self.save_points_dialog(),
+                Action::ScanDisplay(d) => self.scans.display = d,
                 Action::Restart => self.restart(),
                 Action::Quit => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
                 Action::Undo => {
@@ -1140,7 +1189,7 @@ impl App {
             if ui.checkbox(&mut vis, "").on_hover_text("Show in the 3D view").changed() {
                 actions.push(TreeAction::Visible(name.to_string(), vis));
             }
-            let kind = ui_chrome::object_kind(&node.kind);
+            let kind = ui_chrome::object_kind(if node.scan.is_some() { ui_chrome::SCAN } else { &node.kind });
             let tip = format!("{}\n{}\n\n{name} · {}", node.label, kind.about, node.kind);
             ui_chrome::kind_badge(ui, kind.family, !node.visible).on_hover_text(&tip);
             // The label, then what the object is, smaller and greyed.
@@ -1284,6 +1333,9 @@ impl App {
         for e in props["errors"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
             ui.colored_label(Color32::LIGHT_RED, e.as_str().unwrap_or(""));
         }
+        if let Some(s) = self.scan_summary(&obj) {
+            ui.label(s);
+        }
         ui.separator();
         let list = props["props"].as_array().cloned().unwrap_or_default();
         let mut groups: Vec<(String, Vec<Value>)> = Vec::new();
@@ -1382,6 +1434,9 @@ impl App {
                     self.error = None;
                 }
                 ui.colored_label(Color32::LIGHT_RED, e);
+            } else if let Some(s) = self.scan_status() {
+                ui.spinner();
+                ui.label(s);
             } else if let Some(i) = &self.info {
                 ui.label(i);
             }
@@ -1394,9 +1449,17 @@ impl App {
                         .on_hover_text(concat!("This is ", env!("CARGO_PKG_VERSION"), ". Opens the release page in the browser."));
                     ui.separator();
                 }
+                let r = self.renderer.stats;
+                let picked = self.points_selected();
+                if picked > 0 {
+                    ui.colored_label(Color32::from_rgb(230, 130, 20), format!("{picked} points selected ·"));
+                }
+                if r.drawn_points > 0 {
+                    ui.weak(format!("scans: {:.1} M points drawn, {} MB ·", r.drawn_points as f64 / 1e6, self.renderer.cloud_bytes() >> 20))
+                        .on_hover_text("Points of the scans drawn in the last frame: fewer of those far away, within a budget per frame. MB: the scans' points on the GPU.");
+                }
                 if let Some(s) = &self.scene {
                     // Drawn: what the last frame kept after culling the objects out of view.
-                    let r = self.renderer.stats;
                     let frame_ms = ui.input(|i| i.stable_dt) * 1e3;
                     ui.weak(format!("drawn {}/{} objects, {} triangles · frame {frame_ms:.1} ms", r.drawn_instances, s.data.instances.len(), r.drawn_triangles))
                         .on_hover_text("Objects whose box is outside the view are not drawn. Frame: time of the last window frame.");
@@ -1426,14 +1489,14 @@ impl App {
         let ppp = ui.ctx().pixels_per_point();
         let size = ((rect.width() * ppp).round().max(1.0) as u32, (rect.height() * ppp).round().max(1.0) as u32);
         self.camera.aspect = rect.width() / rect.height().max(1.0);
-        if let Some(b) = self.scene.as_ref().and_then(|s| s.data.bbox) {
+        if let Some(b) = self.model_box() {
             self.ground = Some(b);
         }
 
         let d = resp.drag_delta();
         let delta = Vec2::new(d.x, d.y);
         // A press on a handle's arrow drags the handle, not the camera.
-        if !self.drag_handle(ui, &resp) && !self.sketch_drag(ui, &resp) && resp.dragged() {
+        if !self.drag_handle(ui, &resp) && !self.sketch_drag(ui, &resp) && !self.lasso_drag(ui, &resp, rect, ppp) && resp.dragged() {
             let held = ui.input(|i| Held {
                 left: i.pointer.button_down(PointerButton::Primary),
                 middle: i.pointer.button_down(PointerButton::Middle),
@@ -1466,11 +1529,15 @@ impl App {
             if self.sketch.is_some() {
                 let add = ui.input(|i| i.modifiers.shift || i.modifiers.command);
                 self.sketch_click(pos, add);
+            } else if self.scans.tool {
+                self.click_points(ui, pos, rect, ppp);
             } else {
                 self.click_view(pos, ((pos.x - rect.min.x) * ppp) as u32, ((pos.y - rect.min.y) * ppp) as u32, ppp);
             }
         } else if self.sketch.is_some() {
             self.sketch_hover(resp.hover_pos().filter(|_| !resp.dragged()));
+        } else if self.scans.tool {
+            self.gizmos.hover = None;
         } else {
             self.hover(ui, &resp, rect);
         }
@@ -1489,7 +1556,8 @@ impl App {
         self.paint_handles(&ui.painter_at(rect), rect, f.view_proj);
         self.paint_places(&ui.painter_at(rect), rect, f.view_proj);
         self.paint_sketch(&ui.painter_at(rect), rect, f.view_proj);
-        if let Some(prompt) = self.sketch_prompt() {
+        self.paint_lasso(&ui.painter_at(rect));
+        if let Some(prompt) = self.sketch_prompt().or_else(|| self.scan_prompt().map(String::from)) {
             let at = egui::pos2(rect.center().x, rect.top() + 14.0);
             let painter = ui.painter_at(rect);
             let galley = painter.layout_no_wrap(prompt, egui::FontId::proportional(13.0), ui.visuals().text_color());
@@ -1955,12 +2023,14 @@ impl App {
             palette: self.palette,
             background,
             grid,
+            clouds: self.scan_draws(),
+            scan_display: self.scans.display,
         }
     }
 
     /// The scene's box, or the camera's own sphere while there is no scene.
     fn drawn_box(&self) -> (Vec3, Vec3) {
-        self.scene.as_ref().and_then(|s| s.data.bbox).unwrap_or_else(|| {
+        self.model_box().unwrap_or_else(|| {
             let r = Vec3::splat(self.camera.radius);
             (self.camera.target - r, self.camera.target + r)
         })
@@ -1987,6 +2057,8 @@ impl App {
             "gpu_bytes": s.gpu_bytes,
             "drawn_instances": s.drawn_instances,
             "drawn_triangles": s.drawn_triangles,
+            "drawn_points": s.drawn_points,
+            "scan_gpu_bytes": self.renderer.cloud_bytes(),
             "triangles": self.scene.as_ref().map(|s| s.data.triangles()),
             "frame_ms": frame_ms,
             "size": [size.0, size.1],
@@ -2343,6 +2415,7 @@ impl App {
             tab: self.tab,
             window_size: self.window_size,
             maximized: self.maximized,
+            scan_display: self.scans.display,
         }
     }
 
@@ -2390,6 +2463,7 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
         self.handle_events(&ctx);
+        self.poll_scans();
         self.agent_calls(&ctx);
         self.shortcuts(&ctx);
         egui::Panel::top("ribbon").show(ui, |ui| self.ribbon(ui));
@@ -2415,7 +2489,7 @@ mod tests {
     use super::*;
 
     fn node(kind: &str, children: &[&str]) -> Node {
-        Node { label: String::new(), kind: kind.into(), children: children.iter().map(|c| c.to_string()).collect(), visible: true, error: false, plane: None, tip: None }
+        Node { label: String::new(), kind: kind.into(), children: children.iter().map(|c| c.to_string()).collect(), visible: true, error: false, plane: None, tip: None, scan: None }
     }
 
     #[test]
