@@ -1,0 +1,84 @@
+name: Build
+
+# Every push to main or development and every pull request is tested and built for Windows and
+# Linux; the archives are kept as the run's artifacts. Pushing a tag vX.Y.Z (the version in
+# Cargo.toml) also publishes them as a GitHub release, which the app's update check then finds.
+
+on:
+  push:
+    branches: [main, development]
+    # Plain versions only: the update check reads no other tag, and a release is always "latest".
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+            # No Visual C++ runtime to install beside the exe.
+            rustflags: -C target-feature=+crt-static
+          - name: linux-x86_64
+            # The oldest image there is: its glibc (2.35) is the oldest the binary runs on.
+            os: ubuntu-22.04
+            rustflags: ""
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: The tag is the version in Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[0].version' | tr -d '\r')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::the tag is $GITHUB_REF_NAME, but Cargo.toml says $version"
+            exit 1
+          fi
+      - run: cargo test --release --locked
+      - run: cargo build --release --locked
+      - name: Package
+        run: |
+          dir=vibecad-${{ matrix.name }}
+          mkdir -p "$dir/examples"
+          cp README.md LICENSE "$dir/"
+          cp examples/plate.FCStd "$dir/examples/"
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp target/release/vibecad.exe "$dir/"
+            7z a "$dir.zip" "$dir"
+          else
+            cp target/release/vibecad "$dir/"
+            tar czf "$dir.tar.gz" "$dir"
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: vibecad-${{ matrix.name }}
+          path: |
+            vibecad-${{ matrix.name }}.zip
+            vibecad-${{ matrix.name }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+      # Published with both archives at once, so the update check never points at a release
+      # that has nothing to download yet.
+      - run: gh release create "$GITHUB_REF_NAME" vibecad-windows-x86_64.zip vibecad-linux-x86_64.tar.gz --repo "$GITHUB_REPOSITORY" --title "VibeCAD ${GITHUB_REF_NAME#v}" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

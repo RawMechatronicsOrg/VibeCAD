@@ -1,29 +1,114 @@
 # VibeCAD
 
-A small native window over FreeCAD's modelling core. FreeCAD runs headless in its own process;
-VibeCAD draws its shapes with wgpu and edits its documents through it. Documents stay ordinary
-`.FCStd` files that FreeCAD opens as before, colours included.
+[![Build](https://github.com/RawMechatronicsOrg/VibeCAD/actions/workflows/build.yml/badge.svg)](https://github.com/RawMechatronicsOrg/VibeCAD/actions/workflows/build.yml)
+[![Latest release](https://img.shields.io/github/v/release/RawMechatronicsOrg/VibeCAD)](https://github.com/RawMechatronicsOrg/VibeCAD/releases/latest)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-Prototype. It opens, shows, picks, edits properties, undoes, saves and exports, and models with
-a first set of operations (sketches, construction planes, extrude, fillet, chamfer, mirror,
-circular and linear patterns, copy, delete). Sketches are drawn, constrained and dimensioned in
-place, as in Fusion; FreeCAD's Sketcher solves them.
+**A better window on FreeCAD, for you and for your agent.**
 
-## Run
+VibeCAD is a front end to FreeCAD, not a fork of its modelling core and not a new file format.
+FreeCAD runs headless in its own process and does all the modelling; VibeCAD draws its shapes
+with wgpu and edits its documents through it. Documents stay ordinary `.FCStd` files that
+FreeCAD opens as before, colours included, so the two can be used side by side and nothing
+has to be converted, in either direction.
 
-Needs Rust (1.88 or newer) and FreeCAD 1.0 or newer installed.
+**[Download for Windows](https://github.com/RawMechatronicsOrg/VibeCAD/releases/latest/download/vibecad-windows-x86_64.zip)** ·
+**[Download for Linux](https://github.com/RawMechatronicsOrg/VibeCAD/releases/latest/download/vibecad-linux-x86_64.tar.gz)** ·
+[All releases](https://github.com/RawMechatronicsOrg/VibeCAD/releases)
 
-```
-cargo run --release -- examples/plate.FCStd
-```
+![The VibeCAD window: ribbon, model tree, 3D view with the sample plate, view cube and timeline](docs/screenshot.png)
+
+## What you get
+
+For you:
+
+- **The layout of the big CAD tools.** A ribbon, the 3D view filling the window, the model tree
+  and the properties floating over it, a view cube, and a timeline of what each body is built
+  from, with a rollback marker to drag.
+- **Sketching in place, as in Fusion.** Draw, constrain and dimension on a face or a plane;
+  FreeCAD's Sketcher solves.
+- **Direct handles.** Push or pull a face by its arrow, drag a fillet's radius, pick edges; what
+  an extrude would add shows in blue, what it would cut in red.
+- **Native FreeCAD objects.** Sketch, plane, extrude, fillet, chamfer, mirror, patterns and
+  copies are made as the Pads, Pockets and PartDesign features FreeCAD knows.
+- **Checks that point at the mistake.** The validators list thin walls, slits, steps and other
+  places too small to be meant, show each in the view, and name the feature and the sketch to
+  mend.
+- **Large assemblies that open at once.** Boxes first, then the meshes, tessellated by several
+  processes and kept in a disk cache.
+
+For your agent:
+
+- **An MCP server built in.** `vibecad --mcp` connects Claude Code, or any other MCP client, to
+  the document open in the window: the agent edits what you see, and you see what it edits.
+- **Tools to model with.** Read the tree, the properties and the sketches; draw and constrain
+  sketches, extrude them, set properties and expressions; undo, redo, save.
+- **Tools to check its own work.** Every edit leaves a state. `diff` gives the exact solids
+  added and removed between two states, `slice` cuts the bodies like an MRI and returns
+  pictures, `validate` finds the places too small to be meant, and a dry run tries an edit
+  without making it.
+- **You stay in charge.** The AGENTIC tab shows every call as it happens, with its pictures;
+  pause the agent or leave it a note there.
+
+It is a prototype: see [Limits](#limits) for what is missing.
+
+## Install
+
+1. Install [FreeCAD](https://www.freecad.org/downloads.php) 1.0 or newer. VibeCAD uses it and
+   does not come with it.
+2. Download the archive for your system (above), unpack it and start `vibecad`. To see a model
+   at once, give it the sample: `vibecad examples/plate.FCStd`.
+
+On Windows the program is not signed, so SmartScreen asks before its first start (More info →
+Run anyway). The Linux build needs glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36) and
+a Vulkan driver.
 
 VibeCAD looks for FreeCAD's console (`freecadcmd`) in `C:\Program Files\FreeCAD*\bin`, in
 `/Applications/FreeCAD.app` on macOS, then on `PATH`. Set `VIBECAD_FREECAD_CMD` to its full path
 if it is elsewhere.
 
 `examples/plate.FCStd` is a PartDesign body: a constrained sketch, a pad and a pocket. Select
-`Pad` in the tree and change `Length` to see the model recompute. Rebuild it with
-`freecadcmd examples/make_sample.py` from the repository root.
+`Pad` in the tree and change `Length` to see the model recompute.
+
+## Connect your agent
+
+With a document open in the window, add VibeCAD to your agent once. For Claude Code (AGENTIC →
+Copy setup puts this command, with the right path, on the clipboard):
+
+```
+claude mcp add vibecad -- "C:\path\to\vibecad.exe" --mcp
+```
+
+Then ask it for a change to the model. [Agents (MCP)](#agents-mcp) lists the tools.
+
+## Updates
+
+On start VibeCAD asks GitHub once whether there is a newer release. If there is, the status
+line says so with a link to its downloads; nothing is downloaded or installed by itself, and a
+failed check is silent. Set `VIBECAD_NO_UPDATE_CHECK` to turn the check off.
+
+## Build from source
+
+Needs Rust (1.88 or newer) and FreeCAD, as above.
+
+```
+cargo run --release -- examples/plate.FCStd
+```
+
+Rebuild the sample with `freecadcmd examples/make_sample.py` from the repository root.
+
+Every push to `main` or `development` and every pull request is tested and built for Windows
+and Linux by `.github/workflows/build.yml`. To
+publish a release, set the version in `Cargo.toml`, then tag that commit `v` plus the version
+and push the tag: the workflow attaches both archives to a new GitHub release, and running
+copies of VibeCAD offer it on their next start.
+
+```
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+## The window
 
 The window follows the layout of the big CAD tools: a ribbon on top (FILE, EDIT, VIEW), the 3D
 view under it filling the window, the model tree and the properties of the selected object as
@@ -440,7 +525,8 @@ documents, where the `Pad` steps just report an error.
 - The tree and the timeline follow `Group`; a sketch no feature uses stays where it is in its
   body's order. The rollback marker stops only after features that make a shape (not after a
   sketch or a datum).
-- Built and run on Windows only so far. On Linux it needs `freecadcmd` on `PATH` (or
+- Run on Windows only so far; the Linux build is compiled and tested by the workflow, not yet
+  tried by hand. On Linux it needs `freecadcmd` on `PATH` (or
   `VIBECAD_FREECAD_CMD`); FreeCAD from Flatpak, Snap or an AppImage is not found yet, and the
   Flatpak and Snap sandboxes may not see the script in the temp directory. File dialogs use the
   XDG desktop portal, which must be running.

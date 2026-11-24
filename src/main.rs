@@ -22,6 +22,7 @@ mod scene;
 mod selftest;
 mod sketcher;
 mod ui_chrome;
+mod update;
 mod worker;
 
 fn main() -> eframe::Result {

@@ -18,6 +18,7 @@ use crate::scene::SceneData;
 use crate::selftest::{SelfTest, Stage, write_bmp};
 use crate::sketcher::{Constrain, Tool};
 use crate::ui_chrome::{self, Action, CubeAction, RibbonState, SketchRibbon, Tab};
+use crate::update;
 use crate::worker::{Body, Event, Part, Progress, Worker};
 
 mod handles;
@@ -244,6 +245,8 @@ pub struct App {
     validation: validation::Validation,
     /// The sketch being edited in place, when one is.
     sketch: Option<sketch_mode::SketchMode>,
+    /// Whether GitHub has a newer release; a default one once its notice is dismissed.
+    update: update::Check,
 }
 
 impl App {
@@ -304,6 +307,12 @@ impl App {
             gizmos: handles::Gizmos::default(),
             validation: validation::Validation::new(s.show_check),
             sketch: None,
+            update: if SelfTest::from_env().is_some() {
+                update::Check::default()
+            } else {
+                let c = cc.egui_ctx.clone();
+                update::Check::start(move || c.request_repaint())
+            },
         }
     }
 
@@ -1371,6 +1380,14 @@ impl App {
                 ui.label(i);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if let Some([major, minor, patch]) = self.update.newer() {
+                    if ui.small_button("x").on_hover_text("Dismiss").clicked() {
+                        self.update = update::Check::default();
+                    }
+                    ui.hyperlink_to(format!("VibeCAD {major}.{minor}.{patch} is out: download"), update::download_url())
+                        .on_hover_text(concat!("This is ", env!("CARGO_PKG_VERSION"), ". Opens the release page in the browser."));
+                    ui.separator();
+                }
                 if let Some(s) = &self.scene {
                     // Drawn: what the last frame kept after culling the objects out of view.
                     let r = self.renderer.stats;
