@@ -19,6 +19,8 @@ use crate::selftest::{SelfTest, Stage, write_bmp};
 use crate::ui_chrome::{self, Action, CubeAction, RibbonState, Tab};
 use crate::worker::{Body, Event, Part, Progress, Worker};
 
+mod handles;
+
 #[derive(Clone)]
 enum Pending {
     Open(PathBuf),
@@ -28,6 +30,10 @@ enum Pending {
     Edit,
     /// A modelling command; its reply names the object it made.
     Create,
+    /// The edges of an object, for picking them; asked in the given model generation.
+    Edges(String, u64),
+    /// A face, for its handle and preview.
+    Face(u64),
     Save,
     Export,
     /// A read-only call of the agent; its answer goes back to the agent only.
@@ -50,6 +56,8 @@ struct Node {
     error: bool,
     /// The corners of a construction plane the view draws, in document coordinates.
     plane: Option<[Vec3; 4]>,
+    /// A body's tip: the feature whose shape is the body's, where the rollback marker sits.
+    tip: Option<String>,
 }
 
 #[derive(Default)]
@@ -211,10 +219,14 @@ pub struct App {
     /// The box the ground grid is sized for: the document's last drawn extent, so the grid
     /// stays put when everything is hidden.
     ground: Option<(Vec3, Vec3)>,
+    /// A rollback marker being dragged: its body and the feature it would roll back to.
+    rollback: Option<(String, String)>,
     /// The modelling command whose dialog is open.
     command: Option<Command>,
     /// Construction planes as drawn last frame, in points, for clicks on them.
     plane_outlines: Vec<(String, Vec<egui::Pos2>)>,
+    /// Edges and drag handles in the view.
+    gizmos: handles::Gizmos,
 }
 
 impl App {
@@ -269,8 +281,10 @@ impl App {
             window_size: s.window_size,
             maximized: s.maximized,
             ground: None,
+            rollback: None,
             command: None,
             plane_outlines: Vec::new(),
+            gizmos: handles::Gizmos::default(),
         }
     }
 
@@ -386,6 +400,7 @@ impl App {
 
     /// After anything that may change the model: reload tree, shapes and the open property list.
     fn refresh(&mut self) {
+        self.gizmos.clear();
         self.request("tree", json!({}), Pending::Tree);
         self.request("scene", json!({}), Pending::Scene { fit: false });
         if let Some(sel) = &self.selection {
@@ -529,22 +544,6 @@ impl App {
         })
     }
 
-    /// A click in the view at `pos`, pixel (`px`, `py`): a face, else a construction plane.
-    /// A command asking for a plane takes a plane in front of a face.
-    fn click_view(&mut self, pos: egui::Pos2, px: u32, py: u32) {
-        let plane = self.plane_at(pos);
-        let plane_first = plane.is_some() && self.command.as_ref().is_some_and(Command::wants_plane);
-        let face = if plane_first { None } else { self.face_at(px, py) };
-        let hit = match face {
-            Some((sel, text)) => {
-                self.info = Some(format!("picked {text}"));
-                Some(sel)
-            }
-            None => plane,
-        };
-        self.picked(hit);
-    }
-
     fn fit(&mut self) {
         if let Some((lo, hi)) = self.scene.as_ref().and_then(|s| s.data.bbox) {
             self.camera.fit(lo, hi);
@@ -589,6 +588,7 @@ impl App {
                     }
                     let Some(kind) = self.pending.remove(&r.id) else { continue };
                     match r.result {
+                        Err(_) if matches!(kind, Pending::Edges(..) | Pending::Face(_)) => self.on_geometry_error(&kind),
                         Err(e) => {
                             self.error = Some(e);
                             if self.loading.as_ref().is_some_and(|l| l.id == r.id) {
@@ -638,6 +638,8 @@ impl App {
                     self.modified = true;
                     self.refresh();
                 }
+                Pending::Edges(_, g) => self.on_edges(g, &v),
+                Pending::Face(g) => self.on_face(g, &v),
                 Pending::Create => {
                     // The command did its step: close its dialog and select what it made.
                     self.command = None;
@@ -691,6 +693,7 @@ impl App {
                     let p: Vec<Vec3> = c.iter().filter_map(|q| Some(Vec3::new(q[0].as_f64()? as f32, q[1].as_f64()? as f32, q[2].as_f64()? as f32))).collect();
                     p.try_into().ok()
                 }),
+                tip: n["tip"].as_str().map(String::from),
             });
         }
         t.build_history();
@@ -1071,33 +1074,75 @@ impl App {
     /// Along the bottom, as in Fusion: every body's features in the order they are built.
     fn timeline_panel(&mut self, ui: &mut egui::Ui) {
         let mut chosen = None;
+        // Where the marker of each body may stop: after a feature that can be its tip.
+        let mut stops: Vec<(String, String, f32)> = Vec::new();
+        let mut markers: Vec<(String, egui::Response)> = Vec::new();
+        let tip_of = |body: &str| match &self.rollback {
+            Some((b, f)) if b == body => Some(f.as_str()),
+            _ => self.tree.nodes.get(body).and_then(|n| n.tip.as_deref()),
+        };
         egui::ScrollArea::horizontal().auto_shrink([false, true]).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 let several = self.tree.history.first().map(|f| &self.tree.owner[f]) != self.tree.history.last().map(|f| &self.tree.owner[f]);
                 let mut body: Option<&String> = None;
+                let mut past_tip = false;
                 for f in &self.tree.history {
                     let Some(node) = self.tree.nodes.get(f) else { continue };
                     let owner = &self.tree.owner[f];
-                    if several && body != Some(owner) {
-                        if body.is_some() {
-                            ui.add_space(6.0);
-                            ui.separator();
+                    if body != Some(owner) {
+                        if several {
+                            if body.is_some() {
+                                ui.add_space(6.0);
+                                ui.separator();
+                            }
+                            let label = self.tree.nodes.get(owner).map_or(owner.as_str(), |n| n.label.as_str());
+                            ui.weak(label);
                         }
-                        let label = self.tree.nodes.get(owner).map_or(owner.as_str(), |n| n.label.as_str());
-                        ui.weak(label);
                         body = Some(owner);
+                        past_tip = false;
                     }
                     let kind = ui_chrome::object_kind(&node.kind);
                     let selected = self.selection.as_ref().is_some_and(|s| &s.obj == f);
-                    let tip = format!("{}  ({})
-{}", node.label, if kind.name.is_empty() { &node.kind } else { kind.name }, kind.about);
-                    if ui_chrome::timeline_step(ui, kind.family, selected, node.error).on_hover_text(tip).clicked() {
+                    let mut tip = format!("{}  ({})\n{}", node.label, if kind.name.is_empty() { &node.kind } else { kind.name }, kind.about);
+                    if past_tip {
+                        tip.push_str("\n\nRolled back: after the marker, not part of the body's shape now.");
+                    }
+                    let step = ui_chrome::timeline_step(ui, kind.family, selected, node.error, past_tip).on_hover_text(tip);
+                    if step.clicked() {
                         chosen = Some(f.clone());
+                    }
+                    if kind.family.makes_shape() {
+                        stops.push((owner.clone(), f.clone(), step.rect.right()));
+                    }
+                    if tip_of(owner) == Some(f.as_str()) {
+                        let marker = ui_chrome::rollback_marker(ui, egui::Id::unique(("rollback", owner)))
+                            .on_hover_text("Rollback marker: the body's shape is made by the features before it.\nDrag it to roll the body back or forward.");
+                        markers.push((owner.clone(), marker));
+                        past_tip = true;
                     }
                 }
             });
         });
+        for (body, m) in markers {
+            if m.dragged()
+                && let Some(x) = m.interact_pointer_pos().map(|p| p.x)
+            {
+                // Snap to the nearest place the marker may stop, as it is dragged.
+                let near = stops.iter().filter(|(b, ..)| *b == body).min_by(|a, b| (a.2 - x).abs().total_cmp(&(b.2 - x).abs()));
+                if let Some((_, f, _)) = near {
+                    self.rollback = Some((body.clone(), f.clone()));
+                }
+            }
+            if m.drag_stopped()
+                && let Some((b, f)) = self.rollback.take().filter(|(b, _)| *b == body)
+                && let Some(n) = self.tree.nodes.get_mut(&b)
+                && n.tip.as_ref() != Some(&f)
+            {
+                n.tip = Some(f.clone());
+                self.request("set_tip", json!({ "body": b, "feature": f }), Pending::Edit);
+            }
+        }
         if let Some(obj) = chosen {
             self.select(Some(Selection { obj, sub: None, face_id: 0 }));
         }
@@ -1257,7 +1302,8 @@ impl App {
 
         let d = resp.drag_delta();
         let delta = Vec2::new(d.x, d.y);
-        if resp.dragged() {
+        // A press on a handle's arrow drags the handle, not the camera.
+        if !self.drag_handle(ui, &resp) && resp.dragged() {
             let held = ui.input(|i| Held {
                 left: i.pointer.button_down(PointerButton::Primary),
                 middle: i.pointer.button_down(PointerButton::Middle),
@@ -1285,7 +1331,9 @@ impl App {
         } else if resp.clicked()
             && let Some(pos) = resp.interact_pointer_pos()
         {
-            self.click_view(pos, ((pos.x - rect.min.x) * ppp) as u32, ((pos.y - rect.min.y) * ppp) as u32);
+            self.click_view(pos, ((pos.x - rect.min.x) * ppp) as u32, ((pos.y - rect.min.y) * ppp) as u32, ppp);
+        } else {
+            self.hover(ui, &resp, rect);
         }
 
         let dark = ui.visuals().dark_mode;
@@ -1299,6 +1347,7 @@ impl App {
             ui_chrome::ground_labels(&ui.painter_at(rect), grid, rect, f.view_proj, f.forward);
         }
         self.paint_planes(&ui.painter_at(rect), rect, f.view_proj);
+        self.paint_handles(&ui.painter_at(rect), rect, f.view_proj);
         self.view_rect = Some(rect);
         if let CubeAction::Home = ui_chrome::view_cube(ui, rect, &mut self.camera) {
             self.camera.set_view(View::Iso);
@@ -1869,7 +1918,7 @@ mod tests {
     use super::*;
 
     fn node(kind: &str, children: &[&str]) -> Node {
-        Node { label: String::new(), kind: kind.into(), children: children.iter().map(|c| c.to_string()).collect(), visible: true, error: false, plane: None }
+        Node { label: String::new(), kind: kind.into(), children: children.iter().map(|c| c.to_string()).collect(), visible: true, error: false, plane: None, tip: None }
     }
 
     #[test]

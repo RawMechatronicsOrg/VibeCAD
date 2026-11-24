@@ -30,6 +30,13 @@ translucent panels floating over the view (fold them by their header), and a vie
 top-right corner. Click a face of the cube for that view, an edge or a corner for the views in
 between, drag it to orbit; the house next to it goes back to the isometric view.
 
+As in Fusion, the tree lists parts only; what a PartDesign body is built from (sketches, pads,
+pockets, fillets, patterns) is on the timeline along the bottom, in the order it is built, each
+sketch just before the feature made from it. Click a step to select it. The orange rollback
+marker sits after the body's tip, the feature whose shape is the body's: drag it back to see the
+body as it was at an earlier step (the steps after it fade), and forward again. That is FreeCAD's
+Set tip, so it is undone with Undo and saved with the document.
+
 The view has a light background and a ground grid on the XY plane through the origin, as in
 Fusion: minor and major lines (steps of 1, 2, 2.5 or 5 × 10^n mm; a major cell of about 90 pixels,
 so the lines and their labels get finer as you zoom in),
@@ -45,7 +52,7 @@ EDGE WIDTH slider sets the edge width from 1 to 4 pixels (default 1.5).
 | drag | orbit |
 | right or middle drag, shift + drag | pan |
 | wheel | zoom |
-| click | select the face under the cursor (and its object) |
+| click | select the edge near the cursor, else the face under it (and its object) |
 | double click, `F` | fit all |
 | `0` `1` `2` `3` | isometric (from the front-right), front, top, right |
 | `O` | orthographic / perspective |
@@ -65,8 +72,8 @@ opens the document as before.
 | Command | Takes | Makes |
 | --- | --- | --- |
 | Plane | a flat face, a construction plane or XY/XZ/YZ; offset, angle | `PartDesign::Plane` attached to it |
-| Extrude | a flat face (or a sketch from the tree); distance, both sides | `Pad` (positive) or `Pocket` (negative) |
-| Fillet, Chamfer | a face: all its edges; radius or size | `PartDesign::Fillet` / `Chamfer` |
+| Extrude | a flat face (or a sketch from the tree); distance (drag the arrow), both sides | `Pad` (positive) or `Pocket` (negative) |
+| Fillet, Chamfer | edges of one part (a face stands for all its edges); radius or size (drag the arrow) | `PartDesign::Fillet` / `Chamfer` |
 | Mirror | a part, a plane; new solid or join | `Part::Mirroring`, or `PartDesign::Mirrored` of the whole body |
 | Circular | a part, X/Y/Z or a round face (its axis); count, angle | `PartDesign::PolarPattern` of the whole body |
 | Linear | a part, X/Y/Z or a flat face (its normal); count, spacing | `PartDesign::LinearPattern` of the whole body |
@@ -83,6 +90,18 @@ opens the document as before.
 - Construction planes are drawn as translucent orange squares over the model, centred where
   the model's centre falls on them, and can be clicked. A placement (a plane's
   `AttachmentOffset`, an object's `Placement`) shows as six numbers: x, y, z, yaw, pitch, roll.
+
+**Edges and handles.** An edge under the cursor lights up light blue; a click picks it (blue), as
+a face is picked. Only edges of the faces under and around the cursor count, so edges hidden
+behind the part are not picked. In Fillet and Chamfer each click on an edge adds it or takes it
+out again. A selected flat face carries an arrow along its normal: drag it to push or pull the
+face, as Fusion's press-pull does. That opens Extrude with the distance dragged; the solid it
+would add shows in blue, what it would cut in red, and OK (or Enter) makes it. The Extrude
+dialog has the same arrow, and Fillet and Chamfer have one on their first edge for the radius
+or size. Values snap to round steps that follow the zoom. The edges come from the worker on
+demand (`edges`: per edge its polyline, the faces it bounds and the way out of its corner), the
+face from `face` (its triangles, centre and outward normal), and are kept until the model
+changes.
 
 Typed numbers apply on Enter or when the field loses focus. Opening another file or closing the
 window asks before unsaved edits are lost. If FreeCAD crashes, File → Restart FreeCAD starts a new
@@ -105,9 +124,10 @@ one and reopens the file.
   random `VIBECAD_TOKEN`; the script connects back and must greet with the token. The listener
   closes after that one connection, and the directory is removed once FreeCAD has read the script. Every message is a JSON header plus an optional binary payload, both
   length-prefixed (see the script's docstring). Commands: `open`, `new`, `tree`, `props`,
-  `set_prop`, `set_visible`, `undo`, `redo`, `scene`, `save_as`, `export`, the modelling
-  ones (`datum_plane`, `extrude`, `fillet`, `mirror`, `pattern`, `copy`, `delete`), and the
-  agent's (`snapshot`, `timeline`, `slice`, `diff`). Requests go out as
+  `set_prop`, `set_visible`, `set_tip`, `undo`, `redo`, `scene`, `save_as`, `export`, the modelling
+  ones (`datum_plane`, `extrude`, `fillet`, `mirror`, `pattern`, `copy`, `delete`), `edges`
+  and `face` for picking edges and drawing handles, and the agent's (`snapshot`, `timeline`,
+  `slice`, `diff`). Requests go out as
   they are made; replies come back in order, a scene's stream frames before its reply, except
   that `tree` and `props` asked while a scene streams are answered at once, between its frames,
   so the tree and the properties of a selected part do not wait for a large assembly to load.
@@ -269,11 +289,13 @@ documents, where the `Pad` steps just report an error.
 
 ## Limits
 
-- No sketcher, and edges cannot be picked: fillets and chamfers take every edge of a face, and
-  a construction plane cannot be put on an edge. Properties of type length, angle, number,
-  integer, bool, string, enumeration and placement are editable; others are shown as text.
-- Construction planes are drawn over the view without depth, so they show through parts in
-  front of them.
+- No sketcher, and a construction plane cannot be put on an edge. Properties of type length,
+  angle, number, integer, bool, string, enumeration and placement are editable; others are shown
+  as text.
+- Construction planes, picked edges, handles and the extrude preview are drawn over the view
+  without depth, so they show through parts in front of them. There is no preview of a fillet.
+- Lighting edges under the cursor picks the scene once per resting position; on a scene where
+  that takes over 15 ms it is turned off for the session (clicks still pick edges).
 - The first view of a large assembly takes time: the 158 000-face Orbiter assembly shows its
   boxes 0.5 s after it is open, its first mesh after 2.3 s and all of it after about 19 s
   (some 3 s of that checking which shapes are closed solids); from the disk cache all of it
@@ -298,8 +320,9 @@ documents, where the `Pad` steps just report an error.
   from the solid's by more than 2 % is drawn from both sides (correct, only slower).
 - Each edit reloads the tree and the scene; quick edits in a row are not merged.
 - A link to a whole sub-assembly (`App::Part`) is drawn, but tessellated again on every reload.
-- The tree follows `Group` (and a body's origin); PartDesign's habit of showing a sketch under
-  the feature that uses it is not reproduced.
+- The tree and the timeline follow `Group`; a sketch no feature uses stays where it is in its
+  body's order. The rollback marker stops only after features that make a shape (not after a
+  sketch or a datum).
 - Built and run on Windows only so far. On Linux it needs `freecadcmd` on `PATH` (or
   `VIBECAD_FREECAD_CMD`); FreeCAD from Flatpak, Snap or an AppImage is not found yet, and the
   Flatpak and Snap sandboxes may not see the script in the temp directory. File dialogs use the

@@ -12,6 +12,7 @@ mod camera;
 mod mcp;
 mod modelling;
 mod navigation;
+mod picking;
 mod profile;
 mod render;
 mod scene;

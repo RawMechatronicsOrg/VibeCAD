@@ -109,6 +109,14 @@ def test_plane(s):
     err = s.fails("datum_plane", ref={"obj": "Pocket", "sub": "Face7"})
     assert "not flat" in err, err
     s.undo_all()
+    # A face as the window draws its push-pull handle: centre, outward normal, triangles.
+    f = s.call("face", obj="Pocket", sub="Face5")
+    assert f["planar"] and close(f["normal"], [0, 0, 1]) and abs(f["center"][2] - 6.0) < 1e-6, f
+    # The plate's middle is in its hole (radius 8 about 40, 25): the handle stands on the face.
+    assert (f["center"][0] - 40) ** 2 + (f["center"][1] - 25) ** 2 > 8 ** 2, f["center"]
+    assert f["triangles"] and all(abs(p[2] - 6.0) < 1e-6 for p in f["points"])
+    f = s.call("face", obj="Pocket", sub="Face4")
+    assert close(f["normal"], [0, 0, -1]), f
     print("plane: on a face, offset edited, on origin planes, curved face refused")
     return name
 
@@ -140,19 +148,36 @@ def test_extrude(s):
     after = s.tree()
     assert sorted(after["by_name"]) == sorted(before["by_name"]) and after["undo"] == before["undo"], err
     assert "no solid" in err, err
-    err = s.fails("fillet", obj="Pocket", sub="Face5", size=50.0)
+    err = s.fails("fillet", obj="Pocket", subs=["Face5"], size=50.0)
     assert s.tree()["undo"] == before["undo"], err
     print("extrude: pull up, cut down, refusals, undo; failed steps leave nothing (%s)" % err)
 
 
 def test_fillet(s):
-    r = s.call("fillet", obj="Pocket", sub="Face5", size=1.0)
+    r = s.call("fillet", obj="Pocket", subs=["Face5"], size=1.0)
     drawn, _ = s.drawn()
     assert drawn == [r["created"]], drawn
-    r = s.call("fillet", obj="Pocket", sub="Face4", size=0.5, chamfer=True)
+    r = s.call("fillet", obj="Pocket", subs=["Face4"], size=0.5, chamfer=True)
     assert s.tree()["by_name"][r["created"]]["type"] == "PartDesign::Chamfer"
     s.undo_all()
-    print("fillet and chamfer of a face's edges")
+    # Edges, as the window picks them: the four vertical ones of the plate.
+    edges = s.call("edges", obj="Pocket")["edges"]
+    assert len(edges) > 12, len(edges)
+    vertical = [e for e in edges if len(e["points"]) == 2 and abs(e["points"][0][2] - e["points"][1][2]) > 5.9
+                and e["mid"][0] in (0.0, 80.0)]  # not the hole's seam
+    assert len(vertical) == 4, [e["points"] for e in edges]
+    for e in vertical:
+        assert len(e["faces"]) == 2, e
+        x, y = e["mid"][0], e["mid"][1]
+        # Out of the corner: away from the plate's middle, flat.
+        assert e["out"][0] * (x - 40) > 0 and e["out"][1] * (y - 25) > 0 and abs(e["out"][2]) < 1e-6, e
+    r = s.call("fillet", obj="Pocket", subs=["Edge%d" % e["i"] for e in vertical], size=5.0)
+    drawn, bbox = s.drawn()
+    assert drawn == [r["created"]] and close(bbox, [0, 0, 0, 80, 50, 6]), (drawn, bbox)
+    s.undo_all()
+    err = s.fails("fillet", obj="Pocket", subs=[], size=1.0)
+    assert "pick the edges" in err, err
+    print("fillet and chamfer of a face's edges, fillet of four picked edges")
 
 
 def test_mirror(s):
