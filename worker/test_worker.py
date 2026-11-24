@@ -349,6 +349,18 @@ def check_script(cl):
     cl.call("undo")  # the pad's length
 
 
+def check_new_document(cl):
+    """A document that starts empty fixes its tolerance at the first shape drawn in it, not at
+    the empty scene before: taken from no box it was a micron, and a ball 100 mm across came
+    back as hundreds of thousands of triangles (a lofted surface filled the memory)."""
+    cl.call("new")
+    assert not cl.scene()["instances"], "a new document shows nothing"
+    cl.call("script", code="show(Part.makeSphere(50), 'Ball')")
+    tris = check_scene(cl.scene())["tris"]
+    print("new document, then a ball of 100 mm: %d triangles" % tris)
+    assert 500 < tris < 20000, tris
+
+
 def _error(cl, cmd, **kw):
     """The error a command is refused with."""
     try:
@@ -486,6 +498,7 @@ def main(paths):
             print("NaN refused:", str(ex).splitlines()[0][:70])
         ok, _ = cl.call("tree")
         print("still serving after NaN:", ok["ok"])
+    check_new_document(cl)
     cl.close()
 
     # A new FreeCAD process finds every mesh in the disk cache; the edit above did not leave

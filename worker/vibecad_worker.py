@@ -2117,11 +2117,13 @@ class Worker(Modelling):
                 bbox.add(bb)
         # The tolerance is fixed per document and quality: once a shape is tessellated, OCCT
         # bounds it by its triangles, so the box (and a tolerance taken from it) would shift.
-        if self.tol_key != quality or self.tol is None:
-            diag = bbox.DiagonalLength if bbox.isValid() and _finite(bbox.DiagonalLength) else 1.0
-            self.tol = round(max(diag * 0.001 / max(quality, 0.1), 1e-4), 6)
+        # A document with nothing to draw yet fixes none: taken from an empty box it would be a
+        # micron, and the first curved shape made in it would be meshed into gigabytes.
+        sized = bbox.isValid() and _finite(bbox.DiagonalLength) and bbox.DiagonalLength > 0
+        if sized and (self.tol_key != quality or self.tol is None):
+            self.tol = round(max(bbox.DiagonalLength * 0.001 / max(quality, 0.1), 1e-4), 6)
             self.tol_key = quality
-        tol = self.tol
+        tol = self.tol if self.tol is not None else 1.0
         bbox_list = [bbox.XMin, bbox.YMin, bbox.ZMin, bbox.XMax, bbox.YMax, bbox.ZMax] \
             if bbox.isValid() and all(_finite(v) for v in (bbox.XMin, bbox.XMax)) else None
 
