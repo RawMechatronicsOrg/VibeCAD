@@ -145,6 +145,28 @@ def main(exe, out):
         err, text, _ = m.tool("save", path=SAMPLE)
         print("overwriting another file refused:", err, text[:70])
         assert err
+        # Sketch on the plate's top face, dimension it, extrude it.
+        err, text, _ = m.tool("new_sketch", plane={"object": "Pocket", "face": "Face5"})
+        made = json_part(text)
+        print("new_sketch:", err, made["created"], made["sketch"]["plane"])
+        assert not err and made["sketch"]["plane"]["normal"] == [0.0, 0.0, 1.0], text[:300]
+        name = made["created"]
+        err, text, imgs = m.tool("sketch_edit", object=name, add=[
+            {"type": "center_rectangle", "center": [20, 25], "corner": [30, 33]},
+            {"type": "circle", "center": [62, 25], "radius": 6}],
+            constraints=[{"type": "distance_x", "refs": [{"new": 0}], "value": 24, "name": "Width"},
+                         {"type": "diameter", "refs": [{"new": 5}], "value": 10}])
+        edit = json_part(text)
+        print("sketch_edit:", err, "dof", edit["sketch"]["dof"], "profiles", [p["area"] for p in edit["sketch"]["profiles"]])
+        assert not err and len(imgs) == 1 and len(edit["sketch"]["profiles"]) == 2, text[:400]
+        assert "outer" not in edit["sketch"]["profiles"][0], "outlines only when asked"
+        open(os.path.join(out, "sketch.png"), "wb").write(imgs[0])
+        err, text, _ = m.tool("extrude", object=name, distance=3.0)
+        ext = json_part(text)
+        err2, text2, _ = m.tool("diff", before=ext["state_before"], sections=False)
+        added = json_part(text2)["bodies"][0]["added"]["volume"]
+        print("extrude:", err, ext["created"], "added", added)
+        assert not err and abs(added - sum(p["area"] for p in edit["sketch"]["profiles"]) * 3.0) < 1e-3, text2[:300]
         err, text, _ = m.tool("diff", before="s99")
         print("bad state refused:", err, text[:60])
         assert err

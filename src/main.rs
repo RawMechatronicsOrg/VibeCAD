@@ -6,6 +6,9 @@
 //!     vibecad [document.FCStd]
 //!     vibecad --mcp        an MCP server on stdio that drives the running window (see agent.rs)
 
+// The MCP tools' input schemas are one large `json!` literal (see mcp.rs).
+#![recursion_limit = "512"]
+
 mod agent;
 mod app;
 mod camera;

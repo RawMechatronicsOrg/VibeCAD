@@ -346,6 +346,157 @@ fn frame(p: &mut Picture, x0: usize, y0: usize, w: usize, h: usize) {
     }
 }
 
+// ---- sketches as pictures --------------------------------------------------------------
+
+const PROFILE: [u8; 3] = [255, 224, 178];
+const ELEMENT: [u8; 3] = [36, 96, 210];
+const CONSTRAINED: [u8; 3] = [20, 20, 20];
+const CONSTRUCTION: [u8; 3] = [236, 150, 60];
+
+/// The polyline of one element of a `sketch` reply in the sketch's (x, y), or a point.
+enum Drawn {
+    Curve(Vec<(f64, f64)>),
+    Point((f64, f64)),
+}
+
+fn xy(v: &Value) -> Option<(f64, f64)> {
+    Some((v[0].as_f64()?, v[1].as_f64()?))
+}
+
+fn element(g: &Value) -> Option<Drawn> {
+    let circle = |c: (f64, f64), r: f64, a0: f64, a1: f64| {
+        let n = (((a1 - a0).abs() / std::f64::consts::TAU) * 96.0).ceil().max(4.0) as usize;
+        Drawn::Curve((0..=n).map(|k| a0 + (a1 - a0) * k as f64 / n as f64).map(|a| (c.0 + r * a.cos(), c.1 + r * a.sin())).collect())
+    };
+    match g["type"].as_str()? {
+        "LineSegment" => Some(Drawn::Curve(vec![xy(&g["start"])?, xy(&g["end"])?])),
+        "Circle" => Some(circle(xy(&g["center"])?, g["radius"].as_f64()?, 0.0, std::f64::consts::TAU)),
+        "ArcOfCircle" => {
+            let (a0, mut a1) = (g["start_angle"].as_f64()?.to_radians(), g["end_angle"].as_f64()?.to_radians());
+            while a1 <= a0 {
+                a1 += std::f64::consts::TAU;
+            }
+            Some(circle(xy(&g["center"])?, g["radius"].as_f64()?, a0, a1))
+        }
+        "Point" => Some(Drawn::Point(xy(&g["at"])?)),
+        "BSplineCurve" => Some(Drawn::Curve(g["poles"].as_array()?.iter().filter_map(xy).collect())),
+        _ => match (xy(&g["start"]), xy(&g["end"])) {
+            (Some(a), Some(b)) => Some(Drawn::Curve(vec![a, b])),
+            _ => None,
+        },
+    }
+}
+
+fn loop_points(v: &Value) -> Vec<(f64, f64)> {
+    v.as_array().map(|f| f.chunks_exact(2).filter_map(|p| Some((p[0].as_f64()?, p[1].as_f64()?))).collect()).unwrap_or_default()
+}
+
+/// A picture of a `sketch` reply (asked with outlines): its closed profiles filled, its elements
+/// over them (black when the sketch is fully constrained, orange for construction), points as
+/// dots; x to the right, y up, at one scale. None for an empty sketch.
+pub fn render_sketch(sk: &Value, max_side: usize) -> Option<Picture> {
+    let construction = |g: &Value| g["construction"].as_bool() == Some(true);
+    let elements: Vec<(Drawn, bool)> =
+        sk["geometry"].as_array()?.iter().filter_map(|g| Some((element(g)?, construction(g)))).collect();
+    let profiles: Vec<Vec<Vec<(f64, f64)>>> = sk["profiles"]
+        .as_array()
+        .map(|ps| {
+            ps.iter()
+                .map(|p| {
+                    let mut loops = vec![loop_points(&p["outer"])];
+                    loops.extend(p["inner"].as_array().map(Vec::as_slice).unwrap_or(&[]).iter().map(loop_points));
+                    loops
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let all = elements.iter().flat_map(|(d, _)| match d {
+        Drawn::Curve(c) => c.clone(),
+        Drawn::Point(p) => vec![*p],
+    });
+    let (mut lo, mut hi) = ((f64::INFINITY, f64::INFINITY), (f64::NEG_INFINITY, f64::NEG_INFINITY));
+    for (x, y) in all {
+        lo = (lo.0.min(x), lo.1.min(y));
+        hi = (hi.0.max(x), hi.1.max(y));
+    }
+    if !lo.0.is_finite() {
+        return None;
+    }
+    let pad = ((hi.0 - lo.0).max(hi.1 - lo.1) * 0.06).max(1.0);
+    let (lo, hi) = ((lo.0 - pad, lo.1 - pad), (hi.0 + pad, hi.1 + pad));
+    let scale = (max_side as f64 / (hi.0 - lo.0)).min(max_side as f64 / (hi.1 - lo.1));
+    let (w, h) = (((hi.0 - lo.0) * scale).ceil().max(32.0) as usize, ((hi.1 - lo.1) * scale).ceil().max(32.0) as usize);
+    let mut out = Picture::new(w, h, BACKGROUND);
+    let to_px = |p: (f64, f64)| ((p.0 - lo.0) * scale, (hi.1 - p.1) * scale);
+    let clip = (0, 0, w, h);
+    for loops in &profiles {
+        let px: Vec<Vec<(f64, f64)>> = loops.iter().map(|l| l.iter().map(|&p| to_px(p)).collect()).collect();
+        fill_even_odd(&mut out, &px, PROFILE, clip);
+    }
+    let line = if sk["fully_constrained"].as_bool() == Some(true) { CONSTRAINED } else { ELEMENT };
+    for (d, constr) in &elements {
+        let c = if *constr { CONSTRUCTION } else { line };
+        match d {
+            Drawn::Curve(pts) => {
+                let px: Vec<(f64, f64)> = pts.iter().map(|&p| to_px(p)).collect();
+                for seg in px.windows(2) {
+                    stroke_segment(&mut out, seg[0], seg[1], c, *constr);
+                }
+            }
+            Drawn::Point(p) => {
+                let (x, y) = to_px(*p);
+                for dy in -2..=2 {
+                    for dx in -2..=2 {
+                        out.set((x as i64 + dx).max(0) as usize, (y as i64 + dy).max(0) as usize, c);
+                    }
+                }
+            }
+        }
+    }
+    frame(&mut out, 0, 0, w, h);
+    Some(out)
+}
+
+/// A line two pixels wide; dashed for construction.
+fn stroke_segment(p: &mut Picture, a: (f64, f64), b: (f64, f64), c: [u8; 3], dashed: bool) {
+    let steps = ((b.0 - a.0).abs().max((b.1 - a.1).abs()).ceil() as usize).max(1);
+    for k in 0..=steps {
+        if dashed && (k / 6) % 2 == 1 {
+            continue;
+        }
+        let t = k as f64 / steps as f64;
+        let (x, y) = (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+        if x >= 0.0 && y >= 0.0 {
+            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                p.set(x as usize + dx, y as usize + dy, c);
+            }
+        }
+    }
+}
+
+/// How to read the picture of a sketch.
+pub fn sketch_legend(sk: &Value) -> String {
+    format!(
+        "Picture: sketch {} in its own (x, y), x to the right and y up, all at one scale. Orange fill: the closed \
+         profiles an extrude takes; lines: its elements, {}; dashed orange: construction; dots: points.",
+        sk["label"].as_str().unwrap_or("?"),
+        if sk["fully_constrained"].as_bool() == Some(true) { "black: fully constrained" } else { "blue: not fully constrained yet" }
+    )
+}
+
+/// A sketch reply without its profiles' outlines, which the picture shows.
+pub fn without_profile_outlines(v: &Value) -> Value {
+    let mut v = v.clone();
+    let sk = if v.get("profiles").is_some() { Some(&mut v) } else { v.get_mut("sketch") };
+    if let Some(ps) = sk.and_then(|s| s.get_mut("profiles")).and_then(Value::as_array_mut) {
+        for p in ps.iter_mut().filter_map(Value::as_object_mut) {
+            p.remove("outer");
+            p.remove("inner");
+        }
+    }
+    v
+}
+
 /// A `slice` or `diff` reply without the outlines, which the picture shows; they stay when
 /// the agent asked for them.
 pub fn without_outlines(v: &Value) -> Value {
@@ -411,5 +562,32 @@ mod tests {
         let png = p.png();
         assert_eq!(&png[1..4], b"PNG");
         assert!(without_outlines(&v)["slices"][0]["layers"]["section"]["regions"][0].get("loops").is_none());
+    }
+
+    #[test]
+    fn a_sketch_picture_fills_its_profile_and_draws_its_lines() {
+        let sk = json!({
+            "label": "Sketch", "fully_constrained": false,
+            "geometry": [
+                { "type": "LineSegment", "start": [0.0, 0.0], "end": [10.0, 0.0] },
+                { "type": "LineSegment", "start": [10.0, 0.0], "end": [10.0, 10.0] },
+                { "type": "LineSegment", "start": [10.0, 10.0], "end": [0.0, 10.0] },
+                { "type": "LineSegment", "start": [0.0, 10.0], "end": [0.0, 0.0] }
+            ],
+            "profiles": [{ "area": 100.0, "outer": [0.0, 0.0, 10.0, 0.0, 10.0, 10.0, 0.0, 10.0], "inner": [] }]
+        });
+        let p = render_sketch(&sk, 200).unwrap();
+        let at = |fx: f64, fy: f64| {
+            let (x, y) = ((p.width as f64 * fx) as usize, (p.height as f64 * fy) as usize);
+            let i = (y * p.width + x) * 3;
+            [p.rgb[i], p.rgb[i + 1], p.rgb[i + 2]]
+        };
+        assert_eq!(at(0.5, 0.5), PROFILE, "inside the square");
+        assert_eq!(at(0.5, 0.97), BACKGROUND, "outside it");
+        let bottom = (0..p.height).map(|y| at(0.5, y as f64 / p.height as f64)).filter(|c| *c == ELEMENT).count();
+        assert!(bottom >= 2, "the top and bottom lines cross the middle column");
+        let stripped = without_profile_outlines(&json!({ "sketch": sk }));
+        assert!(stripped["sketch"]["profiles"][0].get("outer").is_none());
+        assert!(render_sketch(&json!({ "geometry": [] }), 200).is_none());
     }
 }

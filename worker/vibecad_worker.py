@@ -42,6 +42,7 @@ import zipfile
 import FreeCAD
 import MeshPart
 import Part
+import Sketcher
 
 # Shown in the property panel and editable from it; everything else is read-only text.
 EDITABLE_FLOAT = {
@@ -61,7 +62,7 @@ MAX_FACE_COLORS = 20000
 # Finished meshes are sent at most this often, in seconds, so the window keeps up.
 BATCH_SECONDS = 0.3
 # Requests that change what the scene shows; one arriving during a scene stream ends it.
-ENDS_SCENE = {"scene", "open", "new", "set_prop", "set_props", "undo", "redo", "set_visible",
+ENDS_SCENE = {"scene", "open", "new", "set_prop", "set_props", "new_sketch", "sketch_edit", "undo", "redo", "set_visible",
               "set_tip", "datum_plane", "extrude", "fillet", "mirror", "pattern", "copy", "delete"}
 LINK_TYPES = ("App::Link", "App::LinkElement")
 # How FreeCAD's origin planes turn (yaw, pitch, roll): XY faces +Z, XZ -Y, YZ +X.
@@ -126,15 +127,21 @@ class Modelling:
     Links show another part: they are mirrored and copied, but not changed.
     """
 
-    def _model_edit(self, title, build):
+    def _model_edit(self, title, build, dry=False, describe=None):
         """Run `build(doc)`, which returns the object it made, as one undoable step. A new
-        object that fails to recompute undoes the whole step: FreeCAD's message is the error."""
+        object that fails to recompute undoes the whole step: FreeCAD's message is the error.
+        `describe(made)` adds to the reply what the step left (read before a dry run is put
+        back). With `dry` the document is put back and the result kept as a trial state."""
         doc = self._doc()
+        if dry:
+            self._refuse_dry_run_over_redo(doc)
+        was_edited = self.edited
         self.edited = True
         hide = []  # copies of hidden objects, hidden once the step is committed
         broken_before = {o.Name for o in doc.Objects if "Invalid" in o.State}
         tips = self._tips()
         doc.openTransaction(title)
+        committed = False
         try:
             made = build(doc, hide)
             doc.recompute()
@@ -142,19 +149,33 @@ class Modelling:
                 raise RuntimeError("%s: %s" % (made.Label, _object_error(made)))
             if made is not None and made.isDerivedFrom("PartDesign::Feature") and not made.Shape.Solids:
                 raise RuntimeError("%s: no solid is left" % made.Label)
-        except Exception:
-            abort_transaction(doc)
-            doc.recompute()
-            raise
-        commit_transaction(doc)
+            broken = [o.Name for o in doc.Objects if "Invalid" in o.State and o.Name not in broken_before]
+            out = {"created": made.Name if made is not None else None, "broken": broken}
+            if describe is not None:
+                out.update(describe(made))
+            if dry:
+                out.update(self._trial(title))
+                return out
+            commit_transaction(doc)
+            committed = True
+        finally:
+            if not committed:  # failed, or a dry run: put the document back
+                abort_transaction(doc)
+                doc.recompute()
+                if dry:
+                    self.edited = was_edited
         self._follow_tips(tips)
         for o in hide:
             self.gui.setdefault(o.Name, {})["visible"] = False
             self.vis_changes[o.Name] = False
-        broken = [o.Name for o in doc.Objects if "Invalid" in o.State and o.Name not in broken_before]
-        out = {"created": made.Name if made is not None else None, "broken": broken}
         out.update(self._record_edit(title))
         return out
+
+    def _refuse_dry_run_over_redo(self, doc):
+        # Opening a transaction drops FreeCAD's redo steps, even one that is aborted.
+        if doc.RedoCount:
+            raise ValueError("a dry run would drop the %d step(s) that redo can bring back: redo them, or make "
+                             "an edit, first" % doc.RedoCount)
 
     def _record_edit(self, cause):
         """A state after an edit, and what an agent needs to compare it with the one before."""
@@ -353,6 +374,13 @@ class Modelling:
         if not math.isfinite(distance) or abs(distance) < 1e-7:
             raise ValueError("the distance must not be zero")
         sketch = o.isDerivedFrom("Part::Part2DObject")
+        if sketch:
+            open_wires = [w for w in o.Shape.Wires if not w.isClosed()]
+            if open_wires:
+                raise ValueError("%s has %d open curve(s): an extrude takes closed outlines only; close them, "
+                                 "make them construction, or remove them" % (o.Label, len(open_wires)))
+            if not o.Shape.Wires:
+                raise ValueError("%s has no closed outline to extrude" % o.Label)
 
         def build(doc, hide):
             if sketch:
@@ -406,6 +434,115 @@ class Modelling:
             return f
 
         return self._model_edit("Chamfer" if chamfer else "Fillet", build)
+
+    # ---- sketches ------------------------------------------------------------------------
+
+    def _sketch_support(self, doc, ref, context):
+        """(body or None, attachment) of a new sketch on the plane `ref` names. On a face, in the
+        body of the part (a plain solid becomes a body's base); on an origin plane, in the body of
+        `context`, else the document's only body, else a new one; on a construction plane, in
+        its body, or free beside the bodies when it is free."""
+        if "base" in ref:
+            if ref["base"] not in BASE_PLANES:
+                raise ValueError("no origin plane %s: XY, XZ or YZ" % ref["base"])
+            body = None
+            if context:
+                ctx = self._obj(context)
+                body = ctx if ctx.isDerivedFrom("PartDesign::Body") else self._body_of(ctx)
+            if body is None:
+                bodies = [o for o in doc.Objects if o.isDerivedFrom("PartDesign::Body")]
+                body = bodies[0] if len(bodies) == 1 else doc.addObject("PartDesign::Body", "Body")
+            return body, [(self._origin(body, ref["base"] + "_Plane"), "")]
+        o = self._obj(ref.get("obj") or "")
+        sub = ref.get("sub") or ""
+        if sub:
+            self._flat_face(o, sub)
+            body, feature = self._feature_place(doc, o)
+            return body, [(feature, sub)]
+        if not o.isDerivedFrom("PartDesign::Plane"):
+            raise ValueError("%s is not a plane: pick a flat face, a plane, or XY, XZ or YZ" % o.Label)
+        return self._body_of(o), [(o, "")]
+
+    def cmd_new_sketch(self, req):
+        """An empty sketch on "plane" (a flat face {"obj", "sub"}, a construction plane {"obj"}
+        or an origin plane {"base": "XY"}), attached so it follows what it lies on."""
+        ref = req.get("plane") or {"base": "XY"}
+
+        def build(doc, hide):
+            body, support = self._sketch_support(doc, ref, req.get("context"))
+            sk = body.newObject("Sketcher::SketchObject", "Sketch") if body is not None \
+                else doc.addObject("Sketcher::SketchObject", "Sketch")
+            sk.AttachmentSupport = support
+            sk.MapMode = "FlatFace"
+            return sk
+
+        return self._model_edit("Sketch", build, describe=lambda sk: {
+            "sketch": self.cmd_sketch({"obj": sk.Name, "outlines": req.get("outlines")})})
+
+    def cmd_sketch_edit(self, req):
+        """One undoable change to a sketch, in this order: "remove" {"geometry": [...],
+        "constraints": [...]} (indices as the sketch has them now), "add" geometry, "constraints"
+        to add, "construction" [{"geometry", "on"}] and "move" {"geometry", "at", "to": [x, y]}
+        (a point dragged; the solver moves the rest). Indices after "remove" are those after it;
+        a reference {"new": k} is the k-th element "add" made. A change the solver cannot satisfy
+        (conflicting or redundant constraints) is refused and undone."""
+        sk = self._obj(req.get("obj") or "")
+        if not is_sketch(sk):
+            raise ValueError("%s is a %s, not a sketch" % (sk.Label, sk.TypeId))
+        remove = req.get("remove") or {}
+        add, constraints = req.get("add") or [], req.get("constraints") or []
+        construction, move = req.get("construction") or [], req.get("move")
+        if not (remove.get("geometry") or remove.get("constraints") or add or constraints or construction or move):
+            raise ValueError("nothing to change: give add, constraints, remove, construction or move")
+        made = {"added": [], "constraints_added": []}
+
+        def build(doc, hide):
+            gone = sorted({int(i) for i in remove.get("constraints") or []}, reverse=True)
+            for i in gone:
+                if not 0 <= i < sk.ConstraintCount:
+                    raise ValueError("no constraint %d to remove; the sketch has %d" % (i, sk.ConstraintCount))
+                sk.delConstraint(i)
+            gone = sorted({int(i) for i in remove.get("geometry") or []})
+            for i in gone:
+                if not 0 <= i < sk.GeometryCount:
+                    raise ValueError("no element %d to remove; the sketch has %d" % (i, sk.GeometryCount))
+            if gone:
+                sk.delGeometries(gone)
+            new = []  # (index, start and end swapped) per element made
+            for k, item in enumerate(add):
+                parts, inner = sketch_geometry(item, k)
+                indices = []
+                for geom, swapped, constr in parts:
+                    i = sk.addGeometry(geom, bool(item.get("construction")) if constr is None else constr)
+                    indices.append(i)
+                    new.append((i, swapped))
+                for c in inner:  # the constraints that hold a rectangle or polyline together
+                    sk.addConstraint(c(indices))
+                made["added"].append(indices)
+            for c in constraints:
+                for con in sketch_constraints(c, new, sk.GeometryCount):
+                    i = sk.addConstraint(con)
+                    made["constraints_added"].append(i)
+                if c.get("name"):
+                    sk.renameConstraint(i, str(c["name"]))
+                if c.get("driving") is False:
+                    sk.setDriving(i, False)
+            for c in construction:
+                i = sketch_index(c, new, sk.GeometryCount)
+                sk.setConstruction(i, bool(c.get("on", True)))
+            if move:
+                i = sketch_index(move, new, sk.GeometryCount)
+                to = point2(move, "to")
+                sk.movePoint(i, POINT_POS.get(move.get("at"), 0), to, 0)
+            result = sk.solve()
+            if result != 0:
+                raise ValueError(solver_trouble(sk, result))
+            return sk
+
+        def describe(sk):
+            return dict(made, sketch=self.cmd_sketch({"obj": sk.Name, "outlines": req.get("outlines")}))
+
+        return self._model_edit("Edit " + sk.Label, build, dry=bool(req.get("dry_run")), describe=describe)
 
     # ---- geometry for picking and handles ----------------------------------------------
 
@@ -847,6 +984,273 @@ def describe_geometry(g):
 
 # Where on an element a constraint holds, as Sketcher numbers it.
 CONSTRAINT_POS = {1: "start", 2: "end", 3: "center"}
+POINT_POS = {"start": 1, "end": 2, "center": 3}
+SWAPPED_POS = {1: 2, 2: 1}
+
+
+def point2(d, key):
+    """(x, y) of d[key] as a vector in the sketch's plane."""
+    v = d.get(key)
+    if not (isinstance(v, (list, tuple)) and len(v) == 2 and all(isinstance(x, (int, float)) for x in v)
+            and all(math.isfinite(x) for x in v)):
+        raise ValueError("%s must be [x, y] in mm, not %r" % (key, v))
+    return FreeCAD.Vector(float(v[0]), float(v[1]), 0)
+
+
+def positive(d, key):
+    v = d.get(key)
+    if not (isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v > 0):
+        raise ValueError("%s must be a number above zero, not %r" % (key, v))
+    return float(v)
+
+
+def ccw_arc(a, b, c):
+    """The arc from a through b to c, counter-clockwise as Sketcher keeps arcs: one drawn
+    clockwise runs from c to a instead. (arc, whether its start and end are swapped)."""
+    if (b - a).cross(c - a).Length < 1e-9:
+        raise ValueError("the three points of an arc lie on a line")
+    arc = Part.ArcOfCircle(a, b, c)
+    if arc.Axis.z < 0:
+        return Part.ArcOfCircle(c, b, a), True
+    return arc, False
+
+
+def _closed_loop(n, horizontal=(), vertical=()):
+    """Constraints joining n segments made in a row into a loop (each end to the next start),
+    with some of them horizontal or vertical. Each takes the segments' indices."""
+    out = [lambda ix, i=i: Sketcher.Constraint("Coincident", ix[i], 2, ix[(i + 1) % n], 1) for i in range(n)]
+    out += [lambda ix, i=i: Sketcher.Constraint("Horizontal", ix[i]) for i in horizontal]
+    out += [lambda ix, i=i: Sketcher.Constraint("Vertical", ix[i]) for i in vertical]
+    return out
+
+
+def sketch_geometry(item, k):
+    """Element k of an edit's "add", as Sketcher geometry: ([(geometry, start and end swapped,
+    construction or None for the item's own)], [constraint makers taking the made indices])."""
+    t = item.get("type") if isinstance(item, dict) else None
+    V = FreeCAD.Vector
+    if t == "line":
+        a, b = point2(item, "start"), point2(item, "end")
+        if (b - a).Length < 1e-7:
+            raise ValueError("add[%d]: a line's ends must differ" % k)
+        return [(Part.LineSegment(a, b), False, None)], []
+    if t == "circle":
+        return [(Part.Circle(point2(item, "center"), V(0, 0, 1), positive(item, "radius")), False, None)], []
+    if t == "arc":
+        c, r = point2(item, "center"), positive(item, "radius")
+        a0, a1 = (math.radians(float(item.get(x, 0))) for x in ("start_angle", "end_angle"))
+        while a1 <= a0:
+            a1 += 2 * math.pi
+        return [(Part.ArcOfCircle(Part.Circle(c, V(0, 0, 1), r), a0, a1), False, None)], []
+    if t == "arc3":
+        arc, swapped = ccw_arc(point2(item, "start"), point2(item, "through"), point2(item, "end"))
+        return [(arc, swapped, None)], []
+    if t == "point":
+        return [(Part.Point(point2(item, "at")), False, None)], []
+    if t in ("rectangle", "center_rectangle"):
+        if t == "rectangle":
+            p, q = point2(item, "corner"), point2(item, "opposite")
+        else:
+            c, q = point2(item, "center"), point2(item, "corner")
+            p = c * 2 - q
+        x0, x1, y0, y1 = min(p.x, q.x), max(p.x, q.x), min(p.y, q.y), max(p.y, q.y)
+        if x1 - x0 < 1e-7 or y1 - y0 < 1e-7:
+            raise ValueError("add[%d]: a rectangle needs a width and a height" % k)
+        corners = [V(x0, y0, 0), V(x1, y0, 0), V(x1, y1, 0), V(x0, y1, 0)]
+        lines = [(Part.LineSegment(corners[i], corners[(i + 1) % 4]), False, None) for i in range(4)]
+        inner = _closed_loop(4, horizontal=(0, 2), vertical=(1, 3))
+        if t == "center_rectangle":  # a construction point at the centre, the corners symmetric about it
+            lines.append((Part.Point(V((x0 + x1) / 2, (y0 + y1) / 2, 0)), False, True))
+            inner.append(lambda ix: Sketcher.Constraint("Symmetric", ix[0], 1, ix[1], 2, ix[4], 1))
+        return lines, inner
+    if t == "polyline":
+        pts = item.get("points")
+        if not isinstance(pts, list) or len(pts) < 2:
+            raise ValueError("add[%d]: a polyline needs at least two points" % k)
+        vs = [point2({"p": x}, "p") for x in pts]
+        closed = bool(item.get("closed"))
+        ends = list(zip(vs, vs[1:] + ([vs[0]] if closed else [])))
+        if any((b - a).Length < 1e-7 for a, b in ends):
+            raise ValueError("add[%d]: two points of the polyline in a row are the same" % k)
+        segs = [(Part.LineSegment(a, b), False, None) for a, b in ends]
+        n = len(segs)
+        inner = [lambda ix, i=i: Sketcher.Constraint("Coincident", ix[i], 2, ix[i + 1], 1) for i in range(n - 1)]
+        if closed:
+            inner.append(lambda ix: Sketcher.Constraint("Coincident", ix[n - 1], 2, ix[0], 1))
+        return segs, inner
+    raise ValueError("add[%d]: type must be line, circle, arc, arc3, point, rectangle, center_rectangle or "
+                     "polyline, not %r" % (k, t))
+
+
+def sketch_index(ref, new, count):
+    """The element a reference names: {"geometry": i} or {"new": k}."""
+    if "new" in ref:
+        k = ref["new"]
+        if not (isinstance(k, int) and 0 <= k < len(new)):
+            raise ValueError("no new element %r: this edit makes %d" % (k, len(new)))
+        return new[k][0]
+    i = ref.get("geometry")
+    if not (isinstance(i, int) and 0 <= i < count):
+        raise ValueError("no element %r: the sketch has %d" % (i, count))
+    return i
+
+
+def sketch_ref(ref, new, count):
+    """(GeoId, PointPos) of a constraint's reference: an element ({"geometry": i} or
+    {"new": k}) with "at" start, end or center, an axis {"axis": "x"} or the origin."""
+    if not isinstance(ref, dict):
+        raise ValueError("a reference is an object, not %r" % (ref,))
+    if ref.get("origin"):
+        return -1, 1
+    if "axis" in ref:
+        if ref["axis"] not in ("x", "y"):
+            raise ValueError("axis must be x or y, not %r" % ref["axis"])
+        return (-1 if ref["axis"] == "x" else -2), 0
+    at = ref.get("at")
+    if at is not None and at not in POINT_POS:
+        raise ValueError("at must be start, end or center, not %r" % at)
+    pos = POINT_POS.get(at, 0)
+    i = sketch_index(ref, new, count)
+    if "new" in ref and new[ref["new"]][1]:
+        pos = SWAPPED_POS.get(pos, pos)  # drawn clockwise: Sketcher keeps the arc the other way round
+    return i, pos
+
+
+# Constraint types an edit takes, and the Sketcher types they become.
+SKETCH_CONSTRAINTS = ("coincident", "horizontal", "vertical", "parallel", "perpendicular", "tangent", "equal",
+                      "point_on_object", "midpoint", "symmetric", "concentric", "fix", "distance", "distance_x",
+                      "distance_y", "radius", "diameter", "angle")
+
+
+def sketch_constraints(c, new, count):
+    """The Sketcher constraints one constraint of an edit stands for: {"type", "refs", "value"}."""
+    t = c.get("type") if isinstance(c, dict) else None
+    if t not in SKETCH_CONSTRAINTS:
+        raise ValueError("constraint type must be one of %s, not %r" % (", ".join(SKETCH_CONSTRAINTS), t))
+    refs = [sketch_ref(r, new, count) for r in (c.get("refs") or [])]
+    points = [r for r in refs if r[1] != 0]
+    n = len(refs)
+    C = Sketcher.Constraint
+
+    def need(ok, what):
+        if not ok:
+            raise ValueError("%s takes %s" % (t, what))
+
+    def value(angle=False):
+        v = c.get("value")
+        need(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v), "a numeric value")
+        if angle:
+            return math.radians(float(v))
+        need(v > 0 or t in ("distance_x", "distance_y"), "a value above zero")
+        return float(v)
+
+    if t == "coincident":
+        need(n == 2 and len(points) == 2, "two points (refs with at)")
+        return [C("Coincident", refs[0][0], refs[0][1], refs[1][0], refs[1][1])]
+    if t in ("horizontal", "vertical"):
+        T = t.capitalize()
+        if n == 1 and not points:
+            return [C(T, refs[0][0])]
+        need(n == 2 and len(points) == 2, "a line, or two points")
+        return [C(T, refs[0][0], refs[0][1], refs[1][0], refs[1][1])]
+    if t in ("parallel", "perpendicular", "equal"):
+        need(n == 2 and not points, "two elements")
+        return [C(t.capitalize(), refs[0][0], refs[1][0])]
+    if t == "tangent":
+        if n == 2 and not points:
+            return [C("Tangent", refs[0][0], refs[1][0])]
+        need(n == 2 and len(points) == 2, "two curves, or the two ends where they meet")
+        return [C("Tangent", refs[0][0], refs[0][1], refs[1][0], refs[1][1])]
+    if t == "point_on_object":
+        need(n == 2 and refs[0][1] != 0 and refs[1][1] == 0, "a point, then a curve")
+        return [C("PointOnObject", refs[0][0], refs[0][1], refs[1][0])]
+    if t == "midpoint":
+        need(n == 2 and refs[0][1] != 0 and refs[1][1] == 0 and refs[1][0] >= 0, "a point, then a line")
+        return [C("Symmetric", refs[1][0], 1, refs[1][0], 2, refs[0][0], refs[0][1])]
+    if t == "symmetric":
+        need(n == 3 and refs[0][1] != 0 and refs[1][1] != 0, "two points, then a line or a point")
+        if refs[2][1] == 0:
+            return [C("Symmetric", refs[0][0], refs[0][1], refs[1][0], refs[1][1], refs[2][0])]
+        return [C("Symmetric", refs[0][0], refs[0][1], refs[1][0], refs[1][1], refs[2][0], refs[2][1])]
+    if t == "concentric":
+        need(n == 2 and not points, "two circles or arcs")
+        return [C("Coincident", refs[0][0], 3, refs[1][0], 3)]
+    if t == "fix":
+        need(n == 1 and not points and refs[0][0] >= 0, "one element")
+        return [C("Block", refs[0][0])]
+    if t in ("radius", "diameter"):
+        need(n == 1 and not points, "one circle or arc")
+        return [C(t.capitalize(), refs[0][0], value())]
+    if t == "angle":
+        if n == 1 and not points:
+            return [C("Angle", refs[0][0], value(angle=True))]
+        need(n == 2 and not points, "a line (against the x axis), or two lines")
+        return [C("Angle", refs[0][0], refs[1][0], value(angle=True))]
+    T = {"distance": "Distance", "distance_x": "DistanceX", "distance_y": "DistanceY"}[t]
+    if n == 1 and not points:
+        return [C(T, refs[0][0], value())]
+    if n == 1 and t != "distance":
+        return [C(T, refs[0][0], refs[0][1], value())]  # a point's distance from the origin
+    need(n == 2, "a line, or two points, or a point and a line")
+    if len(points) == 2:
+        return [C(T, refs[0][0], refs[0][1], refs[1][0], refs[1][1], value())]
+    need(t == "distance" and refs[0][1] != 0 and refs[1][1] == 0, "a line, or two points, or a point then a line")
+    return [C(T, refs[0][0], refs[0][1], refs[1][0], value())]
+
+
+# What SketchObject.solve's results other than 0 mean.
+SOLVER_RESULTS = {-2: "redundant constraints", -3: "conflicting constraints", -4: "over-constrained",
+                  -5: "malformed constraints"}
+
+
+def solver_trouble(sk, result):
+    """What the solver says is wrong, with the constraints to blame (indices from 0)."""
+    def ids(name):
+        return [i - 1 for i in (getattr(sk, name, None) or [])]
+    conflicting, redundant = ids("ConflictingConstraints"), ids("RedundantConstraints")
+    parts = []
+    if conflicting:
+        parts.append("conflicting constraints %s" % conflicting)
+    if redundant:
+        parts.append("redundant constraints %s" % redundant)
+    malformed = ids("MalformedConstraints")
+    if malformed:
+        parts.append("malformed constraints %s" % malformed)
+    why = SOLVER_RESULTS.get(result, "no solution for these constraints: they ask for something impossible or "
+                                     "contradict each other")
+    return "the sketch cannot be solved: %s%s" % (why, "".join("; " + x for x in parts))
+
+
+def sketch_profiles(sk, outlines):
+    """The closed regions of a sketch, as Extrude would take them, in the sketch's (x, y):
+    area, box, holes; with `outlines`, the outer loop and the holes as [x0, y0, x1, y1, ...]."""
+    try:
+        shape = sk.Shape.copy()
+    except Exception:
+        return []
+    shape.Placement = FreeCAD.Placement()
+    wires = [w for w in shape.Wires if w.isClosed()]
+    if not wires:
+        return []
+    try:
+        faces = Part.makeFace(wires, "Part::FaceMakerBullseye").Faces
+    except Exception:
+        return []
+    out = []
+    for f in faces:
+        bb = f.BoundBox
+        d = {"area": round(f.Area, 6), "box": [round(x, 6) for x in (bb.XMin, bb.YMin, bb.XMax, bb.YMax)],
+             "holes": len(f.Wires) - 1}
+        if outlines:
+            step = max(bb.DiagonalLength * 0.002, 1e-3)
+
+            def loop(w):
+                return [round(c, 6) for p in w.discretize(Deflection=step) for c in (p.x, p.y)]
+            d["outer"] = loop(f.OuterWire)
+            d["inner"] = [loop(w) for w in f.Wires if not w.isSame(f.OuterWire)]
+        out.append(d)
+    out.sort(key=lambda d: -d["area"])
+    return out
 
 
 def constraint_ref(geo, pos):
@@ -1111,6 +1515,8 @@ class Worker(Modelling):
                           "x_dir": _vec(r.multVec(FreeCAD.Vector(1, 0, 0)))},
                 "geometry": geometry, "constraints": constraints, "external": external,
                 "fully_constrained": bool(getattr(sk, "FullyConstrained", False)),
+                "dof": getattr(sk, "DoF", None),
+                "profiles": sketch_profiles(sk, bool(req.get("outlines"))),
                 "state": list(sk.State), "errors": [] if "Invalid" not in sk.State else [_object_error(sk)]}
 
     def cmd_set_prop(self, req):
@@ -1143,10 +1549,8 @@ class Worker(Modelling):
         title = "; ".join("set %s.%s %s %s" % (o.Name, n, "=" if k == "value" else ":=", _short(v, 40))
                           for o, n, k, v in steps)
         dry = bool(req.get("dry_run"))
-        if dry and doc.RedoCount:
-            # Opening a transaction drops FreeCAD's redo steps, even one that is aborted.
-            raise ValueError("a dry run would drop the %d step(s) that redo can bring back: redo them, or make "
-                             "an edit, first" % doc.RedoCount)
+        if dry:
+            self._refuse_dry_run_over_redo(doc)
         was_edited = self.edited
         self.edited = True
         doc.openTransaction(title if len(steps) == 1 else "Set %d properties" % len(steps))

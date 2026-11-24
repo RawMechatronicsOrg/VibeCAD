@@ -1689,7 +1689,27 @@ impl App {
             _ if self.doc_label.is_none() => Err("no document is open; use open_document or ask the person".to_string()),
             "get_tree" => Ok(self.request("tree", json!({}), Pending::AgentQuery)),
             "get_properties" => Ok(self.request("props", json!({ "obj": s("object") }), Pending::AgentQuery)),
-            "get_sketch" => Ok(self.request("sketch", json!({ "obj": s("object") }), Pending::AgentQuery)),
+            "get_sketch" => Ok(self.request("sketch", json!({ "obj": s("object"), "outlines": true }), Pending::AgentQuery)),
+            "new_sketch" => agent_plane(&a["plane"])
+                .map(|plane| self.request("new_sketch", json!({ "plane": plane, "context": a["body"], "outlines": true }), Pending::Edit)),
+            "sketch_edit" => {
+                let mut args = a.clone();
+                if let Some(m) = args.as_object_mut() {
+                    m.remove("object");
+                    m.insert("obj".into(), json!(s("object")));
+                    m.insert("outlines".into(), json!(true));
+                }
+                let dry = a["dry_run"].as_bool() == Some(true);
+                Ok(self.request("sketch_edit", args, if dry { Pending::AgentQuery } else { Pending::Edit }))
+            }
+            "extrude" => match a["distance"].as_f64() {
+                Some(d) => Ok(self.request(
+                    "extrude",
+                    json!({ "obj": s("object"), "sub": a["face"], "distance": d, "symmetric": a["symmetric"] }),
+                    Pending::Edit,
+                )),
+                None => Err("distance: a number of mm, negative to cut".into()),
+            },
             "set_property" | "set_properties" => {
                 let changes = match a.get("dry_run") {
                     None | Some(Value::Bool(_)) if call.tool == "set_property" => Ok(vec![a.clone()]),
@@ -1776,6 +1796,15 @@ impl App {
                         .into();
                 }
                 out.text.push_str(&agent::without_outlines(&v).to_string());
+            }
+            "get_sketch" | "new_sketch" | "sketch_edit" => {
+                let sk = if call.tool == "get_sketch" { &v } else { &v["sketch"] };
+                if let Some(p) = agent::render_sketch(sk, 720) {
+                    out.images.push(p);
+                    out.text = format!("{}\n", agent::sketch_legend(sk));
+                }
+                let data = if outlines { v.clone() } else { agent::without_profile_outlines(&v) };
+                out.text.push_str(&data.to_string());
             }
             "open_document" => out.text = format!("{v}\nThe window is loading the document's shapes now."),
             _ => out.text = v.to_string(),
@@ -1865,6 +1894,18 @@ impl App {
 
 /// The bottom of the view's light background; the top is near white.
 const BACKGROUND: [f64; 3] = [0.84, 0.86, 0.89];
+
+/// The plane of the agent's `new_sketch` ({object, face} | {object} | {base}), as the worker
+/// takes a reference ({obj, sub} | {base}).
+fn agent_plane(p: &Value) -> Result<Value, String> {
+    if let Some(b) = p["base"].as_str() {
+        return Ok(json!({ "base": b }));
+    }
+    match p["object"].as_str() {
+        Some(o) => Ok(json!({ "obj": o, "sub": p["face"].as_str().unwrap_or("") })),
+        None => Err("plane: {base: \"XY\" | \"XZ\" | \"YZ\"}, or {object, face} for a flat face, or {object} for a construction plane".into()),
+    }
+}
 
 /// The `changes` of the agent's `set_properties`.
 fn agent_changes(a: &Value) -> Result<Vec<Value>, String> {

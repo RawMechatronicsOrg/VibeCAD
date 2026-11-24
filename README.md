@@ -6,7 +6,8 @@ VibeCAD draws its shapes with wgpu and edits its documents through it. Documents
 
 Prototype. It opens, shows, picks, edits properties, undoes, saves and exports, and models with
 a first set of operations (construction planes, extrude, fillet, chamfer, mirror, circular and
-linear patterns, copy, delete). There is no sketcher yet.
+linear patterns, copy, delete). Sketches are made and drawn by an agent (see Agents); the
+window's own sketch mode is on its way.
 
 ## Run
 
@@ -124,7 +125,7 @@ one and reopens the file.
   random `VIBECAD_TOKEN`; the script connects back and must greet with the token. The listener
   closes after that one connection, and the directory is removed once FreeCAD has read the script. Every message is a JSON header plus an optional binary payload, both
   length-prefixed (see the script's docstring). Commands: `open`, `new`, `tree`, `props`,
-  `set_prop`, `set_props`, `sketch`, `set_visible`, `set_tip`, `undo`, `redo`, `scene`, `save_as`, `export`, the modelling
+  `set_prop`, `set_props`, `sketch`, `new_sketch`, `sketch_edit`, `set_visible`, `set_tip`, `undo`, `redo`, `scene`, `save_as`, `export`, the modelling
   ones (`datum_plane`, `extrude`, `fillet`, `mirror`, `pattern`, `copy`, `delete`), `edges`
   and `face` for picking edges and drawing handles, and the agent's (`snapshot`, `timeline`,
   `slice`, `diff`). Requests go out as
@@ -225,9 +226,9 @@ listens on a random localhost port and writes it, with a random token, to `agent
 removed when the window closes. So the agent edits and sees the same document as the person at
 the screen, with one FreeCAD.
 
-Tools: `get_status`, `get_tree`, `get_properties`, `get_sketch`, `set_property`,
-`set_properties`, `undo`, `redo`, `save`, `open_document` (refused while there are unsaved
-edits), and for checking what an edit did:
+Tools: `get_status`, `get_tree`, `get_properties`, `get_sketch`, `new_sketch`, `sketch_edit`,
+`extrude`, `set_property`, `set_properties`, `undo`, `redo`, `save`, `open_document` (refused
+while there are unsaved edits), and for checking what an edit did:
 
 - **Properties.** `get_properties` leaves out what reads as noise (shapes, materials, the raw
   expression engine); entries the tools cannot set (links, lists, vectors) are read-only, and a
@@ -246,6 +247,20 @@ edits), and for checking what an edit did:
   redo: FreeCAD drops them as soon as any transaction opens.
 - **`save`**: to the document's file, or to another absolute `.FCStd` path, which becomes its
   file; an existing file other than its own is replaced only with `overwrite`.
+- **Sketching.** `new_sketch` makes an empty `Sketcher::SketchObject` on an origin plane, a
+  construction plane or a flat face, attached so it follows it (in the body of the face's part;
+  on an origin plane in the body named, the only body, or a new one). `sketch_edit` makes one
+  undoable change to it: remove elements or constraints, add lines, circles, arcs (by centre and
+  angles, or through three points), points, rectangles (by corners or centre) and polylines,
+  add constraints (coincident, horizontal, vertical, parallel, perpendicular, tangent, equal,
+  point on object, midpoint, symmetric, concentric, fix) and dimensions (distance, distance x/y,
+  radius, diameter, angle; named ones become `Constraints.<name>` properties), switch elements
+  to construction, and drag a point under the solver. FreeCAD's solver does the solving; a
+  change it cannot satisfy is refused and undone. Every reply has the sketch as data (geometry,
+  constraints, degrees of freedom, closed profiles) and a picture of it, profiles filled.
+  `extrude` extrudes a sketch's closed profiles (a Pad, or a Pocket for a negative distance) or
+  pushes or pulls a flat face. A sketch with open curves is refused until they are closed,
+  construction or gone.
 
 - **States and timelines.** The worker keeps the exact shape of every solid body (a PartDesign
   Body, or any solid no other shape takes as input) at each state: `s0` at open, one after
@@ -273,6 +288,7 @@ with the agent's next tool result.
 cargo test                                         # scene decoding, the camera, the shader (naga)
 python worker/test_worker.py examples/plate.FCStd  # the worker protocol, against a real FreeCAD
 python worker/test_modelling.py                    # the modelling commands, against a real FreeCAD
+python worker/test_sketch.py                       # sketches: make, draw, constrain, drag, extrude
 python worker/test_mcp.py                          # MCP end to end: opens the window, drives it, closes it
 ```
 

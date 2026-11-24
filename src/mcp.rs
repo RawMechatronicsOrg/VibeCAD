@@ -20,8 +20,10 @@ note the state before (set_property returns state_before and state_after), then 
 added and removed solids, and slice for cross-sections (like an MRI) along any axis, optionally compared \
 with an earlier state. To try an edit without making it, pass dry_run: the document stays as it was and \
 the result is a trial state (\"t1\", ...) that diff and slice take like any other. A sketch's dimensions \
-are properties named \"Constraints.<name>\" (get_sketch lists them). Nothing is written to disk until \
-save. Lengths are in mm, volumes in mm^3. The person can pause you from the window or leave \
+are properties named \"Constraints.<name>\" (get_sketch lists them). To model: new_sketch on a plane or \
+flat face, sketch_edit to draw, constrain and dimension (each reply has a picture of the sketch and its \
+closed profiles), then extrude the sketch. Nothing is written to disk until save. Lengths are in mm, \
+angles in degrees, volumes in mm^3. The person can pause you from the window or leave \
 you a note, which arrives at the end of a tool result.";
 
 /// The tools, with their input schemas.
@@ -60,7 +62,80 @@ pub fn tools() -> Value {
         {
             "name": "get_sketch",
             "description": "A sketch as data: its plane (origin, normal, x direction), its elements in the sketch's (x, y) (lines, circles, arcs, points, ...; construction ones marked) and its constraints with what they refer to; each dimension with its value, unit and the property name that set_property takes.",
-            "inputSchema": { "type": "object", "properties": { "object": { "type": "string", "description": "The sketch's object name, e.g. \"HoleSketch\"." } }, "required": ["object"] }
+            "inputSchema": { "type": "object", "properties": {
+                "object": { "type": "string", "description": "The sketch's object name, e.g. \"HoleSketch\"." },
+                "outlines": { "type": "boolean", "description": "Also return each profile's outline as [x0, y0, x1, y1, ...] (the picture shows them)." }
+            }, "required": ["object"] }
+        },
+        {
+            "name": "new_sketch",
+            "description": "An empty sketch on a plane, attached so it follows what it lies on: on a flat face it goes into that part's body; on an origin plane into the body named, else the only body, else a new one. Returns its name and plane (origin, normal, x direction): the sketch's (x, y) are along x_dir and normal x x_dir.",
+            "inputSchema": { "type": "object", "properties": {
+                "plane": { "type": "object", "description": "{\"base\": \"XY\" | \"XZ\" | \"YZ\"}, or {\"object\": \"Pocket\", \"face\": \"Face5\"} for a flat face, or {\"object\": \"DatumPlane\"}.", "properties": {
+                    "base": { "type": "string", "enum": ["XY", "XZ", "YZ"] },
+                    "object": { "type": "string" },
+                    "face": { "type": "string" }
+                } },
+                "body": { "type": "string", "description": "For an origin plane: the body (or one of its features) to put the sketch in." }
+            }, "required": ["plane"] }
+        },
+        {
+            "name": "sketch_edit",
+            "description": "One undoable change to a sketch, done in this order: remove, add, constraints, construction, move. Coordinates are the sketch's (x, y) in mm, angles in degrees. A reference to an element is {\"geometry\": i} (its index, after remove) or {\"new\": k} (the k-th element this edit adds: a rectangle adds 4 lines bottom, right, top, left, and a center_rectangle also a centre point; a polyline one line per segment), with \"at\": start | end | center for one of its points; also {\"axis\": \"x\" | \"y\"} and {\"origin\": true}. Rectangles and polylines come joined, rectangles level. A change the solver cannot satisfy is refused and nothing stays. Returns the sketch (geometry, constraints with dimensions as Constraints.<name> properties, dof, profiles) and a picture of it.",
+            "inputSchema": { "type": "object", "properties": {
+                "object": { "type": "string", "description": "The sketch's object name." },
+                "add": { "type": "array", "items": { "type": "object", "properties": {
+                    "type": { "type": "string", "enum": ["line", "circle", "arc", "arc3", "point", "rectangle", "center_rectangle", "polyline"] },
+                    "start": { "type": "array", "items": { "type": "number" }, "description": "line, arc3" },
+                    "end": { "type": "array", "items": { "type": "number" }, "description": "line, arc3" },
+                    "through": { "type": "array", "items": { "type": "number" }, "description": "arc3: a point on the arc between start and end" },
+                    "center": { "type": "array", "items": { "type": "number" }, "description": "circle, arc, center_rectangle" },
+                    "radius": { "type": "number", "description": "circle, arc" },
+                    "start_angle": { "type": "number", "description": "arc, degrees from +x, counter-clockwise to end_angle" },
+                    "end_angle": { "type": "number" },
+                    "at": { "type": "array", "items": { "type": "number" }, "description": "point" },
+                    "corner": { "type": "array", "items": { "type": "number" }, "description": "rectangle (with opposite), center_rectangle (a corner)" },
+                    "opposite": { "type": "array", "items": { "type": "number" } },
+                    "points": { "type": "array", "items": { "type": "array", "items": { "type": "number" } }, "description": "polyline" },
+                    "closed": { "type": "boolean", "description": "polyline: join the last point to the first" },
+                    "construction": { "type": "boolean", "description": "Construction geometry: a guide, never part of a profile." }
+                }, "required": ["type"] } },
+                "constraints": { "type": "array", "items": { "type": "object", "properties": {
+                    "type": { "type": "string", "enum": ["coincident", "horizontal", "vertical", "parallel", "perpendicular", "tangent", "equal", "point_on_object", "midpoint", "symmetric", "concentric", "fix", "distance", "distance_x", "distance_y", "radius", "diameter", "angle"] },
+                    "refs": { "type": "array", "description": "coincident: two points; horizontal/vertical: a line or two points; parallel/perpendicular/equal/tangent/concentric: two elements; point_on_object/midpoint: a point then a curve/line; symmetric: two points then a line or point; fix: one element; distance: a line, two points, or a point then a line; distance_x/y: a line, a point (from the origin) or two points; radius/diameter: a circle or arc; angle: a line (from +x) or two lines.", "items": { "type": "object", "properties": {
+                        "geometry": { "type": "integer" }, "new": { "type": "integer" },
+                        "at": { "type": "string", "enum": ["start", "end", "center"] },
+                        "axis": { "type": "string", "enum": ["x", "y"] }, "origin": { "type": "boolean" }
+                    } } },
+                    "value": { "type": "number", "description": "Dimensions: mm, or degrees for angle." },
+                    "name": { "type": "string", "description": "Name the dimension, to set it later as Constraints.<name>." },
+                    "driving": { "type": "boolean", "description": "false: a reference dimension that only measures." }
+                }, "required": ["type", "refs"] } },
+                "remove": { "type": "object", "properties": {
+                    "geometry": { "type": "array", "items": { "type": "integer" } },
+                    "constraints": { "type": "array", "items": { "type": "integer" } }
+                } },
+                "construction": { "type": "array", "items": { "type": "object", "properties": {
+                    "geometry": { "type": "integer" }, "new": { "type": "integer" }, "on": { "type": "boolean" }
+                } } },
+                "move": { "type": "object", "description": "Drag a point of an element to (x, y); the solver moves the rest as the constraints allow.", "properties": {
+                    "geometry": { "type": "integer" }, "new": { "type": "integer" },
+                    "at": { "type": "string", "enum": ["start", "end", "center"] },
+                    "to": { "type": "array", "items": { "type": "number" } }
+                } },
+                "dry_run": dry_run,
+                "outlines": { "type": "boolean", "description": "Also return the profiles' outlines." }
+            }, "required": ["object"] }
+        },
+        {
+            "name": "extrude",
+            "description": "Extrude a sketch's closed profiles (all of them; open curves must be construction or removed first), or push/pull a flat face of a part, by distance: positive adds material (a Pad), negative cuts (a Pocket). One undo step; returns state_before and state_after for diff and slice.",
+            "inputSchema": { "type": "object", "properties": {
+                "object": { "type": "string", "description": "A sketch, or the part whose face is pushed or pulled." },
+                "face": { "type": "string", "description": "For a part: its flat face, e.g. \"Face6\"." },
+                "distance": { "type": "number", "description": "mm along the sketch's (or face's) normal; negative cuts." },
+                "symmetric": { "type": "boolean", "description": "Half to each side of the sketch." }
+            }, "required": ["object", "distance"] }
         },
         {
             "name": "set_property",
