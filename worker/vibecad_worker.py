@@ -401,11 +401,38 @@ class Modelling:
             o = doc.addObject("App::FeaturePython", "Scan")
             o.addProperty("App::PropertyFile", SCAN_FILE, "Scan", "The scan file the VibeCAD window shows (points or a mesh)")
             o.addProperty("App::PropertyPlacement", "Placement", "Scan", "Where the scan sits in the document")
+            _add_scan_mask(o)
             setattr(o, SCAN_FILE, path)
             o.Label = os.path.splitext(os.path.basename(path))[0]
             return o
 
         return self._model_edit("Import scan", build)
+
+    def cmd_scan_mask(self, req):
+        """A scan's deleted points: "path" a mask file the window wrote, which the document takes
+        a copy of and is saved with, or none to show every point again. One undo step."""
+        o = self._obj(req["obj"])
+        if not _is_scan(o):
+            raise ValueError("%s is not a scan" % o.Label)
+        path = req.get("path") or ""
+        if path and not os.path.isfile(path):
+            raise ValueError("no such file: %s" % path)
+
+        def apply():
+            _add_scan_mask(o)
+            if path:
+                setattr(o, SCAN_MASK, path)
+                return
+            # FreeCAD keeps an included file when given no path: an empty one stands for none.
+            empty = os.path.join(tempfile.mkdtemp(prefix="vibecad-mask-"), o.Name + "-none.mask")
+            open(empty, "wb").close()
+            try:
+                setattr(o, SCAN_MASK, empty)
+            finally:
+                shutil.rmtree(os.path.dirname(empty), ignore_errors=True)
+
+        title = ("Delete points of %s" if path else "Restore points of %s") % o.Label
+        return self._edit(title, title, apply)
 
     def _scan_ref(self, o, shown):
         """What the window needs to draw a scan: its file (found again next to the document when
@@ -429,6 +456,11 @@ class Modelling:
         if parent is not None:
             placement = parent.multiply(placement)
         ref["matrix"] = list(placement.toMatrix().A)
+        mask = getattr(o, SCAN_MASK, "") if SCAN_MASK in o.PropertiesList else ""
+        if mask and os.path.isfile(mask) and os.path.getsize(mask) > 0:
+            st = os.stat(mask)
+            ref["mask"] = mask
+            ref["mask_stamp"] = [st.st_size, st.st_mtime_ns]
         return ref
 
     def cmd_extrude(self, req):
@@ -3678,6 +3710,14 @@ def _tip(o):
 
 
 SCAN_FILE = "ScanFile"
+# The points deleted in the window, as a file the document holds (see cmd_scan_mask).
+SCAN_MASK = "ScanMask"
+
+
+def _add_scan_mask(o):
+    if SCAN_MASK not in o.PropertiesList:
+        o.addProperty("App::PropertyFileIncluded", SCAN_MASK, "Scan",
+                      "The points deleted in VibeCAD, one bit a point, in the order of its scan cache")
 
 
 def _is_scan(o):

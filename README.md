@@ -36,7 +36,9 @@ For you:
   mend.
 - **Scans beside the model.** Point clouds and scanned meshes (PLY, STL, OBJ, E57, XYZ/PTS)
   of tens of millions of points, drawn with the model and placed like any object; FreeCAD
-  keeps only the file's path.
+  keeps only the file's path. Select points with a lasso or a click, delete them (undoably,
+  saved in the document, the file untouched), colour them by height or normal, save what is
+  left as PLY.
 - **Large assemblies that open at once.** Boxes first, then the meshes, tessellated by several
   processes and kept in a disk cache.
 
@@ -283,7 +285,7 @@ feature on the way could not be checked whole.
   `set_prop`, `set_props`, `script`, `sketch`, `new_sketch`, `sketch_edit`, `set_visible`, `set_tip`, `undo`, `redo`, `scene`, `save_as`, `export`, the modelling
   ones (`datum_plane`, `extrude`, `fillet`, `mirror`, `pattern`, `copy`, `delete`), `edges`
   and `face` for picking edges and drawing handles, and the agent's (`snapshot`, `timeline`,
-  `slice`, `diff`), `validate`, and `add_scan`. Requests go out as
+  `slice`, `diff`), `validate`, `add_scan` and `scan_mask`. Requests go out as
   they are made; replies come back in order, a scene's stream frames before its reply, except
   that `tree` and `props` asked while a scene streams are answered at once, between its frames,
   so the tree and the properties of a selected part do not wait for a large assembly to load.
@@ -382,7 +384,31 @@ feature on the way could not be checked whole.
   12 million points a frame (`VIBECAD_POINT_BUDGET`) over all scans; points are depth-tested
   with the model. A scan is placed by its own Placement and the parts it sits in, drawn while
   it and every group holding it are visible, lit while it is selected, and read again when its
-  file changes (path, size or time) or turns up after being missing.
+  file changes (path, size or time) or turns up after being missing. The cache has a folder
+  per cache version (`scans/v2`), so builds of other versions keep theirs, and one reading per
+  file: a new one replaces it, broken ones go, and past 16 GB in all the least recently opened
+  go first.
+- **Working on points (SCAN tab).** Each point carries two marks, selected and deleted, two
+  bits in the order of the cache, sixteen points a word, kept in the window and copied to a
+  storage buffer beside the points; the shader colours a selected point orange and drops a
+  deleted one. Select points turns the left button into a lasso (the camera stays on the
+  others): the lasso is filled into a bitmap of the pixels it covers, and every point not
+  deleted is projected and looked up in it, chunk by chunk in parallel, chunks whose box
+  misses the lasso passed over; a click takes the point nearest the eye within 8 pixels.
+  Shift adds, Ctrl removes, Esc clears and then leaves the tool; Del deletes while it is on.
+  Invert works on the scans with a selection (else the selected scan, else all shown), and
+  Delete only on scans shown. Delete points writes the scan's deleted points, one
+  bit each, to a mask file (`VIBEMASK`, the cache version, the count of points and a
+  fingerprint of the scan: its box, origin and every 4096th point) that
+  `scan_mask` copies into the document as the scan's `ScanMask` (an
+  `App::PropertyFileIncluded`): one undo step, saved inside the `.FCStd`, the scan's file left
+  as it is; the tree gives its copy, which the window reads back once the worker has answered
+  (a refused or undone change shows the document's mask again). Restore shows the points at
+  once and sets an empty mask.
+  Save as PLY writes the points left, in document coordinates (x, y, z as doubles), with
+  their normals and colours. How points are drawn (the file's colours, one colour, a ramp
+  over the scan's height, or the direction of their normals; lit or flat; their size) is a
+  setting kept with the others.
 - **Colours and visibility** live in `GuiDocument.xml`, which a headless FreeCAD neither reads
   nor writes. The worker reads them from the file at open and puts that file (and the colour
   files it names) back after a save, with the visibility set in VibeCAD written in, so FreeCAD
@@ -502,7 +528,7 @@ python worker/test_worker.py examples/plate.FCStd  # the worker protocol, agains
 python worker/test_modelling.py                    # the modelling commands, against a real FreeCAD
 python worker/test_sketch.py                       # sketches: make, draw, constrain, drag, extrude
 python worker/test_validate.py                     # validators: a plate with a step, a thin wall, a slit, sharp edges
-python worker/test_scan.py                         # scans: made, moved, saved, found next to the moved document, undone
+python worker/test_scan.py                         # scans: made, moved, masked, saved, found next to the moved document, undone
 python worker/test_mcp.py                          # MCP end to end: opens the window, drives it, closes it
 ```
 
@@ -544,9 +570,12 @@ documents, where the `Pad` steps just report an error.
 - Scans: every point of a scan is held in memory (about 20 bytes a point, twice that while it is
   first read and sorted) and on the GPU; a scan larger than the GPU's memory is not shown, and
   points are not streamed from disk. Measured: 30 million points (a 343 MB PLY) read, sorted,
-  given normals and cached in 7.6 s on 16 cores, then from the cache in 0.1 s. The cache is
-  never trimmed. Text files are read on one thread. Points cannot be picked in the view (a
-  click passes through to the model), and scans are not in the MCP tools yet. The points stay
+  given normals and cached in 7.6 s on 16 cores, then from the cache in 0.1 s. Text files are
+  read on one thread. Without the point tool a click passes through a scan to the model (a
+  scan is selected in the tree), and the lasso takes the points behind others too. The
+  selection is not undone by Ctrl+Z (deleting is). A saved mask names points by their place
+  in the cache, so a VibeCAD that orders points differently (another cache version), or a
+  file changed since, shows every point and says so. Scans are not in the MCP tools yet. The points stay
   in memory after they are on the GPU (the next steps, fitting shapes to them, read them). A
   scan far from the origin keeps its points' spacing (its transform is composed in `f64`),
   but the camera is `f32`, so orbiting a scan millions of millimetres out steps. LAS/LAZ and

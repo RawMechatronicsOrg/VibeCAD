@@ -63,8 +63,27 @@ def main():
         cl.call("undo")
         assert scans(cl)[name]["scan"]["matrix"][3] == 25.0
 
+        # Deleted points: the window's mask file, copied into the document; undone and redone.
+        mask = os.path.join(tmp, "window.mask")
+        with open(mask, "wb") as f:
+            f.write(b"VIBEMASK" + bytes(range(40)))
+        cl.call("scan_mask", obj=name, path=mask)
+        os.remove(mask)  # the document keeps its own copy
+        held = scans(cl)[name]["scan"]
+        assert "mask" in held and open(held["mask"], "rb").read().startswith(b"VIBEMASK"), held
+        cl.call("undo")
+        assert "mask" not in scans(cl)[name]["scan"], "undo left the mask"
+        cl.call("redo")
+        assert "mask" in scans(cl)[name]["scan"], "redo did not bring the mask back"
+        try:
+            cl.call("scan_mask", obj=name, path=os.path.join(tmp, "missing.mask"))
+            raise AssertionError("a missing mask was taken")
+        except RuntimeError as ex:
+            assert "no such file" in str(ex), ex
+
         doc = os.path.join(tmp, "a", "scanned.FCStd")
         cl.call("save_as", path=doc)
+        cl.call("undo")
         cl.call("undo")
         cl.call("undo")
         assert scans(cl) == {}, "undo left the scan"
@@ -78,6 +97,12 @@ def main():
         node = scans(cl)[name]
         assert node["scan"]["found"] and os.path.samefile(node["scan"]["file"], os.path.join(moved, "part.xyz")), node
         assert node["scan"]["matrix"][3] == 25.0, node
+        # The mask was saved inside the document.
+        assert open(node["scan"]["mask"], "rb").read() == b"VIBEMASK" + bytes(range(40)), node
+        cl.call("scan_mask", obj=name, path=None)
+        assert "mask" not in scans(cl)[name]["scan"], "restore left the mask"
+        cl.call("undo")
+        assert "mask" in scans(cl)[name]["scan"]
         cl.call("delete", obj=name)
         assert scans(cl) == {}
         cl.close()

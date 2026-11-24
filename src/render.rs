@@ -346,8 +346,13 @@ struct CloudU {
     normal: mat4x4<f32>,
     // For points without colours of their own.
     color: vec4<f32>,
-    // x: the points have colours, y: the scan is selected
+    // x: the points have colours, y: the scan is selected, z: how points are coloured (0 their
+    // own colours, 1 one colour, 2 by height, 3 by normal), w: lit
     flags: vec4<u32>,
+    // x, y: the heights the colour ramp runs between, z: the points' width, times
+    ramp: vec4<f32>,
+    // Row 2 of the scan's model matrix: a point's height in the document.
+    zrow: vec4<f32>,
 };
 struct CPoint {
     x: f32,
@@ -360,12 +365,15 @@ struct CPoint {
 @group(1) @binding(1) var<uniform> cu: CloudU;
 // Width in pixels per chunk, this frame.
 @group(1) @binding(2) var<storage, read> chunk_sizes: array<f32>;
+// Two bits a point, sixteen a word: 1 selected, 2 deleted (see cloud::marks).
+@group(1) @binding(3) var<storage, read> point_marks: array<u32>;
 
 struct POut {
     @builtin(position) clip: vec4<f32>,
     @location(0) corner: vec2<f32>,
     @location(1) color: vec3<f32>,
     @location(2) normal: vec3<f32>,
+    @location(3) @interpolate(flat) lit: u32,
 };
 
 fn oct_decode(e: u32) -> vec3<f32> {
@@ -377,22 +385,49 @@ fn oct_decode(e: u32) -> vec3<f32> {
     return normalize(n);
 }
 
+// Blue, cyan, green, yellow, red from 0 to 1.
+fn height_ramp(t: f32) -> vec3<f32> {
+    let stops = array<vec3<f32>, 5>(vec3<f32>(0.16, 0.32, 0.86), vec3<f32>(0.12, 0.74, 0.84), vec3<f32>(0.32, 0.78, 0.32),
+                                    vec3<f32>(0.95, 0.84, 0.22), vec3<f32>(0.90, 0.26, 0.16));
+    let x = clamp(t, 0.0, 1.0) * 4.0;
+    let i = min(u32(x), 3u);
+    return mix(stops[i], stops[i + 1u], x - f32(i));
+}
+
 @vertex
 fn vs_point(@builtin(vertex_index) vi: u32, @builtin(instance_index) chunk: u32) -> POut {
     var corners = array<vec2<f32>, 6>(vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0),
                                       vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(-1.0, 1.0));
-    let p = cloud_points[vi / 6u];
+    let i = vi / 6u;
+    let p = cloud_points[i];
     let c = corners[vi % 6u];
-    let clip = cu.mvp * vec4<f32>(p.x, p.y, p.z, 1.0);
     var o: POut;
+    let mark = (point_marks[i / 16u] >> ((i % 16u) * 2u)) & 3u;
+    if ((mark & 2u) != 0u) {
+        o.clip = vec4<f32>(0.0, 0.0, -1.0, 1.0); // deleted: outside the view
+        return o;
+    }
+    let pos = vec4<f32>(p.x, p.y, p.z, 1.0);
+    let clip = cu.mvp * pos;
     // `size` pixels across: half of it in NDC units is size / viewport.
-    o.clip = vec4<f32>(clip.xy + c * chunk_sizes[chunk] / u.view.xy * clip.w, clip.zw);
+    o.clip = vec4<f32>(clip.xy + c * chunk_sizes[chunk] * cu.ramp.z / u.view.xy * clip.w, clip.zw);
     o.corner = c;
-    o.color = select(cu.color.rgb, unpack4x8unorm(p.color).rgb, cu.flags.x != 0u);
+    let n = mat3x3<f32>(cu.normal[0].xyz, cu.normal[1].xyz, cu.normal[2].xyz) * oct_decode(p.normal);
+    switch cu.flags.z {
+        case 0u: { o.color = select(cu.color.rgb, unpack4x8unorm(p.color).rgb, cu.flags.x != 0u); }
+        case 2u: { o.color = height_ramp((dot(cu.zrow, pos) - cu.ramp.x) / max(cu.ramp.y - cu.ramp.x, 1e-6)); }
+        // Fitted normals face either way: their direction, not their sense.
+        case 3u: { o.color = abs(normalize(n)) * 0.8 + 0.15; }
+        default: { o.color = cu.color.rgb; }
+    }
     if (cu.flags.y != 0u) {
         o.color = mix(o.color, vec3<f32>(0.35, 0.85, 0.45), 0.35);
     }
-    o.normal = mat3x3<f32>(cu.normal[0].xyz, cu.normal[1].xyz, cu.normal[2].xyz) * oct_decode(p.normal);
+    if ((mark & 1u) != 0u) {
+        o.color = vec3<f32>(1.0, 0.55, 0.08);
+    }
+    o.normal = n;
+    o.lit = cu.flags.w;
     return o;
 }
 
@@ -400,6 +435,9 @@ fn vs_point(@builtin(vertex_index) vi: u32, @builtin(instance_index) chunk: u32)
 fn fs_point(v: POut) -> @location(0) vec4<f32> {
     if (dot(v.corner, v.corner) > 1.0) {
         discard;
+    }
+    if (v.lit == 0u) {
+        return vec4<f32>(v.color, 1.0);
     }
     var n = select(vec3<f32>(0.0, 0.0, 1.0), normalize(v.normal), dot(v.normal, v.normal) > 1e-20);
     let to_eye = -u.light.xyz;
@@ -589,6 +627,50 @@ struct CloudUniforms {
     normal: [[f32; 4]; 4],
     color: [f32; 4],
     flags: [u32; 4],
+    ramp: [f32; 4],
+    zrow: [f32; 4],
+}
+
+/// How points take their colour.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub enum ScanColor {
+    /// The file's colours, else one colour.
+    #[default]
+    File,
+    Single,
+    /// A ramp from the lowest point of the scan to its highest.
+    Height,
+    /// The normal's direction: faces turned alike look alike.
+    Normal,
+}
+
+impl ScanColor {
+    pub const ALL: [ScanColor; 4] = [ScanColor::File, ScanColor::Single, ScanColor::Height, ScanColor::Normal];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ScanColor::File => "File colours",
+            ScanColor::Single => "One colour",
+            ScanColor::Height => "Height",
+            ScanColor::Normal => "Normal",
+        }
+    }
+}
+
+/// How scans are drawn: for all of them, kept with the settings.
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ScanDisplay {
+    pub color: ScanColor,
+    /// Lit as a surface by their normals, or flat.
+    pub lit: bool,
+    /// The points' width, times.
+    pub size: f32,
+}
+
+impl Default for ScanDisplay {
+    fn default() -> Self {
+        ScanDisplay { color: ScanColor::File, lit: true, size: 1.0 }
+    }
 }
 
 /// A scan to draw this frame.
@@ -598,12 +680,17 @@ pub struct CloudDraw {
     /// Scan coordinates (around the scan's origin) to document coordinates.
     pub model: DMat4,
     pub selected: bool,
+    /// The scan's lowest and highest point, in document z: the height ramp's ends.
+    pub heights: (f32, f32),
 }
 
 /// Points of consecutive chunks in one storage buffer.
 struct CloudGroup {
     bind: wgpu::BindGroup,
     _points: wgpu::Buffer,
+    /// Its points' marks, `marks[first..]` of the scan's.
+    marks: wgpu::Buffer,
+    first: usize,
 }
 
 struct GpuChunk {
@@ -628,6 +715,8 @@ struct GpuCloud {
     sizes_cpu: Vec<f32>,
     /// This frame: (group, chunk, points to draw).
     draws: Vec<(u32, u32, u32)>,
+    /// The marks of all its points, two bits each (see cloud::marks).
+    marks: Vec<u32>,
 }
 
 pub struct Renderer {
@@ -679,6 +768,7 @@ pub struct Frame {
     pub background: [f64; 3],
     pub grid: Option<GroundGrid>,
     pub clouds: Vec<CloudDraw>,
+    pub scan_display: ScanDisplay,
 }
 
 impl Renderer {
@@ -900,6 +990,7 @@ impl Renderer {
                     count: None,
                 },
                 read_only(2),
+                read_only(3),
             ],
         });
         let point_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1170,6 +1261,7 @@ impl Renderer {
             mapped_at_creation: false,
         });
         let gpu = GpuCloud {
+            marks: vec![0; cloud.points.len().div_ceil(16).max(1)],
             has_color: cloud.header.has_color,
             source: Some(cloud),
             groups: Vec::new(),
@@ -1186,6 +1278,19 @@ impl Renderer {
 
     pub fn remove_cloud(&mut self, key: u64) {
         self.clouds.remove(&key);
+    }
+
+    /// New marks (selected, deleted) for a scan's points, as `cloud::marks::Marks::words`.
+    pub fn set_cloud_marks(&mut self, key: u64, words: &[u32]) {
+        let Some(c) = self.clouds.get_mut(&key) else { return };
+        let n = words.len().min(c.marks.len());
+        c.marks[..n].copy_from_slice(&words[..n]);
+        for g in &c.groups {
+            let end = (g.first + c.group_points / 16).min(c.marks.len());
+            if g.first < end {
+                self.queue.write_buffer(&g.marks, 0, bytemuck::cast_slice(&c.marks[g.first..end]));
+            }
+        }
     }
 
     /// Whether every point of this scan is on the GPU.
@@ -1213,6 +1318,13 @@ impl Renderer {
             contents: bytemuck::cast_slice(contents),
             usage: wgpu::BufferUsages::STORAGE,
         });
+        let first = range.start / 16;
+        let words = &c.marks[first.min(c.marks.len())..range.end.div_ceil(16).clamp(first + 1, c.marks.len())];
+        let marks = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("vibecad scan marks"),
+            contents: bytemuck::cast_slice(words),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
         let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("vibecad scan bindings"),
             layout: &self.cloud_layout,
@@ -1220,9 +1332,10 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 0, resource: points.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: c.uniform.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: c.sizes.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: marks.as_entire_binding() },
             ],
         });
-        c.groups.push(CloudGroup { bind, _points: points });
+        c.groups.push(CloudGroup { bind, _points: points, marks, first });
         if range.end >= src.points.len() {
             c.source = None;
         }
@@ -1278,11 +1391,20 @@ impl Renderer {
             let Some(c) = self.clouds.get(&d.key) else { continue };
             let n = Mat3::from_mat4(d.model.as_mat4());
             let n = if n.determinant().abs() > 1e-20 { n.inverse().transpose() } else { n };
+            let show = f.scan_display;
+            let color = match show.color {
+                ScanColor::File => 0,
+                ScanColor::Single => 1,
+                ScanColor::Height => 2,
+                ScanColor::Normal => 3,
+            };
             let u = CloudUniforms {
                 mvp: (vp.as_dmat4() * d.model).as_mat4().to_cols_array_2d(),
                 normal: Mat4::from_mat3(n).to_cols_array_2d(),
                 color: SCAN_COLOR,
-                flags: [c.has_color as u32, d.selected as u32, 0, 0],
+                flags: [c.has_color as u32, d.selected as u32, color, show.lit as u32],
+                ramp: [d.heights.0, d.heights.1, show.size.clamp(0.25, 8.0), 0.0],
+                zrow: d.model.row(2).as_vec4().to_array(),
             };
             self.queue.write_buffer(&c.uniform, 0, bytemuck::bytes_of(&u));
             if !c.sizes_cpu.is_empty() {

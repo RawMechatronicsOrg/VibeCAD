@@ -25,13 +25,17 @@ use serde::{Deserialize, Serialize};
 
 pub mod formats;
 pub mod kd;
+pub mod marks;
 
 /// Points per chunk: the unit of culling and of level of detail.
 pub const CHUNK: usize = 1 << 15;
 /// Neighbours a normal is fitted to.
 const NORMAL_NEIGHBOURS: usize = 12;
-/// Bumped whenever the cache's layout or its building changes.
-const CACHE_VERSION: u32 = 1;
+/// Bumped whenever the cache's layout or the order of its points changes: saved masks of
+/// deleted points (see `marks`) name points by their place in that order.
+pub const CACHE_VERSION: u32 = 2;
+/// Scan caches past this many bytes in all are dropped, least recently used first.
+const CACHE_LIMIT: u64 = 16 << 30;
 const MAGIC: &[u8; 8] = b"VIBESCAN";
 
 /// One point as stored, in the cache and on the GPU (`CPoint` in the shader).
@@ -56,6 +60,9 @@ pub struct Chunk {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Header {
     version: u32,
+    /// The file read, canonical: a new reading of it replaces the cache of the old one.
+    #[serde(default)]
+    source: String,
     source_len: u64,
     source_mtime_ns: u128,
     pub format: String,
@@ -86,6 +93,19 @@ impl Cloud {
     pub fn origin(&self) -> DVec3 {
         DVec3::from(self.header.origin)
     }
+
+    /// What tells this reading of a file from another with as many points: its box, its
+    /// origin and every 4096th point, in order. A saved mask carries it.
+    pub fn fingerprint(&self) -> u64 {
+        let mut h = Fnv(0xcbf2_9ce4_8422_2325);
+        h.write(bytemuck::cast_slice(&self.header.origin));
+        h.write(bytemuck::cast_slice(&self.header.lo));
+        h.write(bytemuck::cast_slice(&self.header.hi));
+        for p in self.points.iter().step_by(4096) {
+            h.write(bytemuck::bytes_of(p));
+        }
+        h.finish()
+    }
 }
 
 /// How far a load is: bytes of the source read, of its length.
@@ -98,10 +118,12 @@ pub struct Progress {
     pub cancel: AtomicBool,
 }
 
-/// Where scans are cached: next to the worker's mesh cache.
+/// Where scans are cached: next to the worker's mesh cache, a folder per cache version, so
+/// builds of other versions side by side keep their own.
 pub fn cache_dir() -> Option<PathBuf> {
+    let version = format!("v{CACHE_VERSION}");
     if let Some(d) = std::env::var_os("VIBECAD_CACHE_DIR") {
-        return Some(PathBuf::from(d).join("scans"));
+        return Some(PathBuf::from(d).join("scans").join(version));
     }
     let base = if cfg!(windows) {
         PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("VibeCAD").join("cache")
@@ -110,7 +132,7 @@ pub fn cache_dir() -> Option<PathBuf> {
     } else {
         std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from).or_else(|| Some(PathBuf::from(std::env::var_os("HOME")?).join(".cache")))?.join("vibecad")
     };
-    Some(base.join("scans"))
+    Some(base.join("scans").join(version))
 }
 
 /// The scan in `path`, from the cache when it has this file as it is now, else read and cached.
@@ -121,10 +143,13 @@ pub fn load(path: &Path, cache: Option<&Path>, progress: &Progress) -> Result<Cl
     progress.total.store(meta.len(), std::sync::atomic::Ordering::Relaxed);
     let cache_file = cache.map(|d| d.join(format!("{:016x}.scan", cache_key(path, meta.len(), mtime))));
     if let Some(f) = &cache_file
+        // Used: the last to go when the cache is trimmed, also while it is read.
+        && std::fs::File::options().write(true).open(f).and_then(|f| f.set_modified(std::time::SystemTime::now())).is_ok()
         && let Ok(mut c) = read_cache(f)
         && c.header.source_len == meta.len()
         && c.header.source_mtime_ns == mtime
     {
+        prune(f, &c.header.source, CACHE_LIMIT);
         c.load_ms = started.elapsed().as_secs_f64() * 1e3;
         return Ok(c);
     }
@@ -132,22 +157,27 @@ pub fn load(path: &Path, cache: Option<&Path>, progress: &Progress) -> Result<Cl
     let mut cloud = build(imported, progress)?;
     cloud.header.source_len = meta.len();
     cloud.header.source_mtime_ns = mtime;
+    cloud.header.source = canonical(path);
     if let Some(f) = &cache_file {
         progress.stage.store(3, std::sync::atomic::Ordering::Relaxed);
         // A cache that cannot be written only costs the next load its time.
-        if let Err(e) = write_cache(f, &cloud) {
-            eprintln!("scan cache {}: {e:#}", f.display());
+        match write_cache(f, &cloud) {
+            Ok(()) => prune(f, &cloud.header.source, CACHE_LIMIT),
+            Err(e) => eprintln!("scan cache {}: {e:#}", f.display()),
         }
     }
     cloud.load_ms = started.elapsed().as_secs_f64() * 1e3;
     Ok(cloud)
 }
 
+fn canonical(path: &Path) -> String {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()).to_string_lossy().into_owned()
+}
+
 fn cache_key(path: &Path, len: u64, mtime: u128) -> u64 {
-    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     // FNV-1a over the path and what identifies its contents.
     let mut h = Fnv(0xcbf2_9ce4_8422_2325);
-    h.write(canonical.to_string_lossy().as_bytes());
+    h.write(canonical(path).as_bytes());
     h.write(&len.to_le_bytes());
     h.write(&mtime.to_le_bytes());
     h.write(&CACHE_VERSION.to_le_bytes());
@@ -180,7 +210,9 @@ pub fn build(imported: formats::Imported, progress: &Progress) -> Result<Cloud> 
     // Morton order over the cube around the points.
     let side = (hi - lo).max_element().max(1e-9);
     let scale = ((1u32 << 21) - 1) as f32 / side;
-    points.par_sort_unstable_by_key(|p| morton(((Vec3::from(p.pos) - lo) * scale).as_uvec3().to_array()));
+    // Points of one cell are ordered by all they hold, so the order is the same on every
+    // reading: a saved mask names points by it.
+    points.par_sort_unstable_by_key(|p| (morton(((Vec3::from(p.pos) - lo) * scale).as_uvec3().to_array()), p.pos.map(f32::to_bits), p.color, p.normal));
     points.par_chunks_mut(CHUNK).enumerate().for_each(|(k, c)| shuffle(c, k as u64));
     if progress.cancel.load(Relaxed) {
         bail!("cancelled");
@@ -202,6 +234,7 @@ pub fn build(imported: formats::Imported, progress: &Progress) -> Result<Cloud> 
         .collect();
     let header = Header {
         version: CACHE_VERSION,
+        source: String::new(),
         source_len: 0,
         source_mtime_ns: 0,
         format: format.to_string(),
@@ -326,7 +359,6 @@ pub fn oct_encode(n: [f32; 3]) -> u32 {
     q(x) | q(y) << 16
 }
 
-#[cfg(test)]
 pub fn oct_decode(e: u32) -> Vec3 {
     let f = |b: u32| ((b & 0xffff) as u16 as i16) as f32 / 32767.0;
     let (x, y) = (f(e), f(e >> 16));
@@ -357,8 +389,49 @@ fn write_cache(path: &Path, c: &Cloud) -> Result<()> {
     Ok(())
 }
 
-fn read_cache(path: &Path) -> Result<Cloud> {
-    let mut r = BufReader::with_capacity(1 << 20, std::fs::File::open(path)?);
+/// After a cache is written or read: drop the older readings of the same file, broken caches,
+/// files left half written for a day, and then the least recently used caches until all fit
+/// in `limit`. A cache that cannot be opened now (another program holds it) is left alone.
+fn prune(written: &Path, source: &str, limit: u64) {
+    let Some(dir) = written.parent() else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let day = std::time::Duration::from_secs(24 * 3600);
+    let mut kept: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
+    let mut total = std::fs::metadata(written).map_or(0, |m| m.len());
+    for e in entries.flatten() {
+        let p = e.path();
+        let Ok(meta) = e.metadata() else { continue };
+        let modified = meta.modified().unwrap_or(UNIX_EPOCH);
+        match p.extension().and_then(|x| x.to_str()) {
+            Some("part") if modified.elapsed().is_ok_and(|age| age > day) => {
+                let _ = std::fs::remove_file(&p);
+            }
+            Some("scan") if p != written => match std::fs::File::open(&p).map(|f| header_of(&mut BufReader::new(f))) {
+                Err(_) => {} // held by another program: left alone
+                Ok(Ok(h)) if h.source != source => {
+                    total += meta.len();
+                    kept.push((modified, meta.len(), p));
+                }
+                // Another reading of the same file, or a broken cache.
+                Ok(_) => {
+                    let _ = std::fs::remove_file(&p);
+                }
+            },
+            _ => {}
+        }
+    }
+    kept.sort_by_key(|k| k.0);
+    for (_, len, p) in kept {
+        if total <= limit {
+            break;
+        }
+        if std::fs::remove_file(&p).is_ok() {
+            total -= len;
+        }
+    }
+}
+
+fn header_of(r: &mut impl Read) -> Result<Header> {
     let mut magic = [0u8; 8];
     r.read_exact(&mut magic)?;
     if &magic != MAGIC {
@@ -376,6 +449,12 @@ fn read_cache(path: &Path) -> Result<Cloud> {
     if header.version != CACHE_VERSION {
         bail!("scan cache of another version");
     }
+    Ok(header)
+}
+
+fn read_cache(path: &Path) -> Result<Cloud> {
+    let mut r = BufReader::with_capacity(1 << 20, std::fs::File::open(path)?);
+    let header = header_of(&mut r)?;
     let n = header.chunks.last().map_or(0, |c| c.start as usize + c.count as usize);
     let mut points = vec![Point::zeroed(); n];
     r.read_exact(bytemuck::cast_slice_mut(&mut points))?;
@@ -475,6 +554,40 @@ mod tests {
         let third = load(&src, Some(&cache), &Progress::default()).unwrap();
         assert!(!third.from_cache);
         assert_eq!(third.points.len(), 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_keeps_one_reading_per_file_within_its_limit() {
+        let dir = std::env::temp_dir().join(format!("vibecad-scan-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = dir.join("cache");
+        let file = |name: &str, n: usize| {
+            let f = dir.join(name);
+            std::fs::write(&f, (0..n).map(|i| format!("{i} {} 0
+", i % 7)).collect::<String>()).unwrap();
+            f
+        };
+        let caches = || std::fs::read_dir(&cache).unwrap().filter(|e| e.as_ref().unwrap().path().extension().is_some_and(|x| x == "scan")).count();
+        let a = file("a.xyz", 100);
+        load(&a, Some(&cache), &Progress::default()).unwrap();
+        // a new reading of the same file replaces the old one
+        file("a.xyz", 120);
+        load(&a, Some(&cache), &Progress::default()).unwrap();
+        assert_eq!(caches(), 1);
+        load(&file("b.xyz", 100), Some(&cache), &Progress::default()).unwrap();
+        assert_eq!(caches(), 2);
+        // over the limit: the least recently used goes, never the one just written
+        let newest = cache.join(format!("{:016x}.scan", {
+            let c = file("c.xyz", 100);
+            load(&c, Some(&cache), &Progress::default()).unwrap();
+            let m = std::fs::metadata(&c).unwrap();
+            cache_key(&c, m.len(), m.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_nanos())
+        }));
+        prune(&newest, "nothing else", 1);
+        assert_eq!(caches(), 1);
+        assert!(newest.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

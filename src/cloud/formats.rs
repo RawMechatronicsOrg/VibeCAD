@@ -540,6 +540,57 @@ fn e57(path: &Path, sink: &mut Sink, read: &AtomicU64) -> Result<(bool, bool)> {
     Ok((has_color, false))
 }
 
+// ---- writing ---------------------------------------------------------------------------
+
+/// Write the points of a scan not deleted as a binary PLY, in document coordinates (`model`
+/// takes scan coordinates there): x, y, z as doubles, the normals, the colours when it has them.
+/// Returns how many points were written.
+pub fn write_ply(path: &Path, cloud: &super::Cloud, marks: &super::marks::Marks, model: glam::DMat4) -> Result<usize> {
+    use std::io::Write as _;
+    let keep = cloud.points.len().saturating_sub(marks.deleted());
+    let color = cloud.header.has_color;
+    let mut head = format!(
+        "ply\nformat binary_little_endian 1.0\ncomment VibeCAD scan, document coordinates in mm\nelement vertex {keep}\n\
+         property double x\nproperty double y\nproperty double z\nproperty float nx\nproperty float ny\nproperty float nz\n"
+    );
+    if color {
+        head += "property uchar red\nproperty uchar green\nproperty uchar blue\n";
+    }
+    head += "end_header\n";
+    let tmp = path.with_extension("ply.part");
+    let rotate = glam::DMat3::from_mat4(model);
+    let rotate = if rotate.determinant().abs() > 1e-20 { rotate.inverse().transpose() } else { rotate };
+    let mut written = 0;
+    let result = (|| -> Result<()> {
+        let mut w = std::io::BufWriter::with_capacity(1 << 20, File::create(&tmp).with_context(|| format!("cannot write {}", tmp.display()))?);
+        w.write_all(head.as_bytes())?;
+        let mut rec = Vec::with_capacity(39);
+        for (i, p) in cloud.points.iter().enumerate() {
+            if marks.get(i) & super::marks::DELETED != 0 {
+                continue;
+            }
+            rec.clear();
+            let q = model.transform_point3(glam::DVec3::from(p.pos.map(f64::from)));
+            q.to_array().iter().for_each(|v| rec.extend(v.to_le_bytes()));
+            let n = (rotate * super::oct_decode(p.normal).as_dvec3()).normalize_or_zero().as_vec3();
+            n.to_array().iter().for_each(|v| rec.extend(v.to_le_bytes()));
+            if color {
+                rec.extend(&p.color.to_le_bytes()[..3]);
+            }
+            w.write_all(&rec)?;
+            written += 1;
+        }
+        w.flush()?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, path).with_context(|| format!("cannot write {}", path.display()))?;
+    Ok(written)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,6 +714,37 @@ mod tests {
         let len = b.len() as u64;
         let pts = run(|s| stl(&mut Cursor::new(b), len, s));
         assert_eq!(pts.len(), 3);
+    }
+
+    #[test]
+    fn written_ply_reads_back_without_the_deleted_points() {
+        let pts: Vec<[f64; 3]> = (0..100).map(|i| [i as f64, 2.0 * i as f64, 1.0]).collect();
+        let imported = Imported {
+            base: pts[0],
+            points: pts.iter().map(|p| Point { pos: [p[0] as f32, p[1] as f32, 0.0], color: rgba([1, 2, 3]), normal: oct_encode([0.0, 0.0, 1.0]) }).collect(),
+            has_color: true,
+            has_normals: true,
+            format: "test",
+        };
+        let cloud = super::super::build(imported, &super::super::Progress::default()).unwrap();
+        let mut marks = super::super::marks::Marks::new(cloud.points.len());
+        let chunks = cloud.header.chunks.clone();
+        marks.select(&cloud.points, &chunks, super::super::marks::Op::Replace, |_| true, |p| p.pos[0] < 0.0);
+        let selected = marks.selected();
+        marks.delete_selected();
+        let dir = std::env::temp_dir().join(format!("vibecad-ply-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("out.ply");
+        // moved 1000 along x in the document
+        let model = glam::DMat4::from_translation(glam::DVec3::new(1000.0, 0.0, 0.0)) * glam::DMat4::from_translation(cloud.origin());
+        assert_eq!(write_ply(&f, &cloud, &marks, model).unwrap(), 100 - selected);
+        let cancel = AtomicBool::new(false);
+        let back = read(&f, &AtomicU64::new(0), &cancel).unwrap();
+        assert_eq!((back.points.len(), back.has_color, back.has_normals), (100 - selected, true, true));
+        let xs: Vec<f64> = back.points.iter().map(|p| back.base[0] + p.pos[0] as f64).collect();
+        assert!(xs.iter().all(|x| (1049.0..=1099.0).contains(x)), "only the kept half, moved: {xs:?}");
+        assert_eq!(back.points[0].color, rgba([1, 2, 3]));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
