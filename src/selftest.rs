@@ -1,5 +1,5 @@
-//! `VIBECAD_SELFTEST=<dir>`: drive the window through zoom, pick, select, edit, undo, an extrude
-//! and a construction plane with the
+//! `VIBECAD_SELFTEST=<dir>`: drive the window through zoom, pick, select, edit, undo, an extrude,
+//! a construction plane and a sketch drawn in sketch mode (with a picture of the whole window) with the
 //! same code the mouse and the property panel use, write frames as BMP and a `report.json`, then
 //! quit. The edit steps are meant for the sample `examples/plate.FCStd` (a Pad under a Pocket);
 //! the view and performance steps work on any document.
@@ -18,8 +18,16 @@ pub enum Stage {
     Undo,
     Extrude,
     Plane,
+    /// A sketch on the plate's top face, drawn with the tools as clicks would draw it.
+    Sketch,
+    SketchDraw,
+    SketchShot,
+    SketchSaved,
     Done,
 }
+
+/// A screenshot of the window: width, height, RGBA rows.
+pub type Window = std::sync::Arc<std::sync::Mutex<Option<(u32, u32, Vec<u8>)>>>;
 
 pub struct SelfTest {
     pub dir: PathBuf,
@@ -29,13 +37,15 @@ pub struct SelfTest {
     /// Frames kept while the first scene streamed in: boxes only, then some meshes.
     pub seen_boxes: bool,
     pub seen_partial: bool,
+    /// The whole window as egui drew it (overlays included), once a screenshot came back.
+    pub window: Window,
 }
 
 impl SelfTest {
     pub fn from_env() -> Option<Self> {
         let dir = PathBuf::from(std::env::var_os("VIBECAD_SELFTEST")?);
         std::fs::create_dir_all(&dir).ok()?;
-        Some(SelfTest { dir, stage: Stage::WaitScene, report: json!({ "steps": [] }), frames_idle: 0, seen_boxes: false, seen_partial: false })
+        Some(SelfTest { dir, stage: Stage::WaitScene, report: json!({ "steps": [] }), frames_idle: 0, seen_boxes: false, seen_partial: false, window: Window::default() })
     }
 
     pub fn log(&mut self, step: &str, data: Value) {

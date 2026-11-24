@@ -7,6 +7,7 @@ use glam::Vec3;
 use crate::camera::Camera;
 use crate::modelling::{self, Op};
 use crate::navigation::Scheme;
+use crate::sketcher::Tool;
 
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Tab {
@@ -50,6 +51,19 @@ pub enum Action {
     Command(Op),
     /// Delete the selected object.
     Delete,
+    /// In sketch mode: draw with this tool, or (None) pick elements.
+    SketchTool(Option<Tool>),
+    /// Picked sketch elements become construction geometry, or back.
+    SketchConstruction,
+    SketchDelete,
+    FinishSketch,
+}
+
+/// The ribbon while a sketch is edited.
+pub struct SketchRibbon {
+    pub label: String,
+    pub tool: Option<Tool>,
+    pub picked: usize,
 }
 
 /// What the ribbon needs to know to enable and mark its buttons.
@@ -74,6 +88,8 @@ pub struct RibbonState {
     pub agent_calls: usize,
     pub agent_running: bool,
     pub navigation: Scheme,
+    /// A sketch is being edited: the ribbon holds its tools instead of the tabs' buttons.
+    pub sketch: Option<SketchRibbon>,
 }
 
 pub fn ribbon(ui: &mut egui::Ui, tab: &mut Tab, s: &RibbonState, status: impl FnOnce(&mut egui::Ui)) -> Vec<Action> {
@@ -81,6 +97,9 @@ pub fn ribbon(ui: &mut egui::Ui, tab: &mut Tab, s: &RibbonState, status: impl Fn
     ui.horizontal(|ui| {
         ui.label(RichText::new("VibeCAD").strong());
         ui.add_space(12.0);
+        if let Some(sk) = &s.sketch {
+            let _ = ui.selectable_label(true, RichText::new(format!("SKETCH · {}", sk.label)).small().strong().color(Color32::from_rgb(230, 140, 50)));
+        }
         for (t, name) in [(Tab::File, "FILE"), (Tab::Edit, "EDIT"), (Tab::View, "VIEW"), (Tab::Agentic, "AGENTIC")] {
             let mut text = RichText::new(name).small().strong();
             if t == Tab::Agentic && s.agent_running {
@@ -95,6 +114,10 @@ pub fn ribbon(ui: &mut egui::Ui, tab: &mut Tab, s: &RibbonState, status: impl Fn
     ui.add_space(2.0);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
+        if let Some(sk) = &s.sketch {
+            sketch_groups(ui, &mut out, sk);
+            return;
+        }
         match tab {
             Tab::File => {
                 group(ui, "DOCUMENT", |ui| {
@@ -121,7 +144,10 @@ pub fn ribbon(ui: &mut egui::Ui, tab: &mut Tab, s: &RibbonState, status: impl Fn
                     button(ui, &mut out, Action::Command(op), Icon::Op(op), op.label(), s.has_doc, s.command == Some(op), op.hint());
                 };
                 group(ui, "CONSTRUCT", |ui| command(ui, Op::Plane));
-                group(ui, "CREATE", |ui| command(ui, Op::Extrude));
+                group(ui, "CREATE", |ui| {
+                    command(ui, Op::Sketch);
+                    command(ui, Op::Extrude);
+                });
                 group(ui, "MODIFY", |ui| {
                     command(ui, Op::Fillet);
                     command(ui, Op::Chamfer);
@@ -220,6 +246,26 @@ pub fn ribbon(ui: &mut egui::Ui, tab: &mut Tab, s: &RibbonState, status: impl Fn
     out
 }
 
+/// The ribbon in sketch mode: the drawing tools, then what acts on picked elements, then Finish.
+fn sketch_groups(ui: &mut egui::Ui, out: &mut Vec<Action>, sk: &SketchRibbon) {
+    group(ui, "SELECT", |ui| {
+        button(ui, out, Action::SketchTool(None), Icon::Pick, "Select", true, sk.tool.is_none(), "Pick elements: click, Ctrl or Shift adds (Esc)");
+    });
+    group(ui, "CREATE", |ui| {
+        for t in Tool::ALL {
+            let on = sk.tool == Some(t);
+            button(ui, out, Action::SketchTool(if on { None } else { Some(t) }), Icon::Tool(t), t.label(), true, on, t.hint());
+        }
+    });
+    group(ui, "MODIFY", |ui| {
+        button(ui, out, Action::SketchConstruction, Icon::Construction, "Construction", sk.picked > 0, false, "Picked elements become guides, never part of a profile; or back (X)");
+        button(ui, out, Action::SketchDelete, Icon::Delete, "Delete", sk.picked > 0, false, "Delete the picked elements (Del)");
+    });
+    group(ui, "FINISH", |ui| {
+        button(ui, out, Action::FinishSketch, Icon::Finish, "Finish sketch", true, false, "Leave the sketch (Esc with nothing picked)");
+    });
+}
+
 /// A row of buttons with a caption under it, as wide as the buttons.
 fn group(ui: &mut egui::Ui, caption: &str, add: impl FnOnce(&mut egui::Ui)) {
     ui.vertical(|ui| {
@@ -255,6 +301,10 @@ enum Icon {
     Copy,
     Op(Op),
     Delete,
+    Pick,
+    Tool(Tool),
+    Construction,
+    Finish,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -403,6 +453,53 @@ fn paint_icon(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
             poly(&[(0.35, 0.25), (0.35, 0.05), (0.9, 0.05), (0.9, 0.75), (0.65, 0.75)], false);
         }
         Icon::Op(op) => modelling::paint_icon(p, r, op, c),
+        Icon::Pick => {
+            // An arrow pointer.
+            poly(&[(0.25, 0.05), (0.25, 0.85), (0.45, 0.65), (0.6, 0.95), (0.72, 0.9), (0.57, 0.6), (0.85, 0.6)], true);
+        }
+        Icon::Tool(t) => {
+            let dot = |x: f32, y: f32| p.circle_filled(at(x, y), 2.0, c);
+            match t {
+                Tool::Line => {
+                    p.line_segment([at(0.1, 0.85), at(0.9, 0.15)], s);
+                    dot(0.1, 0.85);
+                    dot(0.9, 0.15);
+                }
+                Tool::Rectangle => {
+                    poly(&[(0.1, 0.2), (0.9, 0.2), (0.9, 0.8), (0.1, 0.8)], true);
+                    dot(0.1, 0.8);
+                    dot(0.9, 0.2);
+                }
+                Tool::CenterRectangle => {
+                    poly(&[(0.1, 0.2), (0.9, 0.2), (0.9, 0.8), (0.1, 0.8)], true);
+                    dot(0.5, 0.5);
+                    dot(0.9, 0.2);
+                }
+                Tool::Circle => {
+                    p.circle_stroke(at(0.5, 0.5), r.width() * 0.42, s);
+                    dot(0.5, 0.5);
+                }
+                Tool::Arc => {
+                    p.add(egui::Shape::line(arc(0.5, 0.75, 0.42, std::f32::consts::PI, 2.0 * std::f32::consts::PI), s));
+                    dot(0.08, 0.75);
+                    dot(0.92, 0.75);
+                    dot(0.5, 0.33);
+                }
+                Tool::Point => {
+                    p.circle_filled(at(0.5, 0.5), 3.5, c);
+                    p.line_segment([at(0.2, 0.5), at(0.35, 0.5)], s);
+                    p.line_segment([at(0.65, 0.5), at(0.8, 0.5)], s);
+                }
+            }
+        }
+        Icon::Construction => {
+            let pts = vec![at(0.05, 0.9), at(0.95, 0.1)];
+            p.extend(egui::Shape::dashed_line(&pts, Stroke::new(1.5, Color32::from_rgb(230, 140, 50)), 4.0, 3.0));
+            p.circle_stroke(at(0.5, 0.5), r.width() * 0.3, Stroke::new(1.0, c));
+        }
+        Icon::Finish => {
+            poly(&[(0.12, 0.5), (0.4, 0.8), (0.9, 0.15)], false);
+        }
         Icon::Delete => modelling::paint_delete(p, r, c),
         Icon::Log => {
             poly(&[(0.15, 0.05), (0.85, 0.05), (0.85, 0.95), (0.15, 0.95)], true);

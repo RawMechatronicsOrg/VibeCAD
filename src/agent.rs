@@ -492,6 +492,7 @@ pub fn without_profile_outlines(v: &Value) -> Value {
         for p in ps.iter_mut().filter_map(Value::as_object_mut) {
             p.remove("outer");
             p.remove("inner");
+            p.remove("mesh");
         }
     }
     v

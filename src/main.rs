@@ -20,6 +20,7 @@ mod profile;
 mod render;
 mod scene;
 mod selftest;
+mod sketcher;
 mod ui_chrome;
 mod worker;
 

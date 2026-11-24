@@ -16,10 +16,12 @@ use crate::profile::{Profile, Settings};
 use crate::render::{Frame, GroundGrid, Renderer};
 use crate::scene::SceneData;
 use crate::selftest::{SelfTest, Stage, write_bmp};
-use crate::ui_chrome::{self, Action, CubeAction, RibbonState, Tab};
+use crate::sketcher::Tool;
+use crate::ui_chrome::{self, Action, CubeAction, RibbonState, SketchRibbon, Tab};
 use crate::worker::{Body, Event, Part, Progress, Worker};
 
 mod handles;
+mod sketch_mode;
 
 #[derive(Clone)]
 enum Pending {
@@ -39,6 +41,10 @@ enum Pending {
     Export,
     /// A read-only call of the agent; its answer goes back to the agent only.
     AgentQuery,
+    /// The sketch being edited, described again.
+    SketchData,
+    /// A change to the sketch being edited, adding this many elements.
+    SketchEdit(usize),
 }
 
 /// A tool call of the agent waiting for the worker.
@@ -74,6 +80,7 @@ struct Tree {
 }
 
 const BODY: &str = "PartDesign::Body";
+const SKETCH: &str = "Sketcher::SketchObject";
 
 impl Tree {
     /// The tree lists parts; what a body is built from goes to the timeline. A feature holds
@@ -228,6 +235,8 @@ pub struct App {
     plane_outlines: Vec<(String, Vec<egui::Pos2>)>,
     /// Edges and drag handles in the view.
     gizmos: handles::Gizmos,
+    /// The sketch being edited in place, when one is.
+    sketch: Option<sketch_mode::SketchMode>,
 }
 
 impl App {
@@ -286,6 +295,7 @@ impl App {
             command: None,
             plane_outlines: Vec::new(),
             gizmos: handles::Gizmos::default(),
+            sketch: None,
         }
     }
 
@@ -458,6 +468,9 @@ impl App {
             .or_else(|| scene?.data.bbox);
         let size = bbox.map(|(lo, hi)| (hi - lo).to_array());
         self.command = Some(Command::new(op, selection, size));
+        if self.command.as_ref().is_some_and(Command::starts_now) {
+            self.run_command();
+        }
     }
 
     fn run_command(&mut self) {
@@ -491,6 +504,9 @@ impl App {
             c.take(pick);
         }
         self.select(Some(s));
+        if self.command.as_ref().is_some_and(Command::starts_now) && !self.pending.values().any(|p| matches!(p, Pending::Create)) {
+            self.run_command();
+        }
     }
 
     /// The construction plane drawn under a point of the view, if any.
@@ -599,8 +615,11 @@ impl App {
                                 self.loading = None;
                             }
                             // A failed edit may still have touched the model.
-                            if matches!(kind, Pending::Edit | Pending::Create) {
+                            if matches!(kind, Pending::Edit | Pending::Create | Pending::SketchEdit(_)) {
                                 self.refresh();
+                            }
+                            if matches!(kind, Pending::SketchEdit(_) | Pending::SketchData) {
+                                self.on_sketch_error(&kind);
                             }
                         }
                         Ok(body) => self.on_reply(ctx, r.id, kind, body),
@@ -615,6 +634,7 @@ impl App {
         {
             match kind {
                 Pending::Open(path) => {
+                    self.sketch = None;
                     self.doc_label = v["label"].as_str().map(str::to_string);
                     self.doc_path = Some(path);
                     self.selection = None;
@@ -641,6 +661,7 @@ impl App {
                     }
                     self.modified = true;
                     self.refresh();
+                    self.sketch_resync();
                 }
                 Pending::Edges(_, g) => self.on_edges(g, &v),
                 Pending::Face(g) => self.on_face(g, &v),
@@ -659,6 +680,10 @@ impl App {
                         self.error = Some(format!("recompute left these objects invalid: {}", names.join(", ")));
                     }
                     self.refresh();
+                    // A new sketch opens for drawing, as in Fusion.
+                    if let (Some(made), Some(sk)) = (v["created"].as_str(), v.get("sketch")) {
+                        self.edit_sketch(made, Some(sk));
+                    }
                 }
                 Pending::Save(path) => {
                     self.doc_path = Some(path);
@@ -675,6 +700,8 @@ impl App {
                 }
                 Pending::Scene { .. } => self.on_scene_done(id, &v),
                 Pending::AgentQuery => {}
+                Pending::SketchData => self.on_sketch_data(&v),
+                Pending::SketchEdit(adds) => self.on_sketch_edit(adds, &v),
             }
         }
     }
@@ -873,6 +900,23 @@ impl App {
         if pressed(egui::Key::O) {
             self.camera.ortho = !self.camera.ortho;
         }
+        if self.sketch.is_some() {
+            if pressed(egui::Key::Escape) {
+                self.sketch_escape();
+            }
+            if pressed(egui::Key::Delete) {
+                self.sketch_delete();
+            }
+            if pressed(egui::Key::X) {
+                self.sketch_construction();
+            }
+            for (k, t) in [(egui::Key::L, Tool::Line), (egui::Key::R, Tool::Rectangle), (egui::Key::C, Tool::Circle), (egui::Key::A, Tool::Arc), (egui::Key::P, Tool::Point)] {
+                if pressed(k) {
+                    self.set_sketch_tool(Some(t));
+                }
+            }
+            return;
+        }
         if pressed(egui::Key::Escape) {
             // Esc closes an open command's dialog first, then clears the selection.
             if self.command.take().is_none() {
@@ -904,6 +948,11 @@ impl App {
             agent_calls: self.feed.len(),
             agent_running: !self.agent_jobs.is_empty(),
             navigation: self.navigation,
+            sketch: self.sketch.as_ref().map(|m| SketchRibbon {
+                label: m.data.as_ref().map_or_else(|| m.obj.clone(), |d| d.label.clone()),
+                tool: m.drawing.as_ref().map(|d| d.tool),
+                picked: m.selected.len(),
+            }),
         };
         let tab_before = self.tab;
         let (busy, freecad, dead) = (self.busy(), self.freecad.clone(), self.worker_error.is_some());
@@ -963,6 +1012,10 @@ impl App {
                 Action::Navigation(n) => self.navigation = n,
                 Action::Command(op) => self.start_command(op),
                 Action::Delete => self.delete_selected(),
+                Action::SketchTool(t) => self.set_sketch_tool(t),
+                Action::SketchConstruction => self.sketch_construction(),
+                Action::SketchDelete => self.sketch_delete(),
+                Action::FinishSketch => self.finish_sketch(),
             }
         }
     }
@@ -978,7 +1031,9 @@ impl App {
         let feed_height = (view.height() * 0.55).max(200.0);
         let right_height = if self.show_feed { (view.height() - feed_height - 190.0).max(120.0) } else { view.height() - 200.0 };
         let top = view.right_top() + egui::vec2(-10.0, 150.0);
-        if let Some(op) = self.command.as_ref().map(|c| c.op) {
+        if self.sketch.is_some() {
+            ui_chrome::overlay(ctx, "sketch", view, top, egui::Align2::RIGHT_TOP, 290.0, right_height, "Sketch", |ui| self.sketch_panel(ui));
+        } else if let Some(op) = self.command.as_ref().map(|c| c.op) {
             // A command's dialog stands where the properties do, as in the big CAD tools.
             let mut outcome = Outcome::Open;
             ui_chrome::overlay(ctx, "command", view, top, egui::Align2::RIGHT_TOP, 290.0, right_height, op.title(), |ui| {
@@ -1013,6 +1068,7 @@ impl App {
         for a in actions {
             match a {
                 TreeAction::Select(obj) => self.picked(Some(Selection { obj, sub: None, face_id: 0 })),
+                TreeAction::EditSketch(obj) => self.edit_sketch(&obj, None),
                 TreeAction::Visible(obj, v) => {
                     if let Some(n) = self.tree.nodes.get_mut(&obj) {
                         n.visible = v;
@@ -1055,7 +1111,10 @@ impl App {
                 text.append(kind.name, 6.0, egui::TextFormat::simple(small, visuals.weak_text_color()));
             }
             // Cut long names to the panel's width; the full one is in the tooltip.
-            if ui.add(egui::Button::selectable(selected, text).truncate()).on_hover_text(tip).clicked() {
+            let r = ui.add(egui::Button::selectable(selected, text).truncate()).on_hover_text(tip);
+            if r.double_clicked() && node.kind == SKETCH {
+                actions.push(TreeAction::EditSketch(name.to_string()));
+            } else if r.clicked() {
                 actions.push(TreeAction::Select(name.to_string()));
             }
         };
@@ -1079,6 +1138,7 @@ impl App {
     /// Along the bottom, as in Fusion: every body's features in the order they are built.
     fn timeline_panel(&mut self, ui: &mut egui::Ui) {
         let mut chosen = None;
+        let mut edit = None;
         // Where the marker of each body may stop: after a feature that can be its tip.
         let mut stops: Vec<(String, String, f32)> = Vec::new();
         let mut markers: Vec<(String, egui::Response)> = Vec::new();
@@ -1113,8 +1173,13 @@ impl App {
                     if past_tip {
                         tip.push_str("\n\nRolled back: after the marker, not part of the body's shape now.");
                     }
+                    if node.kind == SKETCH {
+                        tip.push_str("\n\nDouble-click to edit it.");
+                    }
                     let step = ui_chrome::timeline_step(ui, kind.family, selected, node.error, past_tip).on_hover_text(tip);
-                    if step.clicked() {
+                    if step.double_clicked() && node.kind == SKETCH {
+                        edit = Some(f.clone());
+                    } else if step.clicked() {
                         chosen = Some(f.clone());
                     }
                     if kind.family.makes_shape() {
@@ -1150,6 +1215,9 @@ impl App {
         }
         if let Some(obj) = chosen {
             self.select(Some(Selection { obj, sub: None, face_id: 0 }));
+        }
+        if let Some(obj) = edit {
+            self.edit_sketch(&obj, None);
         }
     }
 
@@ -1332,11 +1400,20 @@ impl App {
             }
         }
         if resp.double_clicked() {
-            self.fit();
+            if !self.sketch_double_click() {
+                self.fit();
+            }
         } else if resp.clicked()
             && let Some(pos) = resp.interact_pointer_pos()
         {
-            self.click_view(pos, ((pos.x - rect.min.x) * ppp) as u32, ((pos.y - rect.min.y) * ppp) as u32, ppp);
+            if self.sketch.is_some() {
+                let add = ui.input(|i| i.modifiers.shift || i.modifiers.command);
+                self.sketch_click(pos, add);
+            } else {
+                self.click_view(pos, ((pos.x - rect.min.x) * ppp) as u32, ((pos.y - rect.min.y) * ppp) as u32, ppp);
+            }
+        } else if self.sketch.is_some() {
+            self.sketch_hover(resp.hover_pos().filter(|_| !resp.dragged()));
         } else {
             self.hover(ui, &resp, rect);
         }
@@ -1353,6 +1430,15 @@ impl App {
         }
         self.paint_planes(&ui.painter_at(rect), rect, f.view_proj);
         self.paint_handles(&ui.painter_at(rect), rect, f.view_proj);
+        self.paint_sketch(&ui.painter_at(rect), rect, f.view_proj);
+        if let Some(prompt) = self.sketch_prompt() {
+            let at = egui::pos2(rect.center().x, rect.top() + 14.0);
+            let painter = ui.painter_at(rect);
+            let galley = painter.layout_no_wrap(prompt, egui::FontId::proportional(13.0), ui.visuals().text_color());
+            let back = egui::Rect::from_center_size(at + egui::vec2(0.0, galley.size().y * 0.5), galley.size() + egui::vec2(16.0, 8.0));
+            painter.rect_filled(back, 5.0, ui.visuals().panel_fill.gamma_multiply(0.85));
+            painter.galley(back.min + egui::vec2(8.0, 4.0), galley, ui.visuals().text_color());
+        }
         self.view_rect = Some(rect);
         if let CubeAction::Home = ui_chrome::view_cube(ui, rect, &mut self.camera) {
             self.camera.set_view(View::Iso);
@@ -1557,6 +1643,77 @@ impl App {
             Stage::Plane => {
                 let planes: Vec<Value> = self.tree.nodes.iter().filter_map(|(n, node)| Some(json!({ "obj": n, "z": node.plane?.map(|c| c.z) }))).collect();
                 t.log("plane over Pocket.Face5", json!({ "planes": planes, "drawn": self.plane_outlines.len(), "error": self.error }));
+                // Create sketch with the top face selected starts it at once and opens sketch mode.
+                self.select(Some(Selection { obj: "Pocket".into(), sub: Some("Face5".into()), face_id: 0 }));
+                self.start_command(Op::Sketch);
+                t.stage = Stage::Sketch;
+            }
+            Stage::Sketch => {
+                let mode = self.sketch.as_ref().map(|m| json!({ "obj": m.obj, "loaded": m.data.is_some() }));
+                t.log("create sketch on Pocket.Face5", json!({ "mode": mode, "error": self.error }));
+                // A rectangle, a circle and an open L of lines, clicked where the view shows those points.
+                let clicks: [(Option<Tool>, &[(f64, f64)]); 4] = [
+                    (Some(Tool::Rectangle), &[(10.0, 10.0), (40.0, 30.0)]),
+                    (Some(Tool::Circle), &[(60.0, 25.0), (66.0, 25.0)]),
+                    (Some(Tool::Line), &[(5.0, 42.0), (25.0, 42.0), (25.0, 48.0)]),
+                    (Some(Tool::Rectangle), &[]),
+                ];
+                let mut sent = Vec::new();
+                for (tool, points) in clicks {
+                    self.set_sketch_tool(tool);
+                    for &(x, y) in points {
+                        if let Some(pos) = self.sketch_screen_point(glam::DVec2::new(x, y)) {
+                            self.sketch_click(pos, false);
+                            sent.push(json!([x, y, pos.x, pos.y]));
+                        }
+                    }
+                    if tool == Some(Tool::Line) {
+                        self.sketch_escape();
+                    }
+                }
+                // The rectangle tool waits for its first corner with the pointer over (70, 40).
+                if let Some(pos) = self.sketch_screen_point(glam::DVec2::new(70.0, 40.0)) {
+                    self.sketch_hover(Some(pos));
+                }
+                t.log("sketch clicks", json!({ "clicks": sent }));
+                t.stage = Stage::SketchDraw;
+            }
+            Stage::SketchDraw => {
+                if let Some(pos) = self.sketch_screen_point(glam::DVec2::new(70.0, 40.0)) {
+                    self.sketch_hover(Some(pos));
+                }
+                let (slot, c) = (t.window.clone(), ctx.clone());
+                ctx.request_screenshot(move |image| {
+                    let rgba: Vec<u8> = image.pixels.iter().flat_map(|p| p.to_array()).collect();
+                    *slot.lock().unwrap() = Some((image.size[0] as u32, image.size[1] as u32, rgba));
+                    c.request_repaint();
+                });
+                t.stage = Stage::SketchShot;
+            }
+            Stage::SketchShot => {
+                let shot = t.window.lock().unwrap().take();
+                let Some((w, h, rgba)) = shot else {
+                    ctx.request_repaint(); // the screenshot comes with a later frame
+                    self.selftest = Some(t);
+                    return;
+                };
+                let path = t.dir.join("4-sketch-mode.bmp");
+                let saved = write_bmp(&path, w, h, &rgba).is_ok();
+                let d = self.sketch.as_ref().and_then(|m| m.data.as_ref());
+                let summary = d.map(|d| {
+                    json!({
+                        "elements": d.count,
+                        "constraints": d.constraints.iter().map(|c| c.kind.clone()).collect::<Vec<_>>(),
+                        "profiles": d.profiles.len(),
+                        "dof": d.dof,
+                    })
+                });
+                t.log("sketch mode", json!({ "sketch": summary, "prompt": self.sketch_prompt(), "window": saved.then(|| path.to_string_lossy().to_string()), "error": self.error }));
+                self.finish_sketch();
+                t.stage = Stage::SketchSaved;
+            }
+            Stage::SketchSaved => {
+                t.log("finish sketch", json!({ "mode_left": self.sketch.is_none(), "selected": self.selection.as_ref().map(|s| s.obj.clone()) }));
                 t.stage = Stage::Done;
             }
             Stage::Done => {
@@ -1942,6 +2099,7 @@ fn with_default_extension(p: PathBuf, ext: &str) -> PathBuf {
 enum TreeAction {
     Select(String),
     Visible(String, bool),
+    EditSketch(String),
 }
 
 impl App {

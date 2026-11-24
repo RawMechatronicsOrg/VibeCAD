@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Op {
+    Sketch,
     Plane,
     Extrude,
     Fillet,
@@ -21,6 +22,7 @@ pub enum Op {
 impl Op {
     pub fn title(self) -> &'static str {
         match self {
+            Op::Sketch => "Create sketch",
             Op::Plane => "Construction plane",
             Op::Extrude => "Extrude",
             Op::Fillet => "Fillet",
@@ -35,6 +37,7 @@ impl Op {
     /// The short name under its ribbon button.
     pub fn label(self) -> &'static str {
         match self {
+            Op::Sketch => "Sketch",
             Op::Plane => "Plane",
             Op::Circular => "Circular",
             Op::Linear => "Linear",
@@ -44,6 +47,7 @@ impl Op {
 
     pub fn hint(self) -> &'static str {
         match self {
+            Op::Sketch => "Start a sketch: click a flat face or a plane, or choose XY, XZ or YZ; then draw in it",
             Op::Plane => "A plane on a flat face, another plane or an origin plane, moved along its normal and tilted",
             Op::Extrude => "Pull a flat face out or push it in to cut: drag the arrow, or type the distance; or extrude a sketch",
             Op::Fillet => "Round edges: click them in the view (a face stands for all its edges), drag the arrow for the radius",
@@ -63,7 +67,7 @@ impl Op {
     /// What its reference field takes, if it has one.
     fn reference(self) -> Option<RefKind> {
         match self {
-            Op::Plane | Op::Mirror => Some(RefKind::Plane),
+            Op::Sketch | Op::Plane | Op::Mirror => Some(RefKind::Plane),
             Op::Extrude => Some(RefKind::Profile),
             Op::Fillet | Op::Chamfer => Some(RefKind::Edges),
             Op::Circular => Some(RefKind::Axis),
@@ -208,6 +212,11 @@ impl Command {
         c
     }
 
+    /// A sketch whose plane is chosen starts at once, as in Fusion: no OK needed.
+    pub fn starts_now(&self) -> bool {
+        self.op == Op::Sketch && self.reference != Ref::None
+    }
+
     /// Whether a click in the view should try construction planes before faces.
     pub fn wants_plane(&self) -> bool {
         self.active == Slot::Reference && self.op.reference() == Some(RefKind::Plane)
@@ -314,6 +323,7 @@ impl Command {
             _ => Err(self.op.reference().map_or("pick a face", |k| k.prompt()).to_string()),
         };
         Ok(match self.op {
+            Op::Sketch => ("new_sketch", json!({ "plane": reference()?, "context": context, "outlines": true })),
             Op::Plane => ("datum_plane", json!({ "ref": reference()?, "offset": self.offset, "angle": self.angle, "context": context })),
             Op::Extrude => {
                 let p = picked()?;
@@ -354,6 +364,9 @@ impl Command {
                         if ui.selectable_label(self.reference == Ref::Base(b), b).clicked() {
                             self.reference = Ref::Base(b);
                             self.active = Slot::Reference;
+                            if self.op == Op::Sketch {
+                                out = Outcome::Ok; // the plane is all a sketch needs
+                            }
                         }
                     }
                     let text = match (&self.reference, self.edges.as_slice()) {
@@ -373,6 +386,7 @@ impl Command {
                 ui.end_row();
             }
             match self.op {
+                Op::Sketch => {}
                 Op::Plane => {
                     number(ui, "Offset", &mut self.offset, " mm");
                     number(ui, "Angle", &mut self.angle, "°");
@@ -476,6 +490,13 @@ pub fn paint_icon(p: &egui::Painter, r: Rect, op: Op, c: Color32) {
         poly(&[(to.0 - ux - uy * 0.6, to.1 - uy + ux * 0.6), to, (to.0 - ux + uy * 0.6, to.1 - uy - ux * 0.6)], false, s);
     };
     match op {
+        Op::Sketch => {
+            // A rectangle and a circle on a sheet, a pencil across.
+            poly(&[(0.05, 0.25), (0.75, 0.25), (0.75, 0.95), (0.05, 0.95)], true, thin);
+            poly(&[(0.15, 0.45), (0.45, 0.45), (0.45, 0.8), (0.15, 0.8)], true, s);
+            p.circle_stroke(at(0.6, 0.62), r.width() * 0.1, s);
+            poly(&[(0.55, 0.5), (0.95, 0.05), (1.0, 0.12), (0.6, 0.55), (0.55, 0.5)], false, s);
+        }
         Op::Plane => {
             // A parallelogram seen at an angle, filled faintly orange.
             let quad = [(0.2, 0.2), (1.0, 0.2), (0.8, 0.8), (0.0, 0.8)];

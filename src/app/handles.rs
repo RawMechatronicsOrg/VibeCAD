@@ -160,6 +160,11 @@ impl App {
         }
     }
 
+    /// The view as the last frame drew it: its projection and where it is on screen.
+    pub(super) fn gizmos_last_view(&self) -> Option<(Mat4, Rect)> {
+        self.gizmos.view
+    }
+
     fn project(&self) -> Option<impl Fn(Vec3) -> Option<Pos2> + use<>> {
         self.gizmos.view.map(|(m, r)| picking::projector(m, r))
     }

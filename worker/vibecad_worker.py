@@ -1223,7 +1223,8 @@ def solver_trouble(sk, result):
 
 def sketch_profiles(sk, outlines):
     """The closed regions of a sketch, as Extrude would take them, in the sketch's (x, y):
-    area, box, holes; with `outlines`, the outer loop and the holes as [x0, y0, x1, y1, ...]."""
+    area, box, holes; with `outlines`, the outer loop and the holes as [x0, y0, x1, y1, ...] and
+    a mesh of triangles over it ({"points": [x0, y0, ...], "triangles": [i, j, k, ...]})."""
     try:
         shape = sk.Shape.copy()
     except Exception:
@@ -1248,6 +1249,12 @@ def sketch_profiles(sk, outlines):
                 return [round(c, 6) for p in w.discretize(Deflection=step) for c in (p.x, p.y)]
             d["outer"] = loop(f.OuterWire)
             d["inner"] = [loop(w) for w in f.Wires if not w.isSame(f.OuterWire)]
+            try:  # triangles, for the window to shade the profile
+                pts, tris = f.tessellate(step)
+                d["mesh"] = {"points": [round(c, 6) for v in pts for c in (v.x, v.y)],
+                             "triangles": [i for t in tris for i in t]}
+            except Exception:
+                pass
         out.append(d)
     out.sort(key=lambda d: -d["area"])
     return out

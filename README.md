@@ -5,9 +5,9 @@ VibeCAD draws its shapes with wgpu and edits its documents through it. Documents
 `.FCStd` files that FreeCAD opens as before, colours included.
 
 Prototype. It opens, shows, picks, edits properties, undoes, saves and exports, and models with
-a first set of operations (construction planes, extrude, fillet, chamfer, mirror, circular and
-linear patterns, copy, delete). Sketches are made and drawn by an agent (see Agents); the
-window's own sketch mode is on its way.
+a first set of operations (sketches, construction planes, extrude, fillet, chamfer, mirror,
+circular and linear patterns, copy, delete). Sketches are drawn in place, as in Fusion; there is
+no constraint or dimension tool in the window yet (an agent can add both, see Agents).
 
 ## Run
 
@@ -72,6 +72,7 @@ opens the document as before.
 
 | Command | Takes | Makes |
 | --- | --- | --- |
+| Sketch | a flat face, a construction plane or XY/XZ/YZ (picking it starts the sketch) | `Sketcher::SketchObject` attached to it, open in sketch mode |
 | Plane | a flat face, a construction plane or XY/XZ/YZ; offset, angle | `PartDesign::Plane` attached to it |
 | Extrude | a flat face (or a sketch from the tree); distance (drag the arrow), both sides | `Pad` (positive) or `Pocket` (negative) |
 | Fillet, Chamfer | edges of one part (a face stands for all its edges); radius or size (drag the arrow) | `PartDesign::Fillet` / `Chamfer` |
@@ -91,6 +92,23 @@ opens the document as before.
 - Construction planes are drawn as translucent orange squares over the model, centred where
   the model's centre falls on them, and can be clicked. A placement (a plane's
   `AttachmentOffset`, an object's `Placement`) shows as six numbers: x, y, z, yaw, pitch, roll.
+
+**Sketch mode.** Create sketch (EDIT → CREATE → Sketch), or a double click on a sketch in the
+timeline or the tree, opens the sketch in place: the camera turns to face it, its x to the right,
+and the ribbon holds its tools instead of the tabs' buttons. Line (L) draws segments end to end
+until Esc or a double click; Rectangle (R) takes two corners, Center rect the centre and a corner;
+Circle (C) the centre and a point on it; Arc (A) its start, its end and a point on it; Point (P).
+A click snaps to a point of the sketch or its origin within a few pixels (and is joined to it
+with a coincident constraint), else lines up with the click before it (and the line gets a
+horizontal or vertical constraint), else rounds to a step that follows the zoom; the shape to
+come is previewed dashed with its length or size. Each finished shape is one `sketch_edit`, one
+undo step, solved by FreeCAD. With no tool, a click picks elements (Ctrl or Shift adds); Del
+deletes them and X makes them construction geometry (dashed orange, never part of a profile).
+The sketch is drawn over the view from the worker's description: blue while it can still move,
+black once fully constrained; its closed profiles are shaded orange (triangulated by the worker).
+A panel where the properties stand shows its elements, constraints, degrees of freedom and
+profiles. Esc drops the shape being drawn, then the tool, then the picked elements, then leaves
+the sketch, as Finish sketch does; the sketch stays selected, so Extrude takes it as its profile.
 
 **Edges and handles.** An edge under the cursor lights up light blue; a click picks it (blue), as
 a face is picked. Only edges of the faces under and around the cursor count, so edges hidden
