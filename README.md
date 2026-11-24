@@ -6,8 +6,8 @@ VibeCAD draws its shapes with wgpu and edits its documents through it. Documents
 
 Prototype. It opens, shows, picks, edits properties, undoes, saves and exports, and models with
 a first set of operations (sketches, construction planes, extrude, fillet, chamfer, mirror,
-circular and linear patterns, copy, delete). Sketches are drawn in place, as in Fusion; there is
-no constraint or dimension tool in the window yet (an agent can add both, see Agents).
+circular and linear patterns, copy, delete). Sketches are drawn, constrained and dimensioned in
+place, as in Fusion; FreeCAD's Sketcher solves them.
 
 ## Run
 
@@ -104,6 +104,19 @@ horizontal or vertical constraint), else rounds to a step that follows the zoom;
 come is previewed dashed with its length or size. Each finished shape is one `sketch_edit`, one
 undo step, solved by FreeCAD. With no tool, a click picks elements (Ctrl or Shift adds); Del
 deletes them and X makes them construction geometry (dashed orange, never part of a profile).
+
+CONSTRAIN holds Dimension (D) and the constraints: coincident (two points, or a point onto a
+curve), horizontal/vertical (a line or two points, whichever it is nearer), parallel,
+perpendicular, tangent, equal, midpoint, concentric and fix. A constraint tool takes clicks on
+points and elements (points win within a few pixels) and adds the constraint once it has what it
+needs; elements picked before the tool apply at once. Dimension takes a line (its length), a
+circle (diameter), an arc (radius), two points, a point and a line, or two lines (their angle, or
+their distance when parallel), and opens a box by the pointer with the value it measures: type
+the value, Enter. Dimensions are drawn by what they measure, the other constraints as small
+marks (H, V, //, ...); a click picks one (Del removes it) and a double click on a dimension opens
+its value. With no tool, a point or a line can be dragged: while the pointer moves, dry runs show
+where the solver puts everything, and the release makes one move (with undone steps waiting for
+redo, which a dry run would drop, only the release moves it).
 The sketch is drawn over the view from the worker's description: blue while it can still move,
 black once fully constrained; its closed profiles are shaded orange (triangulated by the worker).
 A panel where the properties stand shows its elements, constraints, degrees of freedom and

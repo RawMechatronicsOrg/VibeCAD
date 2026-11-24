@@ -7,7 +7,7 @@ use glam::Vec3;
 use crate::camera::Camera;
 use crate::modelling::{self, Op};
 use crate::navigation::Scheme;
-use crate::sketcher::Tool;
+use crate::sketcher::{Constrain, Tool};
 
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Tab {
@@ -53,6 +53,8 @@ pub enum Action {
     Delete,
     /// In sketch mode: draw with this tool, or (None) pick elements.
     SketchTool(Option<Tool>),
+    /// In sketch mode: a constraint tool or the dimension tool, or (None) none.
+    SketchConstrain(Option<Constrain>),
     /// Picked sketch elements become construction geometry, or back.
     SketchConstruction,
     SketchDelete,
@@ -63,7 +65,10 @@ pub enum Action {
 pub struct SketchRibbon {
     pub label: String,
     pub tool: Option<Tool>,
+    pub constrain: Option<Constrain>,
+    /// Picked elements; with constraints too.
     pub picked: usize,
+    pub picked_any: usize,
 }
 
 /// What the ribbon needs to know to enable and mark its buttons.
@@ -249,7 +254,7 @@ pub fn ribbon(ui: &mut egui::Ui, tab: &mut Tab, s: &RibbonState, status: impl Fn
 /// The ribbon in sketch mode: the drawing tools, then what acts on picked elements, then Finish.
 fn sketch_groups(ui: &mut egui::Ui, out: &mut Vec<Action>, sk: &SketchRibbon) {
     group(ui, "SELECT", |ui| {
-        button(ui, out, Action::SketchTool(None), Icon::Pick, "Select", true, sk.tool.is_none(), "Pick elements: click, Ctrl or Shift adds (Esc)");
+        button(ui, out, Action::SketchTool(None), Icon::Pick, "Select", true, sk.tool.is_none() && sk.constrain.is_none(), "Pick elements and constraints: click, Ctrl or Shift adds; drag points and lines (Esc)");
     });
     group(ui, "CREATE", |ui| {
         for t in Tool::ALL {
@@ -259,7 +264,25 @@ fn sketch_groups(ui: &mut egui::Ui, out: &mut Vec<Action>, sk: &SketchRibbon) {
     });
     group(ui, "MODIFY", |ui| {
         button(ui, out, Action::SketchConstruction, Icon::Construction, "Construction", sk.picked > 0, false, "Picked elements become guides, never part of a profile; or back (X)");
-        button(ui, out, Action::SketchDelete, Icon::Delete, "Delete", sk.picked > 0, false, "Delete the picked elements (Del)");
+        button(ui, out, Action::SketchDelete, Icon::Delete, "Delete", sk.picked_any > 0, false, "Delete the picked elements and constraints (Del)");
+    });
+    group(ui, "CONSTRAIN", |ui| {
+        let dim = sk.constrain == Some(Constrain::Dimension);
+        button(ui, out, Action::SketchConstrain((!dim).then_some(Constrain::Dimension)), Icon::Dimension, "Dimension", true, dim, Constrain::Dimension.hint());
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
+            for row in Constrain::ALL.chunks(5) {
+                ui.horizontal(|ui| {
+                    for &c in row {
+                        let on = sk.constrain == Some(c);
+                        let r = ui.add_sized(vec2(30.0, 21.0), egui::Button::selectable(on, RichText::new(c.glyph()).size(12.0)));
+                        if r.on_hover_text(c.hint()).clicked() {
+                            out.push(Action::SketchConstrain((!on).then_some(c)));
+                        }
+                    }
+                });
+            }
+        });
     });
     group(ui, "FINISH", |ui| {
         button(ui, out, Action::FinishSketch, Icon::Finish, "Finish sketch", true, false, "Leave the sketch (Esc with nothing picked)");
@@ -305,6 +328,7 @@ enum Icon {
     Tool(Tool),
     Construction,
     Finish,
+    Dimension,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -499,6 +523,15 @@ fn paint_icon(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
         }
         Icon::Finish => {
             poly(&[(0.12, 0.5), (0.4, 0.8), (0.9, 0.15)], false);
+        }
+        Icon::Dimension => {
+            // A line with its extension lines and the dimension between, arrowed.
+            p.line_segment([at(0.1, 0.85), at(0.9, 0.85)], s);
+            p.line_segment([at(0.1, 0.25), at(0.1, 0.7)], Stroke::new(1.0, c));
+            p.line_segment([at(0.9, 0.25), at(0.9, 0.7)], Stroke::new(1.0, c));
+            p.line_segment([at(0.1, 0.45), at(0.9, 0.45)], Stroke::new(1.0, c));
+            poly(&[(0.25, 0.35), (0.1, 0.45), (0.25, 0.55)], false);
+            poly(&[(0.75, 0.35), (0.9, 0.45), (0.75, 0.55)], false);
         }
         Icon::Delete => modelling::paint_delete(p, r, c),
         Icon::Log => {

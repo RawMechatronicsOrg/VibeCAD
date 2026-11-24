@@ -20,6 +20,7 @@ pub enum Stage {
     Plane,
     /// A sketch on the plate's top face, drawn with the tools as clicks would draw it.
     Sketch,
+    SketchDimension,
     SketchDraw,
     SketchShot,
     SketchSaved,

@@ -127,11 +127,12 @@ class Modelling:
     Links show another part: they are mirrored and copied, but not changed.
     """
 
-    def _model_edit(self, title, build, dry=False, describe=None):
+    def _model_edit(self, title, build, dry=False, describe=None, trial=True):
         """Run `build(doc)`, which returns the object it made, as one undoable step. A new
         object that fails to recompute undoes the whole step: FreeCAD's message is the error.
         `describe(made)` adds to the reply what the step left (read before a dry run is put
-        back). With `dry` the document is put back and the result kept as a trial state."""
+        back). With `dry` the document is put back and the result kept as a trial state, unless
+        `trial` is off (the window's previews of a drag, which only want `describe`)."""
         doc = self._doc()
         if dry:
             self._refuse_dry_run_over_redo(doc)
@@ -154,7 +155,8 @@ class Modelling:
             if describe is not None:
                 out.update(describe(made))
             if dry:
-                out.update(self._trial(title))
+                if trial:
+                    out.update(self._trial(title))
                 return out
             commit_transaction(doc)
             committed = True
@@ -533,7 +535,8 @@ class Modelling:
             if move:
                 i = sketch_index(move, new, sk.GeometryCount)
                 to = point2(move, "to")
-                sk.movePoint(i, POINT_POS.get(move.get("at"), 0), to, 0)
+                # "relative": `to` is how far to move from where it is (dragging a whole line).
+                sk.movePoint(i, POINT_POS.get(move.get("at"), 0), to, 1 if move.get("relative") else 0)
             result = sk.solve()
             if result != 0:
                 raise ValueError(solver_trouble(sk, result))
@@ -542,7 +545,8 @@ class Modelling:
         def describe(sk):
             return dict(made, sketch=self.cmd_sketch({"obj": sk.Name, "outlines": req.get("outlines")}))
 
-        return self._model_edit("Edit " + sk.Label, build, dry=bool(req.get("dry_run")), describe=describe)
+        return self._model_edit("Edit " + sk.Label, build, dry=bool(req.get("dry_run")), describe=describe,
+                                trial=not req.get("preview"))
 
     # ---- geometry for picking and handles ----------------------------------------------
 

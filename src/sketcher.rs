@@ -144,6 +144,10 @@ pub struct Constraint {
     pub refs: Vec<Value>,
     pub value: Option<f64>,
     pub property: Option<String>,
+    /// False for a reference dimension, which only measures.
+    pub driving: bool,
+    /// The expression a dimension is bound to, which sets its value.
+    pub expression: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -200,6 +204,8 @@ impl Sketch {
                         refs: c["refs"].as_array().cloned().unwrap_or_default(),
                         value: c["value"].as_f64(),
                         property: c["property"].as_str().map(String::from),
+                        driving: c["driving"].as_bool() != Some(false),
+                        expression: c["expression"].as_str().map(String::from),
                     })
                     .collect()
             })
@@ -570,6 +576,297 @@ pub fn element_at(sketch: &Sketch, project: &dyn Fn(DVec2) -> Option<Pos2>, pos:
     sketch.elements.iter().map(|e| (e.index, dist(e))).filter(|(_, d)| *d <= reach).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(i, _)| i)
 }
 
+// ---- constraints and dimensions -----------------------------------------------------------
+
+/// What a click picks for a constraint or a dimension: a point (of an element, or the
+/// origin) before the element it lies on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Pick {
+    Point(Target),
+    Element(usize),
+}
+
+/// How near the pointer a point is picked, in points; nearer than an element's line.
+pub const POINT_REACH: f32 = 8.0;
+
+/// The point or element under `pos`: a point within `POINT_REACH`, else an element within `reach`.
+pub fn pick_at(sketch: &Sketch, project: &dyn Fn(DVec2) -> Option<Pos2>, pos: Pos2, reach: f32) -> Option<Pick> {
+    let mut best: Option<(f32, Target)> = None;
+    let mut consider = |t: Target, p: DVec2| {
+        if let Some(s) = project(p) {
+            let d = (s - pos).length();
+            if d <= POINT_REACH && best.is_none_or(|(b, _)| d < b) {
+                best = Some((d, t));
+            }
+        }
+    };
+    // An element's own point first: on a tie with the origin under it, the element's wins.
+    for e in &sketch.elements {
+        for (at, p) in e.shape.points() {
+            consider(Target::Point(e.index, at), p);
+        }
+    }
+    consider(Target::Origin, DVec2::ZERO);
+    if let Some((_, t)) = best {
+        return Some(Pick::Point(t));
+    }
+    element_at(sketch, project, pos, reach).map(Pick::Element)
+}
+
+/// The constraint tools, as Fusion's CONSTRAINTS panel has them, and the dimension tool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Constrain {
+    Dimension,
+    Coincident,
+    HorizontalVertical,
+    Parallel,
+    Perpendicular,
+    Tangent,
+    Equal,
+    Midpoint,
+    Concentric,
+    Fix,
+}
+
+impl Constrain {
+    pub const ALL: [Constrain; 9] = [
+        Constrain::Coincident,
+        Constrain::HorizontalVertical,
+        Constrain::Parallel,
+        Constrain::Perpendicular,
+        Constrain::Tangent,
+        Constrain::Equal,
+        Constrain::Midpoint,
+        Constrain::Concentric,
+        Constrain::Fix,
+    ];
+
+    /// The short mark on its button and next to the elements it holds.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            Constrain::Dimension => "<->",
+            Constrain::Coincident => "•",
+            Constrain::HorizontalVertical => "H/V",
+            Constrain::Parallel => "//",
+            Constrain::Perpendicular => "_|_",
+            Constrain::Tangent => "T",
+            Constrain::Equal => "=",
+            Constrain::Midpoint => "M",
+            Constrain::Concentric => "(o)",
+            Constrain::Fix => "F",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            Constrain::Dimension => "Dimension (D): click a line for its length, a circle or arc for its size, two points, a point and a line, or two lines for their angle; type the value, Enter",
+            Constrain::Coincident => "Coincident: two points together, or a point onto a line or curve",
+            Constrain::HorizontalVertical => "Horizontal/Vertical: a line, or two points, level or plumb, whichever it is nearer",
+            Constrain::Parallel => "Parallel: two lines",
+            Constrain::Perpendicular => "Perpendicular: two lines",
+            Constrain::Tangent => "Tangent: a line and a circle or arc, or two curves",
+            Constrain::Equal => "Equal: two lines of one length, or two circles or arcs of one size",
+            Constrain::Midpoint => "Midpoint: a point onto the middle of a line",
+            Constrain::Concentric => "Concentric: two circles or arcs about one centre",
+            Constrain::Fix => "Fix: an element stays where it is",
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Constrain::Dimension => "Dimension",
+            Constrain::Coincident => "Coincident",
+            Constrain::HorizontalVertical => "Horizontal/Vertical",
+            Constrain::Parallel => "Parallel",
+            Constrain::Perpendicular => "Perpendicular",
+            Constrain::Tangent => "Tangent",
+            Constrain::Equal => "Equal",
+            Constrain::Midpoint => "Midpoint",
+            Constrain::Concentric => "Concentric",
+            Constrain::Fix => "Fix",
+        }
+    }
+}
+
+impl Sketch {
+    pub fn element(&self, i: usize) -> Option<&Element> {
+        self.elements.iter().find(|e| e.index == i)
+    }
+
+    fn is_line(&self, i: usize) -> bool {
+        matches!(self.element(i).map(|e| &e.shape), Some(Shape::Line(..)))
+    }
+
+    fn is_round(&self, i: usize) -> bool {
+        matches!(self.element(i).map(|e| &e.shape), Some(Shape::Circle(..) | Shape::Arc(..)))
+    }
+
+    /// Where a point is: of an element, or the origin.
+    pub fn point(&self, t: Target) -> Option<DVec2> {
+        match t {
+            Target::Origin => Some(DVec2::ZERO),
+            Target::Point(i, at) => self.element(i)?.shape.points().into_iter().find(|(a, _)| *a == at).map(|(_, p)| p),
+        }
+    }
+}
+
+fn pick_ref(p: Pick) -> Value {
+    match p {
+        Pick::Point(t) => target_ref(t),
+        Pick::Element(i) => json!({ "geometry": i }),
+    }
+}
+
+/// The constraint a tool makes of the picks so far: Ok(Some) when they are enough, Ok(None)
+/// while it needs more, Err when they do not fit the tool (the picks start again).
+pub fn constraint_for(tool: Constrain, sketch: &Sketch, picks: &[Pick]) -> Result<Option<Value>, String> {
+    use Pick::{Element as E, Point as P};
+    let c = |t: &str, refs: &[Pick]| Ok(Some(json!({ "type": t, "refs": refs.iter().map(|p| pick_ref(*p)).collect::<Vec<_>>() })));
+    let wrong = || Err(format!("{}: {}", tool.name(), tool.hint().split_once(": ").map_or("", |x| x.1)));
+    match (tool, picks) {
+        (_, []) => Ok(None),
+        (Constrain::Fix, [E(_)]) => c("fix", picks),
+        (Constrain::HorizontalVertical, [E(i)]) if sketch.is_line(*i) => {
+            let Some(Shape::Line(a, b)) = sketch.element(*i).map(|e| &e.shape) else { return wrong() };
+            let d = *b - *a;
+            c(if d.x.abs() >= d.y.abs() { "horizontal" } else { "vertical" }, picks)
+        }
+        (Constrain::HorizontalVertical | Constrain::Coincident, [P(_)]) => Ok(None),
+        (Constrain::Coincident, [E(_)]) => Ok(None),
+        (Constrain::HorizontalVertical, [P(a), P(b)]) => {
+            let (Some(p), Some(q)) = (sketch.point(*a), sketch.point(*b)) else { return wrong() };
+            let d = q - p;
+            c(if d.x.abs() >= d.y.abs() { "horizontal" } else { "vertical" }, picks)
+        }
+        (Constrain::Coincident, [P(_), P(_)]) => c("coincident", picks),
+        (Constrain::Coincident, [P(_), E(_)]) => c("point_on_object", picks),
+        (Constrain::Coincident, [E(_), P(_)]) => c("point_on_object", &[picks[1], picks[0]]),
+        (Constrain::Midpoint, [P(_)]) => Ok(None),
+        (Constrain::Midpoint, [E(i)]) if sketch.is_line(*i) => Ok(None),
+        (Constrain::Midpoint, [P(_), E(i)]) if sketch.is_line(*i) => c("midpoint", picks),
+        (Constrain::Midpoint, [E(i), P(_)]) if sketch.is_line(*i) => c("midpoint", &[picks[1], picks[0]]),
+        (Constrain::Parallel | Constrain::Perpendicular, [E(i)]) if sketch.is_line(*i) => Ok(None),
+        (Constrain::Parallel, [E(i), E(j)]) if sketch.is_line(*i) && sketch.is_line(*j) => c("parallel", picks),
+        (Constrain::Perpendicular, [E(i), E(j)]) if sketch.is_line(*i) && sketch.is_line(*j) => c("perpendicular", picks),
+        (Constrain::Concentric, [E(i)]) if sketch.is_round(*i) => Ok(None),
+        (Constrain::Concentric, [E(i), E(j)]) if sketch.is_round(*i) && sketch.is_round(*j) => c("concentric", picks),
+        (Constrain::Equal | Constrain::Tangent, [E(_)]) => Ok(None),
+        (Constrain::Equal, [E(i), E(j)]) if sketch.is_line(*i) == sketch.is_line(*j) => c("equal", picks),
+        (Constrain::Tangent, [E(i), E(j)]) if !(sketch.is_line(*i) && sketch.is_line(*j)) => c("tangent", picks),
+        _ => wrong(),
+    }
+}
+
+/// A dimension of the picks: the constraint without its value, the value as it measures now
+/// (mm or degrees), and what the value box says it is. None while more picks are needed.
+pub fn dimension_for(sketch: &Sketch, picks: &[Pick]) -> Result<Option<(Value, f64, &'static str)>, String> {
+    use Pick::{Element as E, Point as P};
+    let refs = |ps: &[Pick]| ps.iter().map(|p| pick_ref(*p)).collect::<Vec<_>>();
+    let shape = |i: usize| sketch.element(i).map(|e| e.shape.clone());
+    match picks {
+        [] | [P(_)] => Ok(None),
+        [E(i)] => match shape(*i) {
+            Some(Shape::Line(a, b)) => Ok(Some((json!({ "type": "distance", "refs": refs(picks) }), a.distance(b), "length"))),
+            Some(Shape::Circle(_, r)) => Ok(Some((json!({ "type": "diameter", "refs": refs(picks) }), 2.0 * r, "diameter"))),
+            Some(Shape::Arc(_, r, ..)) => Ok(Some((json!({ "type": "radius", "refs": refs(picks) }), r, "radius"))),
+            _ => Err("Dimension: pick a line, a circle or an arc, or points".into()),
+        },
+        [P(a), P(b)] => {
+            let (Some(p), Some(q)) = (sketch.point(*a), sketch.point(*b)) else { return Err("Dimension: no such point".into()) };
+            Ok(Some((json!({ "type": "distance", "refs": refs(picks) }), p.distance(q), "distance")))
+        }
+        [P(a), E(i)] | [E(i), P(a)] => match (sketch.point(*a), shape(*i)) {
+            (Some(p), Some(Shape::Line(s, e))) => {
+                let d = (e - s).normalize_or_zero();
+                let dist = (p - s).perp_dot(d).abs();
+                Ok(Some((json!({ "type": "distance", "refs": [pick_ref(Pick::Point(*a)), { "geometry": i }] }), dist, "distance")))
+            }
+            _ => Err("Dimension: a point and a line".into()),
+        },
+        [E(i), E(j)] => match (shape(*i), shape(*j)) {
+            (Some(Shape::Line(a, b)), Some(Shape::Line(c, d))) => {
+                let (u, v) = (b - a, d - c);
+                if u.perp_dot(v).abs() < 1e-9 * u.length() * v.length() {
+                    // Parallel: the distance between them, from the second's start to the first.
+                    let dist = (c - a).perp_dot(u.normalize_or_zero()).abs();
+                    Ok(Some((json!({ "type": "distance", "refs": [{ "geometry": j, "at": "start" }, { "geometry": i }] }), dist, "distance")))
+                } else {
+                    let angle = u.perp_dot(v).atan2(u.dot(v)).to_degrees();
+                    Ok(Some((json!({ "type": "angle", "refs": refs(picks) }), angle, "angle")))
+                }
+            }
+            _ => Err("Dimension: two lines, for their angle or distance".into()),
+        },
+        _ => Err("Dimension: pick a line, a circle, an arc, two points, a point and a line, or two lines".into()),
+    }
+}
+
+/// Where a reference of a constraint is: a point, or the middle of an element.
+fn ref_place(sketch: &Sketch, r: &Value) -> Option<DVec2> {
+    if r["origin"].as_bool() == Some(true) {
+        return Some(DVec2::ZERO);
+    }
+    let i = r["geometry"].as_u64()? as usize;
+    let e = sketch.element(i)?;
+    if let Some(at) = r["at"].as_str() {
+        let at = match at {
+            "start" => At::Start,
+            "end" => At::End,
+            _ => At::Center,
+        };
+        return sketch.point(Target::Point(i, at));
+    }
+    Some(match &e.shape {
+        Shape::Line(a, b) => (*a + *b) * 0.5,
+        Shape::Circle(c, r) => *c + DVec2::new(r * std::f64::consts::FRAC_1_SQRT_2, r * std::f64::consts::FRAC_1_SQRT_2),
+        Shape::Arc(c, r, a0, a1) => *c + *r * DVec2::new(((a0 + a1) / 2.0).cos(), ((a0 + a1) / 2.0).sin()),
+        Shape::Point(p) => *p,
+        Shape::Curve(pts) => *pts.get(pts.len() / 2)?,
+    })
+}
+
+/// How a dimension reads, and where its text goes in the sketch: by the middle of what it
+/// measures. Reference dimensions are in parentheses.
+pub fn dimension_label(sketch: &Sketch, c: &Constraint) -> Option<(DVec2, String)> {
+    let v = c.value?;
+    let places: Vec<DVec2> = c.refs.iter().filter_map(|r| ref_place(sketch, r)).collect();
+    let at = match places.as_slice() {
+        [] => return None,
+        [p] => *p,
+        [p, q, ..] => (*p + *q) * 0.5,
+    };
+    let num = {
+        let s = format!("{v:.2}");
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    };
+    let text = match c.kind.as_str() {
+        "Diameter" => format!("Ø{num}"),
+        "Radius" => format!("R{num}"),
+        "Angle" => format!("{num}°"),
+        _ => num,
+    };
+    Some((at, if c.driving { text } else { format!("({text})") }))
+}
+
+/// The marks of a geometric constraint, each by what it holds: (place, mark).
+pub fn constraint_marks(sketch: &Sketch, c: &Constraint) -> Vec<(DVec2, &'static str)> {
+    let mark = match c.kind.as_str() {
+        "Horizontal" => "H",
+        "Vertical" => "V",
+        "Parallel" => "//",
+        "Perpendicular" => "_|_",
+        "Tangent" => "T",
+        "Equal" => "=",
+        "Block" => "F",
+        "PointOnObject" => "on",
+        "Symmetric" => "M",
+        _ => return Vec::new(),
+    };
+    // Midpoint is a point symmetric about a line's two ends: mark it at the point.
+    let refs: Vec<&Value> = if c.kind == "Symmetric" { c.refs.iter().skip(2).collect() } else { c.refs.iter().collect() };
+    refs.into_iter().filter_map(|r| ref_place(sketch, r)).map(|p| (p, mark)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -680,6 +977,65 @@ mod tests {
         let Some(Shape::Arc(_, _, b0, b1)) = arc3(DVec2::new(-10.0, 0.0), DVec2::new(0.0, 10.0), DVec2::new(10.0, 0.0)) else { panic!() };
         assert!((b0 - a0).abs() < 1e-9 && (b1 - a1).abs() < 1e-9, "the same arc, drawn the other way");
         assert!(arc3(DVec2::ZERO, DVec2::new(1.0, 1.0), DVec2::new(2.0, 2.0)).is_none());
+    }
+
+    #[test]
+    fn constraint_tools_take_the_picks_they_fit() {
+        let s = sketch(vec![
+            Shape::Line(DVec2::ZERO, DVec2::new(10.0, 1.0)),
+            Shape::Line(DVec2::new(0.0, 5.0), DVec2::new(1.0, 15.0)),
+            Shape::Circle(DVec2::new(20.0, 0.0), 3.0),
+            Shape::Arc(DVec2::new(20.0, 0.0), 5.0, 0.0, 1.0),
+        ]);
+        let (l0, l1, c, a) = (Pick::Element(0), Pick::Element(1), Pick::Element(2), Pick::Element(3));
+        let p = |i, at| Pick::Point(Target::Point(i, at));
+        assert_eq!(constraint_for(Constrain::HorizontalVertical, &s, &[l0]).unwrap().unwrap()["type"], "horizontal");
+        assert_eq!(constraint_for(Constrain::HorizontalVertical, &s, &[l1]).unwrap().unwrap()["type"], "vertical");
+        assert_eq!(constraint_for(Constrain::Coincident, &s, &[p(0, At::End)]).unwrap(), None, "waits for a second pick");
+        let on = constraint_for(Constrain::Coincident, &s, &[l1, p(0, At::End)]).unwrap().unwrap();
+        assert_eq!((on["type"].as_str(), &on["refs"][0]), (Some("point_on_object"), &json!({ "geometry": 0, "at": "end" })));
+        assert_eq!(constraint_for(Constrain::Concentric, &s, &[c, a]).unwrap().unwrap()["type"], "concentric");
+        assert!(constraint_for(Constrain::Parallel, &s, &[l0, c]).is_err(), "a circle is not parallel to anything");
+        assert!(constraint_for(Constrain::Equal, &s, &[l0, c]).is_err(), "a line and a circle are not of one size");
+        assert_eq!(constraint_for(Constrain::Tangent, &s, &[l0, c]).unwrap().unwrap()["type"], "tangent");
+        assert_eq!(constraint_for(Constrain::Fix, &s, &[a]).unwrap().unwrap(), json!({ "type": "fix", "refs": [{ "geometry": 3 }] }));
+    }
+
+    #[test]
+    fn a_dimension_measures_what_was_picked() {
+        let s = sketch(vec![
+            Shape::Line(DVec2::ZERO, DVec2::new(3.0, 4.0)),
+            Shape::Circle(DVec2::new(20.0, 0.0), 3.0),
+            Shape::Line(DVec2::new(0.0, 2.0), DVec2::new(3.0, 6.0)),
+            Shape::Line(DVec2::ZERO, DVec2::new(0.0, 8.0)),
+        ]);
+        let (c, v, what) = dimension_for(&s, &[Pick::Element(0)]).unwrap().unwrap();
+        assert_eq!((c["type"].as_str(), v, what), (Some("distance"), 5.0, "length"));
+        assert_eq!(dimension_for(&s, &[Pick::Element(1)]).unwrap().unwrap().1, 6.0, "a circle by its diameter");
+        let (c, v, _) = dimension_for(&s, &[Pick::Element(0), Pick::Element(2)]).unwrap().unwrap();
+        assert_eq!(c["type"], "distance", "parallel lines: the distance between them");
+        assert!((v - 1.2).abs() < 1e-9, "{v}");
+        let (c, v, _) = dimension_for(&s, &[Pick::Element(3), Pick::Element(0)]).unwrap().unwrap();
+        assert_eq!(c["type"], "angle");
+        assert!((v.abs() - 36.8698976).abs() < 1e-6, "{v}");
+        let from_origin = dimension_for(&s, &[Pick::Point(Target::Origin), Pick::Point(Target::Point(1, At::Center))]).unwrap().unwrap();
+        assert_eq!(from_origin.1, 20.0);
+        assert!(dimension_for(&s, &[Pick::Point(Target::Origin)]).unwrap().is_none(), "a point alone waits for a second");
+    }
+
+    #[test]
+    fn dimensions_and_marks_sit_by_what_they_hold() {
+        let s = sketch(vec![Shape::Line(DVec2::ZERO, DVec2::new(10.0, 0.0)), Shape::Circle(DVec2::new(20.0, 0.0), 3.0)]);
+        let dim = Constraint { index: 0, kind: "Diameter".into(), refs: vec![json!({ "geometry": 1 })], value: Some(6.0), property: Some("Constraints.0".into()), driving: true, expression: None };
+        let (_, text) = dimension_label(&s, &dim).unwrap();
+        assert_eq!(text, "Ø6");
+        let len = Constraint { index: 1, kind: "Distance".into(), refs: vec![json!({ "geometry": 0 })], value: Some(12.5), property: None, driving: false, expression: None };
+        assert_eq!(dimension_label(&s, &len).unwrap(), (DVec2::new(5.0, 0.0), "(12.5)".into()));
+        let h = Constraint { index: 2, kind: "Horizontal".into(), refs: vec![json!({ "geometry": 0 })], value: None, property: None, driving: true, expression: None };
+        assert_eq!(constraint_marks(&s, &h), vec![(DVec2::new(5.0, 0.0), "H")]);
+        let project = |p: DVec2| Some(Pos2::new(p.x as f32 * 10.0, p.y as f32 * 10.0));
+        assert_eq!(pick_at(&s, &project, Pos2::new(98.0, 3.0), 6.0), Some(Pick::Point(Target::Point(0, At::End))));
+        assert_eq!(pick_at(&s, &project, Pos2::new(50.0, 3.0), 6.0), Some(Pick::Element(0)));
     }
 
     #[test]

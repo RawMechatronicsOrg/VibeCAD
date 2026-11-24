@@ -16,7 +16,7 @@ use crate::profile::{Profile, Settings};
 use crate::render::{Frame, GroundGrid, Renderer};
 use crate::scene::SceneData;
 use crate::selftest::{SelfTest, Stage, write_bmp};
-use crate::sketcher::Tool;
+use crate::sketcher::{Constrain, Tool};
 use crate::ui_chrome::{self, Action, CubeAction, RibbonState, SketchRibbon, Tab};
 use crate::worker::{Body, Event, Part, Progress, Worker};
 
@@ -45,6 +45,8 @@ enum Pending {
     SketchData,
     /// A change to the sketch being edited, adding this many elements.
     SketchEdit(usize),
+    /// A dry run of a drag in the sketch: where the solver would put everything.
+    SketchPreview,
 }
 
 /// A tool call of the agent waiting for the worker.
@@ -610,7 +612,10 @@ impl App {
                     match r.result {
                         Err(_) if matches!(kind, Pending::Edges(..) | Pending::Face(_)) => self.on_geometry_error(&kind),
                         Err(e) => {
-                            self.error = Some(e);
+                            // A drag the solver will not follow is shown by the sketch staying put.
+                            if !matches!(kind, Pending::SketchPreview) {
+                                self.error = Some(e);
+                            }
                             if self.loading.as_ref().is_some_and(|l| l.id == r.id) {
                                 self.loading = None;
                             }
@@ -618,7 +623,7 @@ impl App {
                             if matches!(kind, Pending::Edit | Pending::Create | Pending::SketchEdit(_)) {
                                 self.refresh();
                             }
-                            if matches!(kind, Pending::SketchEdit(_) | Pending::SketchData) {
+                            if matches!(kind, Pending::SketchEdit(_) | Pending::SketchData | Pending::SketchPreview) {
                                 self.on_sketch_error(&kind);
                             }
                         }
@@ -702,6 +707,7 @@ impl App {
                 Pending::AgentQuery => {}
                 Pending::SketchData => self.on_sketch_data(&v),
                 Pending::SketchEdit(adds) => self.on_sketch_edit(adds, &v),
+                Pending::SketchPreview => self.on_sketch_preview(Some(&v)),
             }
         }
     }
@@ -915,6 +921,9 @@ impl App {
                     self.set_sketch_tool(Some(t));
                 }
             }
+            if pressed(egui::Key::D) {
+                self.set_constrain_tool(Some(Constrain::Dimension));
+            }
             return;
         }
         if pressed(egui::Key::Escape) {
@@ -951,7 +960,9 @@ impl App {
             sketch: self.sketch.as_ref().map(|m| SketchRibbon {
                 label: m.data.as_ref().map_or_else(|| m.obj.clone(), |d| d.label.clone()),
                 tool: m.drawing.as_ref().map(|d| d.tool),
+                constrain: m.constrain,
                 picked: m.selected.len(),
+                picked_any: m.selected.len() + m.selected_constraints.len(),
             }),
         };
         let tab_before = self.tab;
@@ -1013,6 +1024,7 @@ impl App {
                 Action::Command(op) => self.start_command(op),
                 Action::Delete => self.delete_selected(),
                 Action::SketchTool(t) => self.set_sketch_tool(t),
+                Action::SketchConstrain(c) => self.set_constrain_tool(c),
                 Action::SketchConstruction => self.sketch_construction(),
                 Action::SketchDelete => self.sketch_delete(),
                 Action::FinishSketch => self.finish_sketch(),
@@ -1033,6 +1045,7 @@ impl App {
         let top = view.right_top() + egui::vec2(-10.0, 150.0);
         if self.sketch.is_some() {
             ui_chrome::overlay(ctx, "sketch", view, top, egui::Align2::RIGHT_TOP, 290.0, right_height, "Sketch", |ui| self.sketch_panel(ui));
+            self.sketch_editor(ctx);
         } else if let Some(op) = self.command.as_ref().map(|c| c.op) {
             // A command's dialog stands where the properties do, as in the big CAD tools.
             let mut outcome = Outcome::Open;
@@ -1376,7 +1389,7 @@ impl App {
         let d = resp.drag_delta();
         let delta = Vec2::new(d.x, d.y);
         // A press on a handle's arrow drags the handle, not the camera.
-        if !self.drag_handle(ui, &resp) && resp.dragged() {
+        if !self.drag_handle(ui, &resp) && !self.sketch_drag(ui, &resp) && resp.dragged() {
             let held = ui.input(|i| Held {
                 left: i.pointer.button_down(PointerButton::Primary),
                 middle: i.pointer.button_down(PointerButton::Middle),
@@ -1400,7 +1413,7 @@ impl App {
             }
         }
         if resp.double_clicked() {
-            if !self.sketch_double_click() {
+            if !self.sketch_double_click(resp.interact_pointer_pos()) {
                 self.fit();
             }
         } else if resp.clicked()
@@ -1676,6 +1689,26 @@ impl App {
                     self.sketch_hover(Some(pos));
                 }
                 t.log("sketch clicks", json!({ "clicks": sent }));
+                t.stage = Stage::SketchDimension;
+            }
+            Stage::SketchDimension => {
+                // Dimensions as the Dimension tool takes them: a click on the rectangle's
+                // bottom, 24 typed; a click on the circle, 12 typed. Then Fix on the circle.
+                let mut typed = Vec::new();
+                for (at, value) in [((25.0, 10.0), "24"), ((60.0, 31.0), "12")] {
+                    self.set_constrain_tool(Some(Constrain::Dimension));
+                    if let Some(pos) = self.sketch_screen_point(glam::DVec2::new(at.0, at.1)) {
+                        self.sketch_click(pos, false);
+                        typed.push(json!({ "at": [at.0, at.1], "prompt": self.sketch_prompt() }));
+                        self.sketch_apply_value(Some(value));
+                    }
+                }
+                self.set_constrain_tool(Some(Constrain::Fix));
+                if let Some(pos) = self.sketch_screen_point(glam::DVec2::new(66.0, 25.0)) {
+                    self.sketch_click(pos, false);
+                }
+                self.set_sketch_tool(Some(Tool::Rectangle));
+                t.log("sketch dimensions", json!({ "typed": typed, "error": self.error }));
                 t.stage = Stage::SketchDraw;
             }
             Stage::SketchDraw => {

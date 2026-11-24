@@ -100,6 +100,19 @@ def main():
     print("dragged corner:", g[1]["end"], "top", g[2]["start"], g[2]["end"])
     assert abs(g[1]["end"][1] - 28.0) < 1e-6 and abs(g[2]["end"][0] - g[2]["start"][0] + 20.0) < 1e-6, g[:4]
 
+    # A free line dragged as a whole: a dry run shows it moved and leaves it; the move moves it.
+    free, _ = cl.call("sketch_edit", obj=name, add=[{"type": "line", "start": [0, 45], "end": [10, 45]}])
+    k = free["added"][0][0]
+    shown, _ = cl.call("sketch_edit", obj=name, dry_run=True, move={"geometry": k, "to": [3, -2], "relative": True})
+    assert shown["sketch"]["geometry"][k]["start"] == [3.0, 43.0], shown["sketch"]["geometry"][k]
+    assert cl.call("sketch", obj=name)[0]["geometry"][k]["start"] == [0.0, 45.0], "a dry run leaves it"
+    preview, _ = cl.call("sketch_edit", obj=name, dry_run=True, preview=True, move={"geometry": k, "to": [1, 1], "relative": True})
+    assert "trial" not in preview and preview["sketch"]["geometry"][k]["start"] == [1.0, 46.0], preview
+    moved, _ = cl.call("sketch_edit", obj=name, move={"geometry": k, "to": [3, -2], "relative": True})
+    print("line dragged:", moved["sketch"]["geometry"][k]["start"], moved["sketch"]["geometry"][k]["end"])
+    assert moved["sketch"]["geometry"][k]["end"] == [13.0, 43.0], moved["sketch"]["geometry"][k]
+    cl.call("sketch_edit", obj=name, remove={"geometry": [k]})
+
     # Construction geometry is no profile; removing it again brings the profile count back.
     c, _ = cl.call("sketch_edit", obj=name, construction=[{"geometry": 4, "on": True}])
     assert len(c["sketch"]["profiles"]) == 1 and c["sketch"]["geometry"][4]["construction"], c["sketch"]["profiles"]
