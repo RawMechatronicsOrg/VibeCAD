@@ -4,11 +4,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use eframe::egui::{self, Color32, KeyboardShortcut, Modifiers, PointerButton, RichText, Sense};
-use glam::Vec2;
+use eframe::egui::{self, Color32, KeyboardShortcut, Modifiers, PointerButton, Sense};
+use glam::{Vec2, Vec3};
 use serde_json::{Value, json};
 
 use crate::camera::{Camera, View};
+use crate::navigation::{Gesture, Held, Scheme};
+use crate::profile::{Profile, Settings};
 use crate::render::{Frame, GroundGrid, Renderer};
 use crate::scene::SceneData;
 use crate::selftest::{SelfTest, Stage, write_bmp};
@@ -38,8 +40,57 @@ struct Node {
 struct Tree {
     nodes: HashMap<String, Node>,
     roots: Vec<String>,
+    /// The bodies' features in the order they are built, body by body: the timeline.
+    history: Vec<String>,
+    /// The body each feature of the timeline belongs to.
+    owner: HashMap<String, String>,
     undo: u64,
     redo: u64,
+}
+
+const BODY: &str = "PartDesign::Body";
+
+impl Tree {
+    /// The tree lists parts; what a body is built from goes to the timeline. A feature holds
+    /// the sketches it is made from, so they come just before it.
+    fn build_history(&mut self) {
+        fn steps(t: &Tree, name: &str, body: &str, depth: usize, out: &mut Vec<(String, String)>) {
+            let Some(n) = t.nodes.get(name) else { return };
+            if depth > 32 || out.iter().any(|(o, _)| o == name) {
+                return;
+            }
+            for c in &n.children {
+                steps(t, c, body, depth + 1, out);
+            }
+            out.push((name.to_string(), body.to_string()));
+        }
+        fn bodies<'a>(t: &'a Tree, name: &'a str, depth: usize, seen: &mut HashSet<&'a str>, out: &mut Vec<&'a str>) {
+            let Some(n) = t.nodes.get(name) else { return };
+            if depth > 32 || !seen.insert(name) {
+                return;
+            }
+            if n.kind == BODY {
+                out.push(name);
+                return;
+            }
+            for c in &n.children {
+                bodies(t, c, depth + 1, seen, out);
+            }
+        }
+        let mut found = Vec::new();
+        let mut seen = HashSet::new();
+        for r in &self.roots {
+            bodies(self, r, 0, &mut seen, &mut found);
+        }
+        let mut out = Vec::new();
+        for b in found {
+            for c in &self.nodes[b].children {
+                steps(self, c, b, 1, &mut out);
+            }
+        }
+        self.history = out.iter().map(|(f, _)| f.clone()).collect();
+        self.owner = out.into_iter().collect();
+    }
 }
 
 /// What picking needs from the scene shown; the vertices themselves live on the GPU. It grows
@@ -112,6 +163,8 @@ pub struct App {
     palette: bool,
     show_log: bool,
     show_grid: bool,
+    /// How mouse drags move the camera.
+    navigation: Scheme,
     open_on_ready: Option<PathBuf>,
     /// The document has edits that are not saved.
     modified: bool,
@@ -124,10 +177,18 @@ pub struct App {
     /// How the last scene stream went, in milliseconds since it was asked for.
     last_load: Option<Value>,
     selftest: Option<SelfTest>,
+    /// The user's settings, kept between runs.
+    profile: Profile,
+    /// The window's inner size in points when last not maximized, and whether it is now.
+    window_size: [f32; 2],
+    maximized: bool,
+    /// The box the ground grid is sized for: the document's last drawn extent, so the grid
+    /// stays put when everything is hidden.
+    ground: Option<(Vec3, Vec3)>,
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, open: Option<PathBuf>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, open: Option<PathBuf>, profile: Profile, s: Settings, problem: Option<String>) -> Self {
         let rs = cc.wgpu_render_state.as_ref().expect("VibeCAD needs the wgpu renderer");
         let ctx = cc.egui_ctx.clone();
         App {
@@ -136,7 +197,7 @@ impl App {
             freecad: None,
             worker_error: None,
             renderer: Renderer::new(rs),
-            camera: Camera::default(),
+            camera: Camera { ortho: s.ortho, ..Camera::default() },
             pending: HashMap::new(),
             doc_label: None,
             doc_path: None,
@@ -145,21 +206,26 @@ impl App {
             selection: None,
             props: None,
             edits: HashMap::new(),
-            error: None,
+            error: problem,
             info: None,
-            show_edges: true,
-            edge_width: 1.5,
-            palette: true,
-            show_log: false,
-            show_grid: true,
+            show_edges: s.show_edges,
+            edge_width: s.edge_width,
+            palette: s.palette,
+            show_log: s.show_log,
+            show_grid: s.show_grid,
+            navigation: s.navigation,
             open_on_ready: open,
             modified: false,
-            tab: Tab::default(),
+            tab: s.tab,
             view_rect: None,
             loading: None,
             opened_at: None,
             last_load: None,
             selftest: SelfTest::from_env(),
+            profile,
+            window_size: s.window_size,
+            maximized: s.maximized,
+            ground: None,
         }
     }
 
@@ -437,6 +503,7 @@ impl App {
                 error: n["error"].as_bool().unwrap_or(false),
             });
         }
+        t.build_history();
         if self.selection.as_ref().is_some_and(|s| !t.nodes.contains_key(&s.obj)) {
             self.selection = None;
             self.props = None;
@@ -507,6 +574,8 @@ impl App {
         if let Some(l) = self.loading.as_mut()
             && l.fit
         {
+            // Another document: its own extent, not the last one's.
+            self.ground = None;
             if let Some((lo, hi)) = self.scene.as_ref().and_then(|s| s.data.bbox) {
                 self.camera.fit(lo, hi);
             }
@@ -623,6 +692,7 @@ impl App {
             grid: self.show_grid,
             palette: self.palette,
             edge_width: self.edge_width,
+            navigation: self.navigation,
         };
         let (busy, freecad, dead) = (self.busy(), self.freecad.clone(), self.worker_error.is_some());
         let actions = ui_chrome::ribbon(ui, &mut self.tab, &state, |ui| match (dead, freecad) {
@@ -651,13 +721,13 @@ impl App {
                 Action::Undo => self.undo(false),
                 Action::Redo => self.undo(true),
                 Action::Fit => self.fit(),
-                Action::ViewFrom(dir) => ui_chrome::look_from(&mut self.camera, dir),
-                Action::ToggleOrtho => self.camera.ortho = !self.camera.ortho,
+                Action::Projection(ortho) => self.camera.ortho = ortho,
                 Action::ToggleEdges => self.show_edges = !self.show_edges,
                 Action::ToggleLog => self.show_log = !self.show_log,
                 Action::ToggleGrid => self.show_grid = !self.show_grid,
                 Action::TogglePalette => self.palette = !self.palette,
                 Action::EdgeWidth(w) => self.edge_width = w,
+                Action::Navigation(n) => self.navigation = n,
             }
         }
     }
@@ -702,25 +772,38 @@ impl App {
         if !seen.insert(name.to_string()) || depth > 32 {
             return;
         }
-        let selected = self.selection.as_ref().is_some_and(|s| s.obj == name);
+        // A body is lit while one of its features is selected in the timeline or the view.
+        let selected = self.selection.as_ref().is_some_and(|s| s.obj == name || self.tree.owner.get(&s.obj).is_some_and(|b| b == name));
         let mut row = |ui: &mut egui::Ui| {
             let mut vis = node.visible;
             if ui.checkbox(&mut vis, "").on_hover_text("Show in the 3D view").changed() {
                 actions.push(TreeAction::Visible(name.to_string(), vis));
             }
-            let mut text = RichText::new(&node.label);
-            if node.error {
-                text = text.color(Color32::LIGHT_RED);
-            } else if !node.visible {
-                text = text.weak();
+            let kind = ui_chrome::object_kind(&node.kind);
+            let tip = format!("{}\n{}\n\n{name} · {}", node.label, kind.about, node.kind);
+            ui_chrome::kind_badge(ui, kind.family, !node.visible).on_hover_text(&tip);
+            // The label, then what the object is, smaller and greyed.
+            let visuals = &ui.style().visuals;
+            let label_color = if node.error {
+                Color32::LIGHT_RED
+            } else if node.visible {
+                visuals.text_color()
+            } else {
+                visuals.weak_text_color()
+            };
+            let body = egui::TextStyle::Body.resolve(ui.style());
+            let mut text = egui::text::LayoutJob::default();
+            text.append(&node.label, 0.0, egui::TextFormat::simple(body.clone(), label_color));
+            if !kind.name.is_empty() {
+                let small = egui::FontId::new(body.size * 0.8, body.family);
+                text.append(kind.name, 6.0, egui::TextFormat::simple(small, visuals.weak_text_color()));
             }
             // Cut long names to the panel's width; the full one is in the tooltip.
-            let tip = format!("{}\n{}\n{}", node.label, name, node.kind);
             if ui.add(egui::Button::selectable(selected, text).truncate()).on_hover_text(tip).clicked() {
                 actions.push(TreeAction::Select(name.to_string()));
             }
         };
-        if node.children.is_empty() {
+        if node.children.is_empty() || node.kind == BODY {
             ui.horizontal(|ui| {
                 ui.add_space(18.0);
                 row(ui);
@@ -734,6 +817,41 @@ impl App {
                         self.tree_node(ui, c, depth + 1, seen, actions);
                     }
                 });
+        }
+    }
+
+    /// Along the bottom, as in Fusion: every body's features in the order they are built.
+    fn timeline_panel(&mut self, ui: &mut egui::Ui) {
+        let mut chosen = None;
+        egui::ScrollArea::horizontal().auto_shrink([false, true]).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                let several = self.tree.history.first().map(|f| &self.tree.owner[f]) != self.tree.history.last().map(|f| &self.tree.owner[f]);
+                let mut body: Option<&String> = None;
+                for f in &self.tree.history {
+                    let Some(node) = self.tree.nodes.get(f) else { continue };
+                    let owner = &self.tree.owner[f];
+                    if several && body != Some(owner) {
+                        if body.is_some() {
+                            ui.add_space(6.0);
+                            ui.separator();
+                        }
+                        let label = self.tree.nodes.get(owner).map_or(owner.as_str(), |n| n.label.as_str());
+                        ui.weak(label);
+                        body = Some(owner);
+                    }
+                    let kind = ui_chrome::object_kind(&node.kind);
+                    let selected = self.selection.as_ref().is_some_and(|s| &s.obj == f);
+                    let tip = format!("{}  ({})
+{}", node.label, if kind.name.is_empty() { &node.kind } else { kind.name }, kind.about);
+                    if ui_chrome::timeline_step(ui, kind.family, selected, node.error).on_hover_text(tip).clicked() {
+                        chosen = Some(f.clone());
+                    }
+                }
+            });
+        });
+        if let Some(obj) = chosen {
+            self.select(Some(Selection { obj, sub: None, face_id: 0 }));
         }
     }
 
@@ -885,14 +1003,28 @@ impl App {
         let ppp = ui.ctx().pixels_per_point();
         let size = ((rect.width() * ppp).round().max(1.0) as u32, (rect.height() * ppp).round().max(1.0) as u32);
         self.camera.aspect = rect.width() / rect.height().max(1.0);
+        if let Some(b) = self.scene.as_ref().and_then(|s| s.data.bbox) {
+            self.ground = Some(b);
+        }
 
         let d = resp.drag_delta();
         let delta = Vec2::new(d.x, d.y);
-        let shift = ui.input(|i| i.modifiers.shift);
-        if resp.dragged_by(PointerButton::Primary) && !shift {
-            self.camera.orbit(delta);
-        } else if resp.dragged_by(PointerButton::Secondary) || resp.dragged_by(PointerButton::Middle) || (resp.dragged_by(PointerButton::Primary) && shift) {
-            self.camera.pan(delta, rect.height());
+        if resp.dragged() {
+            let held = ui.input(|i| Held {
+                left: i.pointer.button_down(PointerButton::Primary),
+                middle: i.pointer.button_down(PointerButton::Middle),
+                right: i.pointer.button_down(PointerButton::Secondary),
+                shift: i.modifiers.shift,
+                ctrl: i.modifiers.command,
+            });
+            match self.navigation.gesture(held) {
+                Some(Gesture::Orbit) => self.camera.orbit(delta),
+                Some(Gesture::Look) => self.camera.look(delta),
+                Some(Gesture::Pan) => self.camera.pan(delta, rect.height()),
+                // Up zooms in, about twice per 100 points.
+                Some(Gesture::Zoom) => self.camera.zoom(-delta.y * 4.6),
+                None => {}
+            }
         }
         if resp.hovered() {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
@@ -943,7 +1075,7 @@ impl App {
         painter.text(
             rect.left_bottom() + egui::vec2(8.0, -6.0),
             egui::Align2::LEFT_BOTTOM,
-            "drag: orbit · right/shift-drag: pan · wheel: zoom · double-click/F: fit · 0-3: views · cube: click a face, edge or corner",
+            format!("{} · double-click/F: fit · 0-3: views · cube: click a face, edge or corner", self.navigation.hint()),
             egui::FontId::proportional(11.0),
             ui.visuals().weak_text_color(),
         );
@@ -1007,7 +1139,7 @@ impl App {
         let Some(s) = self.scene.as_ref() else { return Vec::new() };
         let Some((lo, hi)) = s.data.instances.iter().find(|i| i.face_base.is_some()).and_then(|i| i.bbox) else { return Vec::new() };
         let Some((w, h)) = self.renderer.size() else { return Vec::new() };
-        let vp = self.camera.view_proj(w as f32 / h.max(1) as f32);
+        let vp = self.camera.view_proj(w as f32 / h.max(1) as f32, self.drawn_box());
         [0.5, 0.75]
             .into_iter()
             .map(|t| {
@@ -1122,8 +1254,19 @@ impl App {
             .as_ref()
             .and_then(|s| self.scene.as_ref()?.by_obj.get(&s.obj).copied())
             .unwrap_or(0);
+        let grid = self
+            .show_grid
+            // Nothing drawn yet in this document (all hidden, or empty): a 100 mm square.
+            .then(|| self.ground.unwrap_or((Vec3::new(-50.0, -50.0, 0.0), Vec3::new(50.0, 50.0, 0.0))))
+            .map(|(lo, hi)| GroundGrid::around(lo, hi).for_scale(self.camera.px_per_unit(size.1 as f32)));
+        let mut drawn = self.drawn_box();
+        if let Some(g) = grid {
+            // The square is drawn a little past its outline.
+            let h = g.half * 1.01;
+            drawn = (drawn.0.min(Vec3::new(-h, -h, 0.0)), drawn.1.max(Vec3::new(h, h, 0.0)));
+        }
         Frame {
-            view_proj: self.camera.view_proj(size.0 as f32 / size.1.max(1) as f32),
+            view_proj: self.camera.view_proj(size.0 as f32 / size.1.max(1) as f32, drawn),
             forward: self.camera.forward(),
             selected_face: self.selection.as_ref().map_or(0, |s| s.face_id),
             selected_instance,
@@ -1131,12 +1274,16 @@ impl App {
             edge_width: self.edge_width,
             palette: self.palette,
             background,
-            grid: self
-                .show_grid
-                .then(|| self.scene.as_ref().and_then(|s| s.data.bbox))
-                .flatten()
-                .map(|(lo, hi)| GroundGrid::around(lo, hi).for_scale(self.camera.px_per_unit(size.1 as f32))),
+            grid,
         }
+    }
+
+    /// The scene's box, or the camera's own sphere while there is no scene.
+    fn drawn_box(&self) -> (Vec3, Vec3) {
+        self.scene.as_ref().and_then(|s| s.data.bbox).unwrap_or_else(|| {
+            let r = Vec3::splat(self.camera.radius);
+            (self.camera.target - r, self.camera.target + r)
+        })
     }
 
     /// Redraw the view with the current selection (the self-test captures between frames).
@@ -1185,7 +1332,51 @@ enum TreeAction {
     Visible(String, bool),
 }
 
+impl App {
+    /// The settings as they are now, for the profile.
+    fn settings(&self) -> Settings {
+        Settings {
+            navigation: self.navigation,
+            show_edges: self.show_edges,
+            edge_width: self.edge_width,
+            palette: self.palette,
+            show_grid: self.show_grid,
+            show_log: self.show_log,
+            ortho: self.camera.ortho,
+            tab: self.tab,
+            window_size: self.window_size,
+            maximized: self.maximized,
+        }
+    }
+
+    /// Follow the window's size and keep the settings.
+    fn keep_settings(&mut self, ctx: &egui::Context) {
+        let (maximized, inner) = ctx.input(|i| (i.viewport().maximized, i.viewport().inner_rect));
+        if let Some(m) = maximized {
+            self.maximized = m;
+        }
+        // Minimized windows report a tiny or empty size; keep the last real one.
+        if let Some(r) = inner.filter(|r| !self.maximized && r.width() >= 200.0 && r.height() >= 200.0) {
+            self.window_size = [r.width().round(), r.height().round()];
+        }
+        let (wait, problem) = self.profile.keep(self.settings(), Instant::now());
+        if let Some(w) = wait {
+            ctx.request_repaint_after(w);
+        }
+        if problem.is_some() {
+            self.error = problem;
+        }
+    }
+}
+
 impl eframe::App for App {
+    fn on_exit(&mut self) {
+        self.profile.keep(self.settings(), Instant::now());
+        if let Some(e) = self.profile.flush() {
+            eprintln!("{e}");
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if ctx.input(|i| i.viewport().close_requested()) && self.selftest.is_none() && !self.may_discard() {
@@ -1195,8 +1386,12 @@ impl eframe::App for App {
         self.shortcuts(&ctx);
         egui::Panel::top("ribbon").show(ui, |ui| self.ribbon(ui));
         egui::Panel::bottom("status").resizable(false).show(ui, |ui| self.status_panel(ui));
+        if !self.tree.history.is_empty() {
+            egui::Panel::bottom("timeline").resizable(false).show(ui, |ui| self.timeline_panel(ui));
+        }
         egui::CentralPanel::no_frame().show(ui, |ui| self.viewport(ui));
         self.overlays(&ctx);
+        self.keep_settings(&ctx);
         if self.selftest.is_some() {
             self.selftest_step(&ctx);
             ctx.request_repaint();
@@ -1204,5 +1399,37 @@ impl eframe::App for App {
         if self.busy() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(kind: &str, children: &[&str]) -> Node {
+        Node { label: String::new(), kind: kind.into(), children: children.iter().map(|c| c.to_string()).collect(), visible: true, error: false }
+    }
+
+    #[test]
+    fn the_timeline_holds_what_bodies_are_built_from_in_order() {
+        let mut t = Tree { roots: vec!["Part".into(), "Box".into()], ..Default::default() };
+        for (name, kind, children) in [
+            ("Part", "App::Part", &["Body", "Body001"][..]),
+            ("Body", BODY, &["Pad", "Pocket"]),
+            ("Pad", "PartDesign::Pad", &["Sketch"]),
+            ("Sketch", "Sketcher::SketchObject", &[]),
+            ("Pocket", "PartDesign::Pocket", &["Sketch001"]),
+            ("Sketch001", "Sketcher::SketchObject", &[]),
+            ("Body001", BODY, &["Fillet"]),
+            ("Fillet", "PartDesign::Fillet", &[]),
+            ("Box", "Part::Box", &[]),
+        ] {
+            t.nodes.insert(name.into(), node(kind, children));
+        }
+        t.build_history();
+        assert_eq!(t.history, ["Sketch", "Pad", "Sketch001", "Pocket", "Fillet"]);
+        assert_eq!(t.owner["Pocket"], "Body");
+        assert_eq!(t.owner["Fillet"], "Body001");
+        assert!(!t.owner.contains_key("Box") && !t.owner.contains_key("Body"));
     }
 }

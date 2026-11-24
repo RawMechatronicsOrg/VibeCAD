@@ -74,7 +74,27 @@ one and reopens the file.
   closes after that one connection, and the directory is removed once FreeCAD has read the script. Every message is a JSON header plus an optional binary payload, both
   length-prefixed (see the script's docstring). Commands: `open`, `new`, `tree`, `props`,
   `set_prop`, `set_visible`, `undo`, `redo`, `scene`, `save_as`, `export`. Requests go out as
-  they are made; replies come back in order, a scene's stream frames before its reply.
+  they are made; replies come back in order, a scene's stream frames before its reply, except
+  that `tree` and `props` asked while a scene streams are answered at once, between its frames,
+  so the tree and the properties of a selected part do not wait for a large assembly to load.
+  The window writes each request from a thread of its own the moment it is made, and matches
+  replies to requests by id.
+- **Tessellators.** The worker does not tessellate itself: it starts processes of its own
+  (`VIBECAD_TESSELLATORS`; by default one per core but one, at most 4; 0 meshes in the worker), each a
+  `freecadcmd` running the same script with `VIBECAD_ROLE=tessellator` and connecting back to
+  the worker with a token, as the worker does to the window. A shape goes to an idle one as
+  BREP text (`exportBrepToString`) with the tolerance, and its mesh comes back in the same
+  format as the scene's. Faces keep their order through BREP, so face numbers, colours and
+  picking are unchanged; OCCT may split a face along the other diagonal or add a point or two
+  on a curved one, within the tolerance. A crash in OCCT costs a process, which is started
+  again, not the document: the shape is tried once more, and one that stops a second
+  tessellator is reported in `skipped` and not meshed again in that session. On Windows the
+  tessellators sit in a job object that ends them with the worker, even when the window kills
+  it; elsewhere they end once the worker's connection closes, after the shape they are on. On
+  `open` and `new` the shapes still being meshed for the old document are dropped. If no
+  tessellator can be started (`freecadcmd` unknown: the window passes its path in
+  `VIBECAD_FREECAD_CMD`) the worker meshes itself, as before. The scene's `stats` say how many
+  tessellators there were and how many meshes they made (`pooled`).
 - **Scene.** The worker tessellates each distinct shape once (`MeshPart.meshFromShape` with one
   segment per face) and sends instances that place it, so the 265 links of an assembly with 121
   parts cost 121 meshes. Curves are cut into segments of at most 10° (0.17 rad), so circles are round on screen.
@@ -87,19 +107,24 @@ one and reopens the file.
 - **Loading in stages.** `scene` streams: first, before any tessellation, every instance's
   placement, colours and its shape's box (FreeCAD's `BoundBox`); the window draws those as
   translucent boxes and fits the view, so the tree, selection and orbiting work at once. Then
-  the meshes, biggest box first, in batches about every 0.3 s; each batch is uploaded as its
+  the meshes, handed to the tessellators biggest box first and sent as they finish, in batches
+  about every 0.3 s; each batch is uploaded as its
   own chunk of GPU buffers and replaces its boxes, and faces are numbered in arrival order, so
   picking, highlight and culling work on a partial scene. Progress frames count faces, not
   objects; the view shows a bar with the percentage, the part being tessellated and the time
   left. After an edit the old scene stays until the new one's first meshes arrive. A request
   that changes the scene (`scene`, `open`, `set_prop`, `undo`, …) arriving mid-stream ends the
-  stream (the worker looks between two meshes) and the window ignores what was left of it.
+  stream (the worker looks between two meshes, and at least every 0.3 s while it waits for the
+  tessellators) and the window ignores what was left of it. Shapes already handed out are
+  meshed to the end and go to the caches; the next scene waits for those it still needs instead
+  of meshing them again, so an edit during a load costs little.
 - **Mesh caches.** In memory by shape hash, so after an edit only changed shapes are
   tessellated again. On disk in `%LOCALAPPDATA%\VibeCAD\cache` (`$XDG_CACHE_HOME/vibecad`,
   `~/Library/Caches/VibeCAD`; `VIBECAD_CACHE_DIR` overrides), keyed by the SHA-256 of the
   `.FCStd` file the shape comes from, the object's name, the tolerance, FreeCAD's version and a
   cache version. A document edited in this session (`set_prop`, undo, redo) uses no disk entry
-  until it is saved, so an edited shape is never served from a stale one. Entries past 1 GB are
+  until it is saved, so an edited shape is never served from a stale one (the key is taken when
+  a shape is handed out, so a save or an undo while it is meshed cannot misfile it). Entries past 1 GB are
   dropped, least recently used first. Hashing each shape's BREP instead was measured and
   rejected: 3 s and 76 MB of strings for the Orbiter assembly, against 13 ms for its file.
 - **Drawing.** Each mesh is uploaded once (vertices split per face, so faces keep sharp normals
@@ -112,13 +137,15 @@ one and reopens the file.
   (so they face outward); such meshes are drawn with back faces culled, with the winding
   flipped for mirrored instances. Open shells, sketches and anything else are drawn from both
   sides. The status line shows how many objects and triangles the last frame drew.
-- **Shading.** Matte: sky/ground ambient, a headlight and a key light from above, no highlight,
-  two-sided. The view is drawn with 4x MSAA (1x where the GPU's formats lack it, or with
-  `VIBECAD_NO_MSAA` set) and resolved into the texture egui shows. Edges are not GPU lines:
-  each segment becomes a screen-facing quad in the vertex shader (from the edge points in a
-  storage buffer), clipped at the near plane before the divide, with a soft falloff across its
-  width and alpha blending; the ends reach half the width past the points so corners close.
-  Faces carry a depth bias so the edges on them win; hidden edges stay hidden.
+- **Shading.** Plastic lit in linear light and written back as sRGB: a soft sky and ground, a
+  headlight, a key light from above-front, a soft highlight and a faint fresnel rim, with a gentle
+  shoulder so light parts do not burn out. (Lighting the sRGB values directly darkened and greyed
+  every face turned from the light.) Two-sided. The view is drawn with 4x MSAA (1x where the
+  GPU's formats lack it, or with `VIBECAD_NO_MSAA` set) and resolved into the texture egui shows.
+  Edges are not GPU lines: each segment becomes a screen-facing quad in the vertex shader (from
+  the edge points in a storage buffer), clipped at the near plane before the divide, with a soft
+  falloff across its width and alpha blending; the ends reach half the width past the points so
+  corners close. Faces carry a depth bias so the edges on them win; hidden edges stay hidden.
 - **Picking.** Face ids are drawn in their own single-sample pass into an `R32Uint` target,
   without lighting, only when a click asks: the pass replays the last frame's camera and
   culled instances, scissored to the clicked pixel, and the pixel is read back and mapped to
@@ -136,9 +163,18 @@ python worker/test_worker.py examples/plate.FCStd  # the worker protocol, agains
 ```
 
 `test_worker.py` gives the worker an empty disk cache, checks the scene stream (boxes first,
-progress in faces, each mesh once, biggest first), opens every file again in a new process to
-check that all meshes come from the disk cache, that an edited shape does not, and that a second
-`scene` sent mid-stream ends the first.
+progress in faces, each mesh once, biggest first when nothing was tessellated), that a `tree`
+sent during a scene longer than a second is answered before it, opens every file again in a new
+process to check that all meshes come from the disk cache, that an edited shape does not, and
+that a second `scene` sent mid-stream ends the first. Last it loads every file twice more from
+an empty cache, meshed in the worker (`VIBECAD_TESSELLATORS=0`) and by the tessellators, and
+checks that the tessellators made every mesh and that the meshes agree: the same faces and
+flags, triangle counts within 1 %, the same box within the tolerance. Give it a large assembly
+too, so the tessellators run in parallel:
+
+```
+python worker/test_worker.py examples/plate.FCStd path/to/assembly.FCStd
+```
 
 `VIBECAD_SELFTEST=<dir> vibecad examples/plate.FCStd` drives the window itself: it keeps a frame
 of the boxes and one of a partly loaded scene while the document streams in, zooms in and back,
@@ -157,9 +193,14 @@ documents, where the `Pad` steps just report an error.
 - The first view of a large assembly takes time: the 158 000-face Orbiter assembly shows its
   boxes 0.5 s after it is open, its first mesh after 2.3 s and all of it after about 19 s
   (some 3 s of that checking which shapes are closed solids); from the disk cache all of it
-  takes 0.6 s. OCCT meshes each shape on one thread here: `MeshPart` has no parallel option,
-  and tessellating shapes on four Python threads saved only 17 % (9.6 s instead of 11.5 s for
-  the meshing alone, at twice the CPU), so it is not done.
+  takes 0.6 s. OCCT meshes each shape on one thread: `MeshPart` has no parallel option, and
+  four Python threads saved only 17 % (9.6 s instead of 11.5 s for the meshing alone), hence
+  processes. On the Orbiter assembly as it is now (51 distinct shapes, 93 500 faces, 16 cores)
+  a cold load took 12.8 s meshed in the worker, 7.5 s with 2 tessellators, 4.5 s with 4 and 4.0 s
+  with 8; past 4 the biggest parts set the pace. Writing the shapes as BREP costs the worker
+  about 1.8 s of that, spread over the load. Each tessellator is a FreeCAD of about 70 MB, and
+  the first scene after start waits for them to connect (some 0.1 s). A shape on which OCCT
+  hangs keeps its tessellator, and the scene waits for it, without a time limit.
 - Boxes are FreeCAD's bounding boxes, which for some curved shapes are much larger than the
   shape; they are only a placeholder until the mesh arrives.
 - Meshes share one vertex, one index and one edge buffer per batch. The window asks the GPU

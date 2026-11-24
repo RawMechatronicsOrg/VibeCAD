@@ -7,6 +7,8 @@
 
 mod app;
 mod camera;
+mod navigation;
+mod profile;
 mod render;
 mod scene;
 mod selftest;
@@ -15,6 +17,9 @@ mod worker;
 
 fn main() -> eframe::Result {
     let open = std::env::args_os().nth(1).map(std::path::PathBuf::from);
+    // The self-test starts from the defaults and leaves the user's settings alone.
+    let (profile, settings, problem) =
+        if std::env::var_os("VIBECAD_SELFTEST").is_some() { (profile::Profile::off(), Default::default(), None) } else { profile::Profile::load() };
     // Ask the GPU for the buffer sizes it really has: wgpu's defaults stop at 256 MB, which a
     // large assembly passes.
     let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
@@ -32,8 +37,11 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         wgpu_options,
-        viewport: eframe::egui::ViewportBuilder::default().with_inner_size([1400.0, 900.0]).with_title("VibeCAD"),
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size(settings.window_size)
+            .with_maximized(settings.maximized)
+            .with_title("VibeCAD"),
         ..Default::default()
     };
-    eframe::run_native("VibeCAD", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, open)))))
+    eframe::run_native("VibeCAD", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, open, profile, settings, problem)))))
 }

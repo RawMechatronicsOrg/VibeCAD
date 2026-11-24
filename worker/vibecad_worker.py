@@ -13,19 +13,27 @@ Every message, in both directions, is one frame:
 A request header is {"id": n, "cmd": "...", ...}; the reply carries the same id and either
 "ok": true with the command's fields or "ok": false with "error". Before its reply, "scene"
 streams frames with the same id and "partial": true (see `Worker.cmd_scene`); only they carry a
-payload. Requests may arrive while a scene streams: they wait, and one that changes what the
-scene shows ends the stream early.
+payload. Requests may arrive while a scene streams: "tree" and "props" are answered at once,
+between the scene's frames; others wait, and one that changes what the scene shows ends the
+stream early. So replies come in request order except for those two.
+
+Shapes are tessellated in other processes (see `Tessellators`): freecadcmd running this same
+script with VIBECAD_ROLE=tessellator, which get each shape as BREP text and send its mesh back.
 """
 import array
 import collections
 import hashlib
+import hmac
 import math
 import json
 import os
 import select
+import shutil
 import socket
 import struct
+import subprocess
 import sys
+import tempfile
 import time
 import traceback
 import xml.etree.ElementTree as ET
@@ -60,6 +68,27 @@ ENDS_SCENE = {"scene", "open", "new", "set_prop", "undo", "redo", "set_visible"}
 ANGULAR_DEFLECTION = 0.17
 CACHE_VERSION = 3  # 2: meshes carry "curved_faces", B-rep edges only for shapes without faces; 3: finer angle
 CACHE_LIMIT = 1 << 30
+# Requests answered while a scene streams, between two of its frames: they only read.
+ANSWERED_DURING_SCENE = {"tree", "props"}
+# Tessellators that have not connected this long after their start are given up.
+TESSELLATOR_START_SECONDS = 60
+
+# The tessellators run this same script. The window removes its copy once this process has
+# read it, so keep the text to write theirs.
+try:
+    with open(__file__, "rb") as _f:
+        SOURCE = _f.read()
+except (NameError, OSError):
+    SOURCE = None
+
+
+def tessellator_count():
+    """VIBECAD_TESSELLATORS, else one per core up to 4, leaving a core for this process.
+    0 tessellates in this process."""
+    try:
+        return max(0, int(os.environ["VIBECAD_TESSELLATORS"]))
+    except (KeyError, ValueError):
+        return min(4, max(1, (os.cpu_count() or 2) - 1))
 
 
 class Worker:
@@ -76,6 +105,10 @@ class Worker:
         self.edited = False
         self.disk = DiskCache(cache_dir())
         self.conn = None       # set by `serve`; a scene streams through it
+        self.pool = None       # Tessellators, set by `start_tessellators`; None meshes here
+        self.jobs = {}         # job sent to a tessellator -> (mesh entry, tolerance, disk key)
+        self.next_job = 1
+        self.crashed = []      # (key, shape) of shapes that stopped two tessellators
 
     # ---- documents -------------------------------------------------------------------
 
@@ -138,6 +171,10 @@ class Worker:
         self.mesh_cache.clear()
         self.tol, self.tol_key = None, None
         self.edited = False
+        # Shapes of the document closed or reloaded: not worth waiting for.
+        if self.pool is not None:
+            self.pool.abandon()
+        self.jobs.clear()
 
     # ---- tree and properties ---------------------------------------------------------
 
@@ -164,12 +201,20 @@ class Worker:
                 if name not in omit and members and all(m in omit for m in members):
                     omit.add(name)
                     changed = True
+        # As in FreeCAD's own tree, a feature built from sketches holds them: a Pad shows the
+        # sketch it extrudes under it, not beside it in the Body.
+        claimed = {}
+        for o in objects:
+            for sketch in _profiles(o):
+                if sketch.Name in groups and sketch.Name not in claimed and sketch.Name not in omit:
+                    claimed[sketch.Name] = o.Name
+                    groups[o.Name].append(sketch.Name)
         in_group = set()
         nodes = []
         for o in objects:
             if o.Name in omit:
                 continue
-            children = [c for c in groups[o.Name] if c not in omit]
+            children = [c for c in groups[o.Name] if c not in omit and claimed.get(c, o.Name) == o.Name]
             in_group.update(groups[o.Name])
             nodes.append({
                 "name": o.Name,
@@ -178,6 +223,8 @@ class Worker:
                 "children": children,
                 "visible": self._visible(o),
                 "error": "Invalid" in o.State or "Error" in o.State,
+                # A body's shape is that of its tip: the timeline's rollback marker.
+                "tip": _tip(o),
             })
         roots = [o.Name for o in objects if o.Name not in in_group and o.Name not in omit]
         return {"nodes": nodes, "roots": roots, "undo": doc.UndoCount, "redo": doc.RedoCount}
@@ -252,20 +299,61 @@ class Worker:
         self.vis_changes[obj.Name] = bool(req["visible"])
         return {}
 
+    def cmd_set_tip(self, req):
+        """Roll a body back or forward, as FreeCAD's Set tip: its shape becomes that of
+        `feature`, and the features after it no longer count."""
+        doc = self._doc()
+        body, feature = self._obj(req["body"]), self._obj(req["feature"])
+        if not body.isDerivedFrom("PartDesign::Body") or feature not in body.Group:
+            raise ValueError("%s is not a feature of %s" % (feature.Label, body.Label))
+        tips = self._tips()
+        self.edited = True
+        doc.openTransaction("Set tip")
+        try:
+            body.Tip = feature
+            doc.recompute()
+        except Exception:
+            doc.abortTransaction()
+            raise
+        doc.commitTransaction()
+        self._follow_tips(tips)
+        broken = [o.Name for o in doc.Objects if "Invalid" in o.State]
+        return {"broken": broken}
+
+    def _tips(self):
+        return {o.Name: _tip(o) for o in self._doc().Objects if o.isDerivedFrom("PartDesign::Body")}
+
+    def _follow_tips(self, before):
+        """A body shows its tip: where the tip moved and the old one was shown, show the new
+        one instead, as FreeCAD's GUI does. Drawing state, like set_visible."""
+        doc = self._doc()
+        for body, tip in self._tips().items():
+            old = before.get(body)
+            if old == tip or old is None or tip is None or doc.getObject(old) is None:
+                continue
+            if self._visible(doc.getObject(old)):
+                for name, shown in ((old, False), (tip, True)):
+                    self.gui.setdefault(name, {})["visible"] = shown
+                    self.vis_changes[name] = shown
+
     def cmd_undo(self, req):
         doc = self._doc()
         if doc.UndoCount:
             self.edited = True
+            tips = self._tips()
             doc.undo()
             doc.recompute()
+            self._follow_tips(tips)
         return {"undo": doc.UndoCount, "redo": doc.RedoCount}
 
     def cmd_redo(self, req):
         doc = self._doc()
         if doc.RedoCount:
             self.edited = True
+            tips = self._tips()
             doc.redo()
             doc.recompute()
+            self._follow_tips(tips)
         return {"undo": doc.UndoCount, "redo": doc.RedoCount}
 
     # ---- geometry --------------------------------------------------------------------
@@ -356,12 +444,16 @@ class Worker:
         # Biggest boxes first: the silhouette comes in before the screws.
         order = sorted(range(len(meshes)), key=lambda k: -meshes[k]["size"])
         stats = {"meshes": len(meshes), "memory_hits": 0, "disk_hits": 0, "tessellated": 0,
+                 "tessellators": 0, "brep_s": 0.0,
                  "boxes_s": round(boxes_at - started, 3), "first_mesh_s": None}
         batch, blobs, size, last_sent = [], [], 0, time.time()
         done, skipped, failed, cancelled = 0, [], [], False
 
         def progress(obj):
             return {"done_faces": done, "total_faces": total, "obj": obj}
+
+        def begun(m):
+            self._send({"id": rid, "partial": True, "stream": "progress", "progress": progress(m["label"])})
 
         def flush():
             nonlocal batch, blobs, size, last_sent
@@ -372,31 +464,30 @@ class Worker:
                             "progress": progress(None)}, b"".join(blobs))
             batch, blobs, size, last_sent = [], [], 0, time.time()
 
-        for k in order:
-            if self._scene_ended():
-                cancelled = True
-                break
-            m = meshes[k]
-            try:
-                enc = self._cached_mesh(m, tol, stats)
-                if enc is None:
-                    self._send({"id": rid, "partial": True, "stream": "progress", "progress": progress(m["label"])})
-                    enc = encode_mesh(m["shape"], tol)
-                    stats["tessellated"] += 1
-                    self._store_mesh(m, tol, enc)
-            except Exception as e:
-                failed.append(k)
-                skipped.extend({"obj": name, "error": error_text(e)} for name in m["objs"])
-                done += m["faces"]
-                continue
-            meta, blob = enc
-            batch.append(dict(meta, index=k, offset=size, size=len(blob)))
-            blobs.append(blob)
-            size += len(blob)
-            done += m["faces"]
-            if time.time() - last_sent >= BATCH_SECONDS:
-                flush()
+        results = self._meshes(meshes, order, tol, stats, begun)
+        try:
+            for k, enc in results:
+                if self._scene_ended():
+                    cancelled = True
+                    break
+                self._answer_waiting_reads()
+                if k is not None:
+                    m = meshes[k]
+                    done += m["faces"]
+                    if isinstance(enc, Exception):
+                        failed.append(k)
+                        skipped.extend({"obj": name, "error": error_text(enc)} for name in m["objs"])
+                    else:
+                        meta, blob = enc
+                        batch.append(dict(meta, index=k, offset=size, size=len(blob)))
+                        blobs.append(blob)
+                        size += len(blob)
+                if time.time() - last_sent >= BATCH_SECONDS:
+                    flush()
+        finally:
+            results.close()
         flush()
+        stats["brep_s"] = round(stats["brep_s"], 3)
         if not cancelled:
             live = set(mesh_index)
             for key in [key for key in self.mesh_cache if key not in live]:
@@ -449,11 +540,173 @@ class Worker:
             return enc
         return None
 
-    def _store_mesh(self, m, tol, enc):
+    def _store_mesh(self, m, enc, disk_key):
+        """Keep a mesh in memory and, under `disk_key` (taken when its tessellation began, so a
+        later edit or save cannot file it under the wrong document state), on disk."""
         self.mesh_cache[m["key"]] = (m["shape"], enc)
-        key = self._disk_key(m, tol)
-        if key:
-            self.disk.put(key, enc)
+        if disk_key:
+            self.disk.put(disk_key, enc)
+
+    def _meshes(self, meshes, order, tol, stats, begun):
+        """(k, encoded mesh or the exception that stopped it) for each mesh in `order`, as each is
+        ready: from the caches at once, the others from the tessellators as they finish, handed
+        out biggest first (or meshed here, in order, without tessellators). While it waits it
+        yields (None, None) at least every BATCH_SECONDS and whenever a request comes in, so the
+        caller can answer it, notice the scene is out of date or send what it has.
+
+        A job outlives a scene that stops early: its mesh still goes to the caches when it
+        comes, and a later scene that needs the same shape waits for it instead of starting
+        it again (an edit leaves most shapes as they were).
+
+        A shape whose tessellator died is tried once more (that process may have died before,
+        while idle); one that kills a second is remembered and never meshed again this session,
+        here least of all."""
+        pool = self.pool if self.pool is not None and self.pool.usable() else None
+        stats["tessellators"] = len(pool.ready) + len(pool.starting) if pool else 0
+        queue = collections.deque()  # k waiting for a tessellator
+        mine = {}                    # job -> k, for this scene's jobs
+        tries = collections.Counter()  # k -> tessellators lost on it
+
+        def here(k):
+            m = meshes[k]
+            begun(m)
+            try:
+                enc = encode_mesh(m["shape"], tol)
+            except Exception as e:
+                return e
+            stats["tessellated"] += 1
+            self._store_mesh(m, enc, self._disk_key(m, tol))
+            return enc
+
+        def hand_out():
+            """Give queued shapes to idle tessellators; (k, exception) for those that could not go."""
+            failed = []
+            for t in pool.idle():
+                while queue and t.job is None:
+                    k = queue.popleft()
+                    m = meshes[k]
+                    try:
+                        t0 = time.time()
+                        brep = m["shape"].exportBrepToString().encode("utf-8")
+                        stats["brep_s"] += time.time() - t0
+                    except Exception as e:
+                        failed.append((k, e))
+                        continue
+                    job = self.next_job
+                    self.next_job += 1
+                    if pool.submit(t, job, brep, tol):
+                        self.jobs[job] = (m, tol, self._disk_key(m, tol))
+                        mine[job] = k
+                        begun(m)
+                    else:
+                        queue.appendleft(k)
+                        break
+            return failed
+
+        def take(finished):
+            """File what the tessellators sent, all of it before anything is yielded (the caller
+            may stop at any yield); (k, result) for this scene's shapes that are done."""
+            out = []
+            for job, res, lost in finished:
+                entry = self.jobs.pop(job, None)
+                if entry is not None and not isinstance(res, Exception):
+                    self._store_mesh(entry[0], res, entry[2])
+                if job not in mine:
+                    continue
+                k = mine.pop(job)
+                if lost:
+                    tries[k] += 1
+                    if tries[k] < 2:
+                        queue.appendleft(k)
+                        continue
+                    self.crashed.append((meshes[k]["key"], meshes[k]["shape"]))
+                    res = RuntimeError("this shape stopped two tessellators; it is not meshed again")
+                elif not isinstance(res, Exception):
+                    stats["tessellated"] += 1
+                stats["pooled"] += not isinstance(res, Exception)
+                out.append((k, res))
+            return out
+
+        stats["pooled"] = stats["joined"] = 0
+        for k in order:
+            m = meshes[k]
+            if any(key == m["key"] and shape.isSame(m["shape"]) for key, shape in self.crashed):
+                yield k, RuntimeError("this shape stopped two tessellators; it is not meshed again")
+                continue
+            try:
+                enc = self._cached_mesh(m, tol, stats)
+            except Exception as e:
+                yield k, e
+                continue
+            if enc is not None:
+                yield k, enc
+                continue
+            # A job a stopped scene left running on a live tessellator.
+            job = None if pool is None else next(
+                (j for j, (jm, jtol, _) in self.jobs.items()
+                 if jtol == tol and jm["key"] == m["key"] and pool.holds(j) and jm["shape"].isSame(m["shape"])), None)
+            if job is not None:
+                mine[job] = k
+                stats["joined"] += 1
+            elif pool is None:
+                yield k, here(k)
+            else:
+                queue.append(k)
+                yield from hand_out()
+        while pool is not None and (queue or mine):
+            if not pool.usable():
+                # No tessellator is left (or none ever started): mesh the rest here, as before
+                # there were tessellators. Shapes known to crash OCCT were filtered out above.
+                for job in list(mine):
+                    self.jobs.pop(job, None)
+                    yield mine.pop(job), RuntimeError("the tessellator stopped while meshing this shape")
+                while queue:
+                    k = queue.popleft()
+                    if tries[k]:  # it may be what stopped them
+                        yield k, RuntimeError("the tessellator stopped while meshing this shape")
+                    else:
+                        yield k, here(k)
+                break
+            watched = pool.sockets() + ([self.conn.sock] if self.conn is not None else [])
+            readable = select.select(watched, [], [], BATCH_SECONDS)[0]
+            done = take(pool.finished(readable))
+            done.extend(hand_out())
+            yield from done
+            yield None, None
+
+    def _answer_waiting_reads(self):
+        """Answer the requests that only read, waiting while a scene streams, up to the first
+        that does not (it waits for the scene, and so do those behind it)."""
+        while self.conn is not None and self.conn.pending \
+                and self.conn.pending[0].get("cmd") in ANSWERED_DURING_SCENE:
+            self.conn.send(*self.answer(self.conn.pending.popleft()))
+
+    def answer(self, req):
+        """The reply to one request: (encoded header, payload)."""
+        rid = req.get("id")
+        handler = getattr(self, "cmd_" + str(req.get("cmd")), None)
+        try:
+            if handler is None:
+                raise ValueError("unknown command: %s" % req.get("cmd"))
+            result = handler(req)
+            payload = b""
+            if isinstance(result, tuple):
+                result, payload = result
+            reply = {"id": rid, "ok": True}
+            reply.update(result)
+            return encode_header(reply), payload
+        except Exception as e:  # report to the window, keep serving
+            return encode_header({"id": rid, "ok": False, "error": error_text(e),
+                                  "trace": traceback.format_exc(limit=6)}), b""
+
+    def start_tessellators(self):
+        count = tessellator_count()
+        if count and SOURCE:
+            try:
+                self.pool = Tessellators(count, SOURCE)
+            except Exception as e:
+                print("VibeCAD: tessellators not started, meshing here:", error_text(e), file=sys.stderr)
+                self.pool = None
 
     # ---- helpers ---------------------------------------------------------------------
 
@@ -794,6 +1047,218 @@ class DiskCache:
         self.size = total
 
 
+class Tessellator:
+    """One tessellator process and its connection; `job` is the job it is meshing, or None."""
+
+    def __init__(self, sock, proc):
+        self.sock, self.proc, self.job = sock, proc, None
+
+
+class Tessellators:
+    """Processes that tessellate shapes for this worker, one shape at a time each.
+
+    Each is a freecadcmd running this script with VIBECAD_ROLE=tessellator. It connects back to
+    a listener here and greets with its pid and a token from its environment, so nothing else on
+    the machine can pose as one; the listener closes once every started process has connected
+    or died. A job is a header {"job", "tol"} with the shape as BREP text for payload; the answer
+    is {"job", "ok": true, "meta"} with `encode_mesh`'s blob, or {"job", "ok": false, "error"}.
+    A crash in OCCT costs one tessellator, not the document: the process is started again, up
+    to `restarts` times in all. On Windows the tessellators sit in a job object that ends them
+    with this process, however it ends; elsewhere they end when their connection does (after
+    the shape they are on).
+    """
+
+    def __init__(self, count, source):
+        exe = os.environ.get("VIBECAD_FREECAD_CMD") or sys.executable
+        if not exe or "freecad" not in os.path.basename(exe).lower():
+            raise RuntimeError("FreeCAD's console is not known (VIBECAD_FREECAD_CMD)")
+        self.exe, self.count, self.source = exe, count, source
+        self.token = os.urandom(16).hex()
+        self.ready = []                 # connected Tessellators
+        self.starting = {}              # pid -> (Popen, time started), not connected yet
+        self.listener, self.dir = None, None
+        self.restarts = 4 * count
+        self.contain = _kill_with_this_process()
+        self._start(count)
+
+    def usable(self):
+        """Some are connected or still starting; otherwise shapes are meshed in this process."""
+        return bool(self.ready or self.starting)
+
+    def idle(self):
+        return [t for t in self.ready if t.job is None]
+
+    def holds(self, job):
+        return any(t.job == job for t in self.ready)
+
+    def sockets(self):
+        return ([self.listener] if self.listener is not None else []) + [t.sock for t in self.ready]
+
+    def submit(self, t, job, brep, tol):
+        """Send `t` a job; False when it is gone."""
+        try:
+            send_frame(t.sock, {"job": job, "tol": tol}, brep)
+        except OSError:
+            self._lost(t)
+            return False
+        t.job = job
+        return True
+
+    def finished(self, readable):
+        """(job, (meta, blob) or the exception that stopped it, whether its tessellator died)
+        for each job answered in `readable`; also takes in tessellators that connected, and
+        starts new ones for those that died."""
+        out = []
+        if self.listener is not None and self.listener in readable:
+            self._accept()
+        for t in [t for t in self.ready if t.sock in readable]:
+            try:
+                header, payload = recv_frame(t.sock)
+            except (EOFError, OSError, ValueError):
+                job = t.job
+                self._lost(t)
+                if job is not None:
+                    out.append((job, RuntimeError("the tessellator stopped while meshing this shape"), True))
+                continue
+            job, t.job = header.get("job"), None
+            if header.get("ok"):
+                out.append((job, (header["meta"], payload), False))
+            else:
+                out.append((job, RuntimeError(header.get("error") or "tessellation failed"), False))
+        self._settle()
+        return out
+
+    def abandon(self):
+        """Stop the jobs under way (of a document closed since): their tessellators start anew."""
+        for t in [t for t in self.ready if t.job is not None]:
+            self.restarts += 1  # not a crash
+            self._lost(t)
+
+    def _start(self, n):
+        if self.listener is None:
+            self.listener = socket.socket()
+            self.listener.bind(("127.0.0.1", 0))
+            self.listener.listen(n + 4)
+            self.listener.setblocking(False)
+        if self.dir is None:
+            self.dir = tempfile.mkdtemp(prefix="vibecad-tessellator-")  # private to this user
+        script = os.path.join(self.dir, "vibecad_worker.py")
+        if not os.path.exists(script):  # a process starting now may be reading it
+            with open(script, "wb") as f:
+                f.write(self.source)
+        env = dict(os.environ, VIBECAD_ROLE="tessellator", VIBECAD_TOKEN=self.token,
+                   VIBECAD_ADDR="127.0.0.1:%d" % self.listener.getsockname()[1])
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        for _ in range(n):
+            try:
+                # stderr goes where this process's goes: the window's log.
+                p = subprocess.Popen([self.exe, script], env=env, stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.DEVNULL, creationflags=flags)
+            except OSError:
+                break
+            if self.contain is not None:
+                self.contain(p)
+            self.starting[p.pid] = (p, time.time())
+        self._settle()
+
+    def _accept(self):
+        while True:
+            try:
+                sock, _ = self.listener.accept()
+            except OSError:  # BlockingIOError: nobody else is waiting
+                return
+            try:
+                sock.setblocking(True)
+                sock.settimeout(2)  # a process of ours greets at once
+                hello, _ = recv_frame(sock)
+                sock.settimeout(None)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                token = str(hello.get("token", "")).encode("utf-8", "replace")
+                pid = hello.get("pid")
+                ours = hmac.compare_digest(token, self.token.encode()) and isinstance(pid, int) and pid in self.starting
+            except Exception:
+                ours = False
+            if not ours:
+                sock.close()
+                continue
+            proc, _ = self.starting.pop(pid)
+            self.ready.append(Tessellator(sock, proc))
+
+    def _lost(self, t):
+        try:
+            t.sock.close()
+        except OSError:
+            pass
+        try:
+            t.proc.kill()
+        except OSError:
+            pass
+        self.ready.remove(t)
+        if self.restarts > 0:
+            self.restarts -= 1
+            self._start(1)
+
+    def _settle(self):
+        """Forget processes that died or never connected; close the listener and remove the
+        script once nobody is left to connect."""
+        now = time.time()
+        for pid, (p, started) in list(self.starting.items()):
+            late = now - started > TESSELLATOR_START_SECONDS
+            if p.poll() is not None or late:
+                if late:
+                    p.kill()
+                del self.starting[pid]
+        if not self.starting:
+            if self.listener is not None:
+                self.listener.close()
+                self.listener = None
+            if self.dir is not None:
+                shutil.rmtree(self.dir, ignore_errors=True)
+                self.dir = None
+
+
+def _kill_with_this_process():
+    """On Windows, a function that puts a started process into a job object ending it with this
+    process, even when this one is killed; None elsewhere or when that fails."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class Basic(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                        ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                        ("SchedulingClass", wintypes.DWORD)]
+
+        class Io(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_uint64) for n in ("Reads", "Writes", "Others", "ReadBytes", "WriteBytes", "OtherBytes")]
+
+        class Extended(ctypes.Structure):
+            _fields_ = [("Basic", Basic), ("Io", Io), ("ProcessMemoryLimit", ctypes.c_size_t),
+                        ("JobMemoryLimit", ctypes.c_size_t), ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        job = k32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        info = Extended()
+        info.Basic.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):  # ExtendedLimitInformation
+            return None
+        # The handle stays open as long as this process does: when it ends, so do they.
+        return lambda proc: k32.AssignProcessToJobObject(job, int(proc._handle))
+    except Exception:
+        return None
+
+
 def _finite(x):
     try:
         return math.isfinite(float(x))
@@ -812,6 +1277,26 @@ def _is_container(o):
     """Groups whose members are drawn rather than the group itself. A Body shows its tip feature."""
     return o.isDerivedFrom("App::Part") or o.isDerivedFrom("App::DocumentObjectGroup") \
         or o.isDerivedFrom("PartDesign::Body")
+
+
+def _profiles(o):
+    """The sketches a feature is built from: a Pad's or Pocket's profile, a loft's sections, a
+    sweep's spine."""
+    links = []
+    for prop in ("Profile", "Spine"):
+        v = getattr(o, prop, None) if prop in o.PropertiesList else None
+        links.append(v[0] if isinstance(v, tuple) else v)
+    if "Sections" in o.PropertiesList:
+        links.extend(v[0] if isinstance(v, tuple) else v for v in (o.Sections or []))
+    return [x for x in links if x is not None and hasattr(x, "TypeId") and x.isDerivedFrom("Part::Part2DObject")]
+
+
+def _tip(o):
+    """The name of a body's tip feature, or None (an empty body, or not a body)."""
+    if not o.isDerivedFrom("PartDesign::Body"):
+        return None
+    tip = getattr(o, "Tip", None)
+    return tip.Name if tip is not None else None
 
 
 def _is_datum(o):
@@ -1054,30 +1539,43 @@ def serve(addr):
     conn = worker.conn = Conn(sock)
     send_frame(sock, {"id": 0, "ok": True, "hello": True, "token": os.environ.get("VIBECAD_TOKEN", ""),
                       "freecad": ".".join(FreeCAD.Version()[:3]), "python": sys.version.split()[0]})
+    # They start while the window asks for its document.
+    worker.start_tessellators()
     while True:
         try:
             req = conn.next()
         except (EOFError, ConnectionError):
             return
-        rid = req.get("id")
-        handler = getattr(worker, "cmd_" + str(req.get("cmd")), None)
+        conn.send(*worker.answer(req))
+
+
+def serve_tessellator(addr):
+    """A tessellator (see `Tessellators`): mesh the shapes the worker sends until it goes away."""
+    host, port = addr.rsplit(":", 1)
+    sock = socket.create_connection((host, int(port)))
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    send_frame(sock, {"token": os.environ.get("VIBECAD_TOKEN", ""), "pid": os.getpid()})
+    while True:
         try:
-            if handler is None:
-                raise ValueError("unknown command: %s" % req.get("cmd"))
-            result = handler(req)
-            payload = b""
-            if isinstance(result, tuple):
-                result, payload = result
-            reply = {"id": rid, "ok": True}
-            reply.update(result)
-            encoded = encode_header(reply)
-        except Exception as e:  # report to the window, keep serving
-            payload = b""
-            encoded = encode_header({"id": rid, "ok": False, "error": error_text(e),
-                                     "trace": traceback.format_exc(limit=6)})
-        send_frame(sock, encoded, payload)
+            header, brep = recv_frame(sock)
+        except (EOFError, OSError):
+            return
+        job = header.get("job")
+        try:
+            shape = Part.Shape()
+            shape.importBrepFromString(brep.decode("utf-8"))
+            meta, blob = encode_mesh(shape, header["tol"])
+            reply, payload = {"job": job, "ok": True, "meta": meta}, blob
+        except Exception as e:
+            reply, payload = {"job": job, "ok": False, "error": error_text(e)}, b""
+        try:
+            send_frame(sock, reply, payload)
+        except OSError:
+            return
 
 
 addr = os.environ.get("VIBECAD_ADDR")
-if addr:
+if addr and os.environ.get("VIBECAD_ROLE") == "tessellator":
+    serve_tessellator(addr)
+elif addr:
     serve(addr)

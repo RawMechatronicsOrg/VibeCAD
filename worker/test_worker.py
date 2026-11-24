@@ -5,6 +5,8 @@
 Needs FreeCAD's console: VIBECAD_FREECAD_CMD, or the default install path. The worker's disk
 cache goes to a fresh temporary directory, so the first scene of each file is a cold start.
 """
+import array
+import collections
 import json
 import os
 import socket
@@ -42,17 +44,20 @@ CACHE = tempfile.mkdtemp(prefix="vibecad-test-cache-")
 
 
 class Client:
-    def __init__(self):
+    def __init__(self, cache=None, **env):
         srv = socket.socket()
         srv.bind(("127.0.0.1", 0))
         srv.listen(1)
         srv.settimeout(60)
-        env = dict(os.environ, VIBECAD_ADDR="127.0.0.1:%d" % srv.getsockname()[1], VIBECAD_CACHE_DIR=CACHE)
+        env = dict(os.environ, VIBECAD_ADDR="127.0.0.1:%d" % srv.getsockname()[1], VIBECAD_CACHE_DIR=cache or CACHE,
+                   VIBECAD_FREECAD_CMD=FREECAD, **env)  # as the window does: the tessellators' FreeCAD
         self.proc = subprocess.Popen([FREECAD, os.path.join(HERE, "vibecad_worker.py")], env=env,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.s, _ = srv.accept()
         self.s.settimeout(300)
         self.n = 0
+        self.inbox = {}  # id -> frames that came while another reply was awaited
+        self.arrived = []  # ids of final replies, in the order they came
         hello, _ = recv(self.s)
         print("hello:", hello)
 
@@ -62,12 +67,25 @@ class Client:
         self.s.sendall(struct.pack("<I", len(h)) + h + struct.pack("<I", 0))
         return self.n
 
-    def reply(self, rid):
-        """The final reply to `rid`; the partial frames before it go to `self.partials`."""
-        self.partials = []
+    def _next(self, rid):
+        waiting = self.inbox.get(rid)
+        if waiting:
+            return waiting.pop(0)
         while True:
             rep, payload = recv(self.s)
-            assert rep["id"] == rid, (rep, rid)
+            if not rep.get("partial"):
+                self.arrived.append(rep["id"])
+            if rep["id"] == rid:
+                return rep, payload
+            assert 0 < rep["id"] <= self.n, rep
+            self.inbox.setdefault(rep["id"], []).append((rep, payload))
+
+    def reply(self, rid):
+        """The final reply to `rid`; the partial frames before it go to `self.partials`. Frames
+        for other requests (answered while a scene streams) are kept for their own `reply`."""
+        self.partials = []
+        while True:
+            rep, payload = self._next(rid)
             if rep.get("partial"):
                 self.partials.append((rep, payload))
                 continue
@@ -89,10 +107,12 @@ class Client:
 
 
 def check_stream(final, partials):
-    """Boxes first, then progress and meshes, biggest shapes first, each mesh once."""
+    """Boxes first, then progress and meshes, each mesh once. Meshed in one process, biggest
+    shapes come first; tessellators hand them back as they finish."""
     assert partials and partials[0][0]["stream"] == "boxes", partials[:1]
     boxes = partials[0][0]
     metas, order, progress, sizes = [None] * len(boxes["meshes"]), [], [], 0
+    blobs = [None] * len(boxes["meshes"])
     for rep, payload in partials[1:]:
         assert rep["stream"] in ("progress", "meshes"), rep["stream"]
         progress.append(rep["progress"])
@@ -106,6 +126,7 @@ def check_stream(final, partials):
                 assert m["faces"] == boxes["meshes"][m["index"]]["faces"], m
                 assert isinstance(m["closed"], bool)
                 metas[m["index"]] = m
+                blobs[m["index"]] = payload[m["offset"]:m["offset"] + m["size"]]
                 order.append(m["index"])
             assert total == len(payload), (total, len(payload))
             sizes += total
@@ -114,11 +135,13 @@ def check_stream(final, partials):
     if not final["cancelled"]:
         missing = [k for k, m in enumerate(metas) if m is None and k not in final["failed_meshes"]]
         assert not missing, missing
-    sizes_sent = [box_size(boxes["meshes"][k]["bbox"]) for k in order]
-    assert sizes_sent == sorted(sizes_sent, reverse=True), "meshes not sent biggest first"
+    stats = final["stats"]
+    if stats["tessellators"] == 0 or stats["tessellated"] == 0:
+        sizes_sent = [box_size(boxes["meshes"][k]["bbox"]) for k in order]
+        assert sizes_sent == sorted(sizes_sent, reverse=True), "meshes not sent biggest first"
     for inst in boxes["instances"]:
         assert 0 <= inst["mesh"] < len(metas) and len(inst["matrix"]) == 16
-    return {"boxes": boxes, "meshes": metas, "instances": boxes["instances"], "bbox": final["bbox"],
+    return {"boxes": boxes, "meshes": metas, "blobs": blobs, "instances": boxes["instances"], "bbox": final["bbox"],
             "stats": final["stats"], "cancelled": final["cancelled"], "progress": progress,
             "frames": len(partials), "bytes": sizes}
 
@@ -158,9 +181,19 @@ def main(paths):
         tree, _ = cl.call("tree")
         t_open = time.time() - t
         t = time.time()
-        scene = cl.scene()
+        # A tree asked for while the scene streams is answered at once, not after the scene.
+        sid = cl.send("scene")
+        cl.inbox.setdefault(sid, []).insert(0, cl._next(sid))  # the boxes: it is streaming
+        tid = cl.send("tree")
+        scene = cl.scene(sid)
+        cl.reply(tid)
         c = check_scene(scene)
         st = scene["stats"]
+        print("   tree asked during the scene answered %s it (scene took %.2fs)" % (
+            "before" if cl.arrived.index(tid) < cl.arrived.index(sid) else "after", st["total_s"]))
+        if st["total_s"] > 1.0:
+            assert cl.arrived.index(tid) < cl.arrived.index(sid), "tree waited for the scene"
+        assert st["pooled"] == st["tessellated"], st  # the tessellators did the meshing
         print("%s: open+tree %.2fs, scene %.2fs (boxes %.2fs, first meshes %.2fs), %d instances of %d meshes, %d nodes, %d faces, %d tris (%d unique), %.1f MB in %d frames, bbox %s" % (
             os.path.basename(path), t_open, time.time() - t, st["boxes_s"], st["first_mesh_s"] or 0, len(scene["instances"]),
             len(scene["meshes"]), len(tree["nodes"]), c["faces"], c["tris"], c["unique_tris"], scene["bytes"] / 1e6,
@@ -195,6 +228,25 @@ def main(paths):
         print("after undo, bbox z:", round(s3["bbox"][5], 2), u)
         r, _ = cl.call("redo")
         print("redo:", r)
+        # Rolling the body back to the pad shows the plate without its hole; undo rolls forward.
+        tips = {n["name"]: n["tip"] for n in cl.call("tree")[0]["nodes"]}
+        assert tips["Body"] == "Pocket", tips
+        cl.call("set_tip", body="Body", feature="Pad")
+        back = cl.scene()
+        tree3, _ = cl.call("tree")
+        shown = sorted(i["obj"] for i in back["instances"])
+        print("rolled back to Pad, shown:", shown)
+        assert [n["tip"] for n in tree3["nodes"] if n["name"] == "Body"] == ["Pad"]
+        assert shown == ["Pad"], shown
+        cl.call("undo")
+        shown = sorted(i["obj"] for i in cl.scene()["instances"])
+        print("undo rolls forward, shown:", shown)
+        assert shown == ["Pocket"], shown
+        try:
+            cl.call("set_tip", body="Body", feature="Body")
+            raise AssertionError("a body is not its own feature")
+        except RuntimeError as ex:
+            print("bad tip refused:", str(ex).splitlines()[0][:70])
         out = os.path.join(tempfile.gettempdir(), "vibecad_saved.FCStd")
         saved, _ = cl.call("save_as", path=out)
         with zipfile.ZipFile(out) as z:
@@ -271,6 +323,73 @@ def main(paths):
         assert end["cancelled"] and not fresh["cancelled"]
         cl.close()
     shutil.rmtree(CACHE, ignore_errors=True)
+
+    # Tessellators get each shape as BREP text; their meshes must match those made in the
+    # worker itself (see `meshes_agree`).
+    for path in paths:
+        got = {}
+        for n in ("0", None):
+            cache = tempfile.mkdtemp(prefix="vibecad-test-cache-")
+            cl = Client(cache, **({"VIBECAD_TESSELLATORS": n} if n else {}))
+            cl.call("open", path=path)
+            got[n] = cl.scene()
+            cl.close()
+            shutil.rmtree(cache, ignore_errors=True)
+        here, pooled = got["0"], got[None]
+        assert here["stats"]["tessellators"] == 0 and here["stats"]["pooled"] == 0
+        # every mesh came from a tessellator, none from a fallback in the worker
+        assert pooled["stats"]["pooled"] == pooled["stats"]["tessellated"] == len(pooled["meshes"]), pooled["stats"]
+        tol = here["boxes"]["tolerance"]
+        problems, identical = {}, 0
+        for k, (a, b) in enumerate(zip(here["meshes"], pooled["meshes"])):
+            if (a is None) != (b is None):
+                problems[k] = "meshed in one process only"
+            elif a is not None:
+                same, why = meshes_agree(a, here["blobs"][k], b, pooled["blobs"][k], tol)
+                identical += same
+                if why:
+                    problems[k] = why
+        print("%s: tessellators (%.2fs) and in-process (%.2fs): %d of %d meshes alike, %d with the same points" % (
+            os.path.basename(path), pooled["stats"]["total_s"], here["stats"]["total_s"],
+            len(here["meshes"]) - len(problems), len(here["meshes"]), identical))
+        assert not problems, problems
+
+
+def meshes_agree(a, blob_a, b, blob_b, tol):
+    """(same points, what differs or None) for two meshes of one shape, one made from a BREP copy.
+
+    Faces, their numbering and the flags must be the same, and every face must have triangles in
+    both. The triangles themselves may differ a little: from the copy's parameters OCCT may split a
+    face along the other diagonal, or add a few points on a curved face (seen on a mirrored part:
+    15 900 triangles instead of 15 896). So the counts may differ by 1 % and the box by the
+    tolerance."""
+    for k in ("faces", "closed", "curved_faces", "brep_edges"):
+        if a[k] != b[k]:
+            return False, "%s %r != %r" % (k, a[k], b[k])
+    pa, fa = _points_and_faces(a, blob_a)
+    pb, fb = _points_and_faces(b, blob_b)
+    if set(fa) != set(fb):
+        return False, "faces without triangles differ"
+    for k in ("triangles", "points", "edge_points"):
+        if abs(a[k] - b[k]) > 0.01 * max(a[k], b[k]):
+            return False, "%s %d != %d" % (k, a[k], b[k])
+    if pa and pb:
+        for axis in range(3):
+            lo = (min(p[axis] for p in pa), min(p[axis] for p in pb))
+            hi = (max(p[axis] for p in pa), max(p[axis] for p in pb))
+            if abs(lo[0] - lo[1]) > tol or abs(hi[0] - hi[1]) > tol:
+                return False, "box differs along axis %d: %r %r" % (axis, lo, hi)
+    same = sorted(tuple(round(v, 3) for v in p) for p in pa) == sorted(tuple(round(v, 3) for v in p) for p in pb)
+    return same, None
+
+
+def _points_and_faces(meta, blob):
+    n, t = meta["points"], meta["triangles"]
+    pos = array.array("f")
+    pos.frombytes(blob[:12 * n])
+    face_of = array.array("I")
+    face_of.frombytes(blob[12 * n + 12 * t:12 * n + 16 * t])
+    return [tuple(pos[3 * i:3 * i + 3]) for i in range(n)], collections.Counter(face_of)
 
 
 if __name__ == "__main__":
