@@ -45,7 +45,7 @@ EDGE WIDTH slider sets the edge width from 1 to 4 pixels (default 1.5).
 | drag | orbit |
 | right or middle drag, shift + drag | pan |
 | wheel | zoom |
-| click | select the face under the cursor (and its object) |
+| click | select the edge near the cursor, else the face under it (and its object) |
 | double click, `F` | fit all |
 | `0` `1` `2` `3` | isometric (from the front-right), front, top, right |
 | `O` | orthographic / perspective |
@@ -65,8 +65,8 @@ opens the document as before.
 | Command | Takes | Makes |
 | --- | --- | --- |
 | Plane | a flat face, a construction plane or XY/XZ/YZ; offset, angle | `PartDesign::Plane` attached to it |
-| Extrude | a flat face (or a sketch from the tree); distance, both sides | `Pad` (positive) or `Pocket` (negative) |
-| Fillet, Chamfer | a face: all its edges; radius or size | `PartDesign::Fillet` / `Chamfer` |
+| Extrude | a flat face (or a sketch from the tree); distance (drag the arrow), both sides | `Pad` (positive) or `Pocket` (negative) |
+| Fillet, Chamfer | edges of one part (a face stands for all its edges); radius or size (drag the arrow) | `PartDesign::Fillet` / `Chamfer` |
 | Mirror | a part, a plane; new solid or join | `Part::Mirroring`, or `PartDesign::Mirrored` of the whole body |
 | Circular | a part, X/Y/Z or a round face (its axis); count, angle | `PartDesign::PolarPattern` of the whole body |
 | Linear | a part, X/Y/Z or a flat face (its normal); count, spacing | `PartDesign::LinearPattern` of the whole body |
@@ -83,6 +83,18 @@ opens the document as before.
 - Construction planes are drawn as translucent orange squares over the model, centred where
   the model's centre falls on them, and can be clicked. A placement (a plane's
   `AttachmentOffset`, an object's `Placement`) shows as six numbers: x, y, z, yaw, pitch, roll.
+
+**Edges and handles.** An edge under the cursor lights up light blue; a click picks it (blue), as
+a face is picked. Only edges of the faces under and around the cursor count, so edges hidden
+behind the part are not picked. In Fillet and Chamfer each click on an edge adds it or takes it
+out again. A selected flat face carries an arrow along its normal: drag it to push or pull the
+face, as Fusion's press-pull does. That opens Extrude with the distance dragged; the solid it
+would add shows in blue, what it would cut in red, and OK (or Enter) makes it. The Extrude
+dialog has the same arrow, and Fillet and Chamfer have one on their first edge for the radius
+or size. Values snap to round steps that follow the zoom. The edges come from the worker on
+demand (`edges`: per edge its polyline, the faces it bounds and the way out of its corner), the
+face from `face` (its triangles, centre and outward normal), and are kept until the model
+changes.
 
 Typed numbers apply on Enter or when the field loses focus. Opening another file or closing the
 window asks before unsaved edits are lost. If FreeCAD crashes, File → Restart FreeCAD starts a new
@@ -106,7 +118,8 @@ one and reopens the file.
   closes after that one connection, and the directory is removed once FreeCAD has read the script. Every message is a JSON header plus an optional binary payload, both
   length-prefixed (see the script's docstring). Commands: `open`, `new`, `tree`, `props`,
   `set_prop`, `set_visible`, `undo`, `redo`, `scene`, `save_as`, `export`, and the modelling
-  ones (`datum_plane`, `extrude`, `fillet`, `mirror`, `pattern`, `copy`, `delete`). Requests go out as
+  ones (`datum_plane`, `extrude`, `fillet`, `mirror`, `pattern`, `copy`, `delete`), and `edges`
+  and `face` for picking edges and drawing handles. Requests go out as
   they are made; replies come back in order, a scene's stream frames before its reply, except
   that `tree` and `props` asked while a scene streams are answered at once, between its frames,
   so the tree and the properties of a selected part do not wait for a large assembly to load.
@@ -228,11 +241,13 @@ documents, where the `Pad` steps just report an error.
 
 ## Limits
 
-- No sketcher, and edges cannot be picked: fillets and chamfers take every edge of a face, and
-  a construction plane cannot be put on an edge. Properties of type length, angle, number,
-  integer, bool, string, enumeration and placement are editable; others are shown as text.
-- Construction planes are drawn over the view without depth, so they show through parts in
-  front of them.
+- No sketcher, and a construction plane cannot be put on an edge. Properties of type length,
+  angle, number, integer, bool, string, enumeration and placement are editable; others are shown
+  as text.
+- Construction planes, picked edges, handles and the extrude preview are drawn over the view
+  without depth, so they show through parts in front of them. There is no preview of a fillet.
+- Lighting edges under the cursor picks the scene once per resting position; on a scene where
+  that takes over 15 ms it is turned off for the session (clicks still pick edges).
 - The first view of a large assembly takes time: the 158 000-face Orbiter assembly shows its
   boxes 0.5 s after it is open, its first mesh after 2.3 s and all of it after about 19 s
   (some 3 s of that checking which shapes are closed solids); from the disk cache all of it

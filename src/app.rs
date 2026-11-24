@@ -18,6 +18,8 @@ use crate::selftest::{SelfTest, Stage, write_bmp};
 use crate::ui_chrome::{self, Action, CubeAction, RibbonState, Tab};
 use crate::worker::{Body, Event, Part, Progress, Worker};
 
+mod handles;
+
 #[derive(Clone)]
 enum Pending {
     Open(PathBuf),
@@ -27,6 +29,10 @@ enum Pending {
     Edit,
     /// A modelling command; its reply names the object it made.
     Create,
+    /// The edges of an object, for picking them; asked in the given model generation.
+    Edges(String, u64),
+    /// A face, for its handle and preview.
+    Face(u64),
     Save,
     Export,
 }
@@ -194,6 +200,8 @@ pub struct App {
     command: Option<Command>,
     /// Construction planes as drawn last frame, in points, for clicks on them.
     plane_outlines: Vec<(String, Vec<egui::Pos2>)>,
+    /// Edges and drag handles in the view.
+    gizmos: handles::Gizmos,
 }
 
 impl App {
@@ -237,6 +245,7 @@ impl App {
             ground: None,
             command: None,
             plane_outlines: Vec::new(),
+            gizmos: handles::Gizmos::default(),
         }
     }
 
@@ -351,6 +360,7 @@ impl App {
 
     /// After anything that may change the model: reload tree, shapes and the open property list.
     fn refresh(&mut self) {
+        self.gizmos.clear();
         self.request("tree", json!({}), Pending::Tree);
         self.request("scene", json!({}), Pending::Scene { fit: false });
         if let Some(sel) = &self.selection {
@@ -494,22 +504,6 @@ impl App {
         })
     }
 
-    /// A click in the view at `pos`, pixel (`px`, `py`): a face, else a construction plane.
-    /// A command asking for a plane takes a plane in front of a face.
-    fn click_view(&mut self, pos: egui::Pos2, px: u32, py: u32) {
-        let plane = self.plane_at(pos);
-        let plane_first = plane.is_some() && self.command.as_ref().is_some_and(Command::wants_plane);
-        let face = if plane_first { None } else { self.face_at(px, py) };
-        let hit = match face {
-            Some((sel, text)) => {
-                self.info = Some(format!("picked {text}"));
-                Some(sel)
-            }
-            None => plane,
-        };
-        self.picked(hit);
-    }
-
     fn fit(&mut self) {
         if let Some((lo, hi)) = self.scene.as_ref().and_then(|s| s.data.bbox) {
             self.camera.fit(lo, hi);
@@ -544,6 +538,7 @@ impl App {
                 Event::Reply(r) => {
                     let Some(kind) = self.pending.remove(&r.id) else { continue };
                     match r.result {
+                        Err(_) if matches!(kind, Pending::Edges(..) | Pending::Face(_)) => self.on_geometry_error(&kind),
                         Err(e) => {
                             self.error = Some(e);
                             if self.loading.as_ref().is_some_and(|l| l.id == r.id) {
@@ -593,6 +588,8 @@ impl App {
                     self.modified = true;
                     self.refresh();
                 }
+                Pending::Edges(_, g) => self.on_edges(g, &v),
+                Pending::Face(g) => self.on_face(g, &v),
                 Pending::Create => {
                     // The command did its step: close its dialog and select what it made.
                     self.command = None;
@@ -1177,7 +1174,8 @@ impl App {
 
         let d = resp.drag_delta();
         let delta = Vec2::new(d.x, d.y);
-        if resp.dragged() {
+        // A press on a handle's arrow drags the handle, not the camera.
+        if !self.drag_handle(ui, &resp) && resp.dragged() {
             let held = ui.input(|i| Held {
                 left: i.pointer.button_down(PointerButton::Primary),
                 middle: i.pointer.button_down(PointerButton::Middle),
@@ -1205,7 +1203,9 @@ impl App {
         } else if resp.clicked()
             && let Some(pos) = resp.interact_pointer_pos()
         {
-            self.click_view(pos, ((pos.x - rect.min.x) * ppp) as u32, ((pos.y - rect.min.y) * ppp) as u32);
+            self.click_view(pos, ((pos.x - rect.min.x) * ppp) as u32, ((pos.y - rect.min.y) * ppp) as u32, ppp);
+        } else {
+            self.hover(ui, &resp, rect);
         }
 
         let dark = ui.visuals().dark_mode;
@@ -1219,6 +1219,7 @@ impl App {
             ui_chrome::ground_labels(&ui.painter_at(rect), grid, rect, f.view_proj, f.forward);
         }
         self.paint_planes(&ui.painter_at(rect), rect, f.view_proj);
+        self.paint_handles(&ui.painter_at(rect), rect, f.view_proj);
         self.view_rect = Some(rect);
         if let CubeAction::Home = ui_chrome::view_cube(ui, rect, &mut self.camera) {
             self.camera.set_view(View::Iso);
