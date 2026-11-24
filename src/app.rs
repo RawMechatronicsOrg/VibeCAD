@@ -1792,6 +1792,107 @@ impl App {
             }
             Stage::SketchSaved => {
                 t.log("finish sketch", json!({ "mode_left": self.sketch.is_none(), "selected": self.selection.as_ref().map(|s| s.obj.clone()) }));
+                self.select(None);
+                self.camera.set_view(View::Iso);
+                self.fit();
+                t.stage = Stage::EdgeAsk;
+            }
+            Stage::EdgeAsk => {
+                // A part in view, and its edges and corners from the worker.
+                let (w, h) = self.renderer.size().unwrap_or((1, 1));
+                let mut points = vec![(0.62f32, 0.70f32)];
+                points.extend(self.geometry_points());
+                let hit = points.into_iter().find_map(|(fx, fy)| self.face_at((w as f32 * fx) as u32, (h as f32 * fy) as u32)).map(|(s, _)| s.obj);
+                if let Some(obj) = &hit {
+                    self.ask_edges(obj);
+                }
+                t.log("edges asked", json!({ "obj": hit }));
+                t.edge_at = None;
+                t.stage = if hit.is_some() { Stage::EdgePick } else { Stage::Done };
+                t.report["part"] = json!(hit);
+            }
+            Stage::EdgePick => {
+                let obj = t.report["part"].as_str().unwrap_or("").to_string();
+                let picked = self.selftest_click(&obj, false, ctx.pixels_per_point());
+                t.edge_at = picked.as_ref().map(|p| p.1);
+                t.log("click on an edge", json!({ "picked": picked.map(|p| p.0), "info": self.info, "props_for": self.selection.as_ref().map(|s| &s.obj) }));
+                t.stage = Stage::VertexPick;
+            }
+            Stage::VertexPick => {
+                let Some(shot) = self.window_shot(ctx, &mut t, "5-edge.bmp") else {
+                    self.selftest = Some(t);
+                    return;
+                };
+                let obj = t.report["part"].as_str().unwrap_or("").to_string();
+                let picked = self.selftest_click(&obj, true, ctx.pixels_per_point());
+                t.log("click on a corner", json!({ "picked": picked.map(|p| p.0), "info": self.info, "edge_frame": shot }));
+                t.stage = Stage::WheelOpen;
+            }
+            Stage::WheelOpen => {
+                let Some(shot) = self.window_shot(ctx, &mut t, "6-vertex.bmp") else {
+                    self.selftest = Some(t);
+                    return;
+                };
+                // The edge again, then Alt held with the pointer over it.
+                let obj = t.report["part"].as_str().unwrap_or("").to_string();
+                let picked = self.selftest_click(&obj, false, ctx.pixels_per_point());
+                t.log("edge for the marking menu", json!({ "picked": picked.as_ref().map(|p| &p.0), "vertex_frame": shot }));
+                match picked {
+                    Some((_, at)) => {
+                        t.edge_at = Some(at);
+                        t.inject.events.extend([egui::Event::PointerMoved(at), egui::Event::ModifiersChanged(Modifiers::ALT)]);
+                        t.inject.focus = true;
+                        t.stage = Stage::WheelPoint;
+                    }
+                    None => t.stage = Stage::Done,
+                }
+            }
+            Stage::WheelPoint => {
+                t.log("Alt held", self.marking_state());
+                // Towards the left side: Fillet.
+                if let Some(at) = t.edge_at {
+                    t.inject.events.push(egui::Event::PointerMoved(at - egui::vec2(60.0, 8.0)));
+                }
+                t.stage = Stage::WheelChoose;
+            }
+            Stage::WheelChoose => {
+                let Some(shot) = self.window_shot(ctx, &mut t, "7-wheel.bmp") else {
+                    self.selftest = Some(t);
+                    return;
+                };
+                let mut state = self.marking_state();
+                state["frame"] = json!(shot);
+                t.log("pointer moved left", state);
+                t.inject.events.push(egui::Event::ModifiersChanged(Modifiers::NONE));
+                t.stage = Stage::SizeType;
+            }
+            Stage::SizeType => {
+                let mut state = self.marking_state();
+                state["command"] = json!(self.command.as_ref().map(|c| c.op.title()));
+                state["edges"] = json!(self.command.as_ref().and_then(|c| c.picked_edges()).map(|(o, e)| (o.to_string(), e)));
+                state["typing"] = json!(ctx.egui_wants_keyboard_input());
+                t.log("Alt let go", state);
+                let key = |down| egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: down, repeat: false, modifiers: Modifiers::NONE };
+                t.inject.events.extend([egui::Event::Text("2".into()), key(true), key(false)]);
+                t.stage = Stage::Filleted;
+            }
+            Stage::Filleted => {
+                let Some(shot) = self.window_shot(ctx, &mut t, "8-filleted.bmp") else {
+                    self.selftest = Some(t);
+                    return;
+                };
+                let made = self.selection.as_ref().map(|s| s.obj.clone());
+                let kind = made.as_ref().and_then(|m| self.tree.nodes.get(m)).map(|n| n.kind.clone());
+                let radius = self.props.as_ref().and_then(|p| p["props"].as_array()?.iter().find(|q| q["name"] == "Radius").cloned());
+                t.log("size typed, Enter", json!({ "made": made, "type": kind, "radius": radius, "undo": self.tree.undo, "dialog_open": self.command.is_some(), "error": self.error, "frame": shot }));
+                t.report["fillet"] = json!(made);
+                t.inject.focus = false;
+                self.undo(false);
+                t.stage = Stage::FilletUndo;
+            }
+            Stage::FilletUndo => {
+                let gone = t.report["fillet"].as_str().is_some_and(|f| !self.tree.nodes.contains_key(f));
+                t.log("undo the fillet", json!({ "gone": gone, "undo": self.tree.undo, "redo": self.tree.redo }));
                 t.stage = Stage::Done;
             }
             Stage::Done => {
@@ -1802,6 +1903,28 @@ impl App {
             }
         }
         self.selftest = Some(t);
+    }
+
+    /// A picture of the whole window as egui drew it, overlays and all, written to `name`: asked
+    /// for in one frame, it comes with a later one (None until then), then its path or null.
+    fn window_shot(&self, ctx: &egui::Context, t: &mut SelfTest, name: &str) -> Option<Value> {
+        if !t.shot_asked {
+            t.shot_asked = true;
+            let (slot, c) = (t.window.clone(), ctx.clone());
+            ctx.request_screenshot(move |image| {
+                let rgba: Vec<u8> = image.pixels.iter().flat_map(|p| p.to_array()).collect();
+                *slot.lock().unwrap() = Some((image.size[0] as u32, image.size[1] as u32, rgba));
+                c.request_repaint();
+            });
+            return None;
+        }
+        let Some((w, h, rgba)) = t.window.lock().unwrap().take() else {
+            ctx.request_repaint();
+            return None;
+        };
+        t.shot_asked = false;
+        let path = t.dir.join(name);
+        Some(json!(write_bmp(&path, w, h, &rgba).is_ok().then(|| path.to_string_lossy().to_string())))
     }
 
     /// The frame the view draws now, at `size` pixels.
@@ -2244,6 +2367,16 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// The self-test's keys and pointer, given to egui as the window's own input.
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        if let Some(t) = self.selftest.as_mut() {
+            if t.inject.focus {
+                raw.focused = true;
+            }
+            raw.events.append(&mut t.inject.events);
+        }
+    }
+
     fn on_exit(&mut self) {
         self.profile.keep(self.settings(), Instant::now());
         if let Some(e) = self.profile.flush() {

@@ -1,6 +1,7 @@
-//! What the view needs to pick edges and to draw drag handles: the B-rep edges and faces the
-//! worker sends on demand (`edges`, `face`), and the screen geometry of picking an edge near
-//! the cursor and of dragging a handle along a direction in the model.
+//! What the view needs to pick edges and corners and to draw drag handles: the B-rep edges,
+//! vertices and faces the worker sends on demand (`edges`, `face`), and the screen geometry of
+//! picking an edge or a corner near the cursor and of dragging a handle along a direction in
+//! the model.
 
 use eframe::egui::{self, Color32, Pos2, Rect, Stroke, Vec2, pos2};
 use glam::{Mat4, Vec3};
@@ -17,6 +18,16 @@ pub struct EdgeInfo {
     /// Its middle, and the direction out of the corner there (zero for a lone edge).
     pub mid: Vec3,
     pub out: Vec3,
+}
+
+/// A B-rep vertex of an object, in document coordinates.
+#[derive(Clone, Debug)]
+pub struct VertexInfo {
+    /// "Vertex<index>".
+    pub index: u32,
+    pub at: Vec3,
+    /// The edges that end at it, 0-based ("Edge1" is 0).
+    pub edges: Vec<u32>,
 }
 
 /// A face as handles and previews use it, in document coordinates.
@@ -50,6 +61,23 @@ pub fn parse_edges(v: &Value) -> Vec<EdgeInfo> {
                         points: e["points"].as_array()?.iter().filter_map(vec3).collect(),
                         mid: vec3(&e["mid"])?,
                         out: vec3(&e["out"])?,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn parse_vertices(v: &Value) -> Vec<VertexInfo> {
+    v["vertices"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|p| {
+                    Some(VertexInfo {
+                        index: p["i"].as_u64()? as u32,
+                        at: vec3(&p["at"])?,
+                        edges: p["edges"].as_array()?.iter().filter_map(|e| e.as_u64().map(|e| e as u32)).collect(),
                     })
                 })
                 .collect()
@@ -130,6 +158,17 @@ pub fn nearest_edge<'a>(edges: &'a [EdgeInfo], keep: impl Fn(&EdgeInfo) -> bool,
         .map(|(e, _)| e)
 }
 
+/// The vertex nearest `pos` within `max` points among those `keep` admits.
+pub fn nearest_vertex<'a>(vertices: &'a [VertexInfo], keep: impl Fn(&VertexInfo) -> bool, project: &dyn Fn(Vec3) -> Option<Pos2>, pos: Pos2, max: f32) -> Option<&'a VertexInfo> {
+    vertices
+        .iter()
+        .filter(|v| keep(v))
+        .filter_map(|v| Some((v, (project(v.at)? - pos).length())))
+        .filter(|(_, d)| *d <= max)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(v, _)| v)
+}
+
 /// A handle dragged along `dir` from `base`: how far in model units a pointer move of `delta`
 /// points goes along it, or None when `dir` points at the eye and a drag cannot tell.
 pub fn drag_amount(base: Vec3, dir: Vec3, project: &dyn Fn(Vec3) -> Option<Pos2>, delta: Vec2) -> Option<f32> {
@@ -177,6 +216,13 @@ pub fn paint_edge(painter: &egui::Painter, e: &EdgeInfo, project: &dyn Fn(Vec3) 
         if let (Some(a), Some(b)) = (w[0], w[1]) {
             painter.line_segment([a, b], Stroke::new(3.5, color));
         }
+    }
+}
+
+/// A corner drawn over the view: a dot, ringed so it shows on any face.
+pub fn paint_vertex(painter: &egui::Painter, v: &VertexInfo, project: &dyn Fn(Vec3) -> Option<Pos2>, color: Color32) {
+    if let Some(p) = project(v.at) {
+        painter.circle(p, 5.0, color, Stroke::new(1.5, Color32::WHITE));
     }
 }
 
@@ -254,6 +300,16 @@ mod tests {
         assert_eq!(nearest_edge(&edges, |_| true, &project, pos2(50.0, 7.0), 6.0).map(|e| e.index), Some(2));
         assert!(nearest_edge(&edges, |_| true, &project, pos2(50.0, 30.0), 6.0).is_none());
         assert!(nearest_edge(&edges, |e| e.index == 2, &project, pos2(50.0, 1.0), 6.0).is_none());
+    }
+
+    #[test]
+    fn the_nearest_corner_within_reach_is_picked() {
+        let project = |p: Vec3| Some(pos2(p.x, p.y));
+        let vs = parse_vertices(&json!({ "vertices": [{ "i": 1, "at": [0, 0, 0], "edges": [0, 1] }, { "i": 2, "at": [10, 0, 0], "edges": [1, 2] }] }));
+        assert_eq!(vs[1].edges, vec![1, 2]);
+        assert_eq!(nearest_vertex(&vs, |_| true, &project, pos2(7.0, 1.0), 6.0).map(|v| v.index), Some(2));
+        assert!(nearest_vertex(&vs, |_| true, &project, pos2(5.0, 5.0), 6.0).is_none());
+        assert!(nearest_vertex(&vs, |v| v.edges.contains(&0), &project, pos2(9.0, 0.0), 6.0).is_none());
     }
 
     #[test]

@@ -623,7 +623,20 @@ class Modelling:
                         "points": [_vec(m.multVec(p)) for p in pts],
                         "mid": _vec(m.multVec(mid)),
                         "out": _vec(_direction(m, mid, out_dir))})
-        return {"obj": o.Name, "edges": out}
+        # The corners: per vertex its number ("Vertex<i>"), where it is and the edges (0-based)
+        # that end there, so that the view picks only corners of faces it sees.
+        corner = {}
+        for i, v in enumerate(shape.Vertexes):
+            corner.setdefault(v.hashCode(), []).append(i)
+        edges_of = [[] for _ in shape.Vertexes]
+        for ei, e in enumerate(edges):
+            for ev in e.Vertexes:
+                for i in corner.get(ev.hashCode(), []):
+                    if shape.Vertexes[i].isSame(ev) and ei not in edges_of[i]:
+                        edges_of[i].append(ei)
+        vertices = [{"i": i + 1, "at": _vec(m.multVec(v.Point)), "edges": edges_of[i]}
+                    for i, v in enumerate(shape.Vertexes)]
+        return {"obj": o.Name, "edges": out, "vertices": vertices}
 
     def cmd_face(self, req):
         """A face as the window draws handles and previews on it: "planar", its "center" and

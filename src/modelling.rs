@@ -1,9 +1,12 @@
 //! Modelling commands: construction planes, extrude, fillet and chamfer, mirror, patterns and
 //! copies. Each one shows a small dialog over the view; its fields are filled from the
 //! selection when it starts and from clicks in the view or the tree while it is open, and OK
-//! sends one request to the worker (see `Modelling` in `worker/vibecad_worker.py`).
+//! sends one request to the worker (see `Modelling` in `worker/vibecad_worker.py`). The marking
+//! menu (Alt held over the view) offers the commands that fit what is picked on a wheel.
 
-use eframe::egui::{self, Color32, Pos2, Rect, RichText, Stroke, pos2, vec2};
+use std::f32::consts::{PI, TAU};
+
+use eframe::egui::{self, Color32, Pos2, Rect, RichText, Stroke, Vec2, pos2, vec2};
 use serde_json::{Value, json};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -57,6 +60,11 @@ impl Op {
             Op::Linear => "Repeat a part in a row along a direction",
             Op::Copy => "Copy a part, moved: independent, or a link that follows the original",
         }
+    }
+
+    /// What the number a fillet or chamfer takes is called, in its dialog and by the pointer.
+    pub fn amount_name(self) -> &'static str {
+        if self == Op::Chamfer { "Size" } else { "Radius" }
     }
 
     /// Whether the command acts on a whole part, picked first.
@@ -271,7 +279,8 @@ impl Command {
     /// A click on an edge or face for a fillet: added, or taken out when it was in. Picks on
     /// another object start the list again.
     fn toggle_edge(&mut self, p: Pick) {
-        let Some(sub) = &p.sub else { return };
+        // A corner rounds nothing: only edges and faces go in the list.
+        let Some(sub) = p.sub.as_ref().filter(|s| s.starts_with("Edge") || s.starts_with("Face")) else { return };
         if self.edges.first().is_some_and(|e| e.obj != p.obj) {
             self.edges.clear();
         }
@@ -397,8 +406,7 @@ impl Command {
                     ui.checkbox(&mut self.symmetric, "Both sides");
                     ui.end_row();
                 }
-                Op::Fillet => number(ui, "Radius", &mut self.distance, " mm"),
-                Op::Chamfer => number(ui, "Size", &mut self.distance, " mm"),
+                Op::Fillet | Op::Chamfer => number(ui, self.op.amount_name(), &mut self.distance, " mm"),
                 Op::Mirror => {
                     ui.label("Result");
                     ui.horizontal(|ui| {
@@ -463,6 +471,91 @@ fn count(ui: &mut egui::Ui, n: &mut i64) {
     ui.label("Count");
     ui.add(egui::DragValue::new(n).range(2..=1000).speed(0.1));
     ui.end_row();
+}
+
+// ---- marking menu ------------------------------------------------------------------------
+
+/// The commands the marking menu offers for what is picked, by its kind ("Edge3", "Face2",
+/// "Vertex1", or none for a whole object): one per side of the wheel, the first to the left and
+/// the rest clockwise. Empty: nothing for that kind yet.
+pub fn marking_choices(sub: Option<&str>) -> &'static [Op] {
+    match sub {
+        Some(s) if s.starts_with("Edge") => &[Op::Fillet, Op::Chamfer],
+        _ => &[],
+    }
+}
+
+/// The wheel's ring, in points from its centre; inside `WHEEL_DEAD` the pointer lights nothing.
+const WHEEL_IN: f32 = 28.0;
+const WHEEL_OUT: f32 = 96.0;
+const WHEEL_DEAD: f32 = 16.0;
+
+/// The angle on screen (y down, so growing clockwise) at which choice `k` of `n` sits.
+fn wheel_angle(k: usize, n: usize) -> f32 {
+    PI + k as f32 * TAU / n as f32
+}
+
+/// The choice the pointer points at, `delta` from the wheel's centre: none in the middle.
+pub fn wheel_choice(delta: Vec2, n: usize) -> Option<usize> {
+    if n == 0 || delta.length() < WHEEL_DEAD {
+        return None;
+    }
+    let turns = (delta.y.atan2(delta.x) - PI).rem_euclid(TAU) / (TAU / n as f32);
+    Some(turns.round() as usize % n)
+}
+
+/// The wheel around `center`: a segment per choice with its icon and name, the one pointed at
+/// (`hot`) lit; with no choices a grey ring saying so. `what` names what it acts on.
+pub fn paint_wheel(painter: &egui::Painter, center: Pos2, choices: &[Op], hot: Option<usize>, pointer: Option<Pos2>, what: &str) {
+    let (fill, ink, rim) = if painter.ctx().global_style().visuals.dark_mode {
+        (Color32::from_rgba_unmultiplied(34, 38, 46, 235), Color32::from_gray(225), Color32::from_gray(90))
+    } else {
+        (Color32::from_rgba_unmultiplied(250, 250, 252, 240), Color32::from_gray(30), Color32::from_gray(170))
+    };
+    let lit = Color32::from_rgb(30, 120, 230);
+    let at = |angle: f32, r: f32| center + vec2(angle.cos(), angle.sin()) * r;
+    let sector = |from: f32, to: f32, color: Color32| {
+        let steps = ((to - from) / 0.08).ceil().max(2.0) as u32;
+        let mut mesh = egui::epaint::Mesh::default();
+        for i in 0..=steps {
+            let a = from + (to - from) * i as f32 / steps as f32;
+            mesh.colored_vertex(at(a, WHEEL_IN), color);
+            mesh.colored_vertex(at(a, WHEEL_OUT), color);
+            if i > 0 {
+                let j = 2 * i;
+                mesh.add_triangle(j - 2, j - 1, j);
+                mesh.add_triangle(j - 1, j + 1, j);
+            }
+        }
+        painter.add(egui::Shape::mesh(mesh));
+    };
+    let font = |size| egui::FontId::proportional(size);
+    let n = choices.len();
+    if n == 0 {
+        sector(0.0, TAU, fill.gamma_multiply(0.6));
+    }
+    for (k, &op) in choices.iter().enumerate() {
+        let (mid, half) = (wheel_angle(k, n), PI / n as f32);
+        let on = hot == Some(k);
+        sector(mid - half + 0.03, mid + half - 0.03, if on { lit } else { fill });
+        let color = if on { Color32::WHITE } else { ink };
+        let c = at(mid, (WHEEL_IN + WHEEL_OUT) * 0.5);
+        paint_icon(painter, Rect::from_center_size(c - vec2(0.0, 10.0), vec2(20.0, 20.0)), op, color);
+        painter.text(c + vec2(0.0, 4.0), egui::Align2::CENTER_TOP, op.label(), font(13.0), color);
+    }
+    painter.circle_stroke(center, WHEEL_OUT, Stroke::new(1.0, rim));
+    painter.circle_stroke(center, WHEEL_IN, Stroke::new(1.0, rim));
+    painter.text(center - vec2(0.0, WHEEL_OUT + 6.0), egui::Align2::CENTER_BOTTOM, what, font(12.0), ink);
+    if n == 0 {
+        painter.text(center + vec2(0.0, WHEEL_OUT + 6.0), egui::Align2::CENTER_TOP, "nothing to do here yet", font(12.0), ink);
+        return;
+    }
+    // Which way the pointer points, from the middle.
+    if let Some(p) = pointer.filter(|p| (*p - center).length() > WHEEL_DEAD) {
+        let d = (p - center).normalized();
+        painter.line_segment([center + d * 6.0, center + d * (WHEEL_IN - 4.0)], Stroke::new(2.0, lit));
+    }
+    painter.circle_filled(center, 3.0, lit);
 }
 
 /// A construction plane as the view draws it: translucent orange, as in the big CAD tools.
@@ -662,6 +755,26 @@ mod tests {
         assert!(c.wants_edges());
         c.take(edge);
         assert_eq!(c.request(None).unwrap().1["axis"], json!({ "obj": "Pocket", "sub": "Edge7" }));
+    }
+
+    #[test]
+    fn a_corner_is_no_edge_to_round() {
+        let corner = Pick { obj: "Pocket".into(), sub: Some("Vertex2".into()), text: "Pocket.Vertex2".into(), whole: false };
+        let c = Command::new(Op::Fillet, Some(corner), None);
+        assert!(c.picked_edges().is_none() && c.request(None).is_err());
+    }
+
+    #[test]
+    fn the_marking_menu_offers_fillet_left_and_chamfer_right_for_an_edge() {
+        assert_eq!(marking_choices(Some("Edge4")), &[Op::Fillet, Op::Chamfer]);
+        assert!(marking_choices(Some("Face2")).is_empty() && marking_choices(Some("Vertex1")).is_empty() && marking_choices(None).is_empty());
+        assert_eq!(wheel_choice(vec2(-40.0, 5.0), 2), Some(0), "left");
+        assert_eq!(wheel_choice(vec2(40.0, -30.0), 2), Some(1), "right");
+        assert_eq!(wheel_choice(vec2(3.0, 4.0), 2), None, "the middle lights nothing");
+        assert_eq!(wheel_choice(vec2(40.0, 0.0), 0), None);
+        // Four: left, up, right, down.
+        let four: Vec<_> = [(-1.0, 0.0), (0.0, -1.0), (1.0, 0.0), (0.0, 1.0)].iter().map(|&(x, y)| wheel_choice(vec2(x, y) * 50.0, 4)).collect();
+        assert_eq!(four, [Some(0), Some(1), Some(2), Some(3)]);
     }
 
     #[test]

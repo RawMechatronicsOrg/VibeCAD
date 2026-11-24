@@ -161,8 +161,18 @@ def test_fillet(s):
     assert s.tree()["by_name"][r["created"]]["type"] == "PartDesign::Chamfer"
     s.undo_all()
     # Edges, as the window picks them: the four vertical ones of the plate.
-    edges = s.call("edges", obj="Pocket")["edges"]
+    got = s.call("edges", obj="Pocket")
+    edges = got["edges"]
     assert len(edges) > 12, len(edges)
+    # Corners, as the window picks them: the plate's eight, each where three edges end.
+    corners = [v for v in got["vertices"] if v["at"][0] in (0.0, 80.0) and v["at"][1] in (0.0, 50.0)]
+    assert len(corners) == 8, got["vertices"]
+    by_index = {e["i"] - 1: e for e in edges}
+    for v in corners:
+        assert len(v["edges"]) == 3, v
+        for k in v["edges"]:
+            ends = [by_index[k]["points"][0], by_index[k]["points"][-1]]
+            assert any(close(p, v["at"]) for p in ends), (v, by_index[k]["points"])
     vertical = [e for e in edges if len(e["points"]) == 2 and abs(e["points"][0][2] - e["points"][1][2]) > 5.9
                 and e["mid"][0] in (0.0, 80.0)]  # not the hole's seam
     assert len(vertical) == 4, [e["points"] for e in edges]

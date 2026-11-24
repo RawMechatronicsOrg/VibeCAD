@@ -1,7 +1,8 @@
-//! Edges and drag handles in the view: hovering and picking B-rep edges, the arrow that pushes
-//! or pulls a face (with a preview of what it adds or cuts) and the one that sets a fillet's
-//! radius, as in the big CAD tools. The geometry comes from the worker on demand (`edges`,
-//! `face`) and is kept until the model changes.
+//! Edges, corners and drag handles in the view: hovering and picking B-rep edges and vertices,
+//! the arrow that pushes or pulls a face (with a preview of what it adds or cuts) and the one
+//! that sets a fillet's radius, as in the big CAD tools, and the marking menu: a wheel of the
+//! commands for what is picked, held open with Alt. The geometry comes from the worker on
+//! demand (`edges`, `face`) and is kept until the model changes.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -11,11 +12,13 @@ use glam::{Mat4, Vec3};
 use serde_json::{Value, json};
 
 use super::{App, Pending, Selection};
-use crate::modelling::Op;
-use crate::picking::{self, EdgeInfo, FaceInfo};
+use crate::modelling::{self, Op};
+use crate::picking::{self, EdgeInfo, FaceInfo, VertexInfo};
 
-/// How near the cursor an edge is picked, in points.
+/// How near the cursor an edge is picked, in points; a corner, which wins over its edges.
 const EDGE_REACH: f32 = 7.0;
+const VERTEX_REACH: f32 = 8.0;
+const HOVER: Color32 = Color32::from_rgb(120, 185, 255);
 /// How long a handle's arrow is on screen, in points, and how near it a press grabs it.
 const ARROW: f32 = 80.0;
 const GRAB: f32 = 10.0;
@@ -41,12 +44,39 @@ pub(super) struct Gizmos {
     drag: Option<Drag>,
     /// The last frame's view, for clicks and drags in the next one.
     view: Option<(Mat4, Rect)>,
+    /// The corners of the objects whose edges are here, and the one lit under the cursor.
+    vertices: HashMap<String, Vec<VertexInfo>>,
+    hover_vertex: Option<u32>,
+    /// The marking menu while Alt holds it open, Alt as the last frame saw it, and the size
+    /// typed by the pointer for the command the menu started.
+    wheel: Option<Wheel>,
+    alt: bool,
+    size: Option<SizeBox>,
+}
+
+/// The marking menu on screen.
+struct Wheel {
+    center: Pos2,
+    choices: &'static [Op],
+    /// What it acts on, as it reads: "Pocket.Edge3".
+    what: String,
+}
+
+/// The number box by the pointer for the command the marking menu started.
+struct SizeBox {
+    at: Pos2,
+    op: Op,
+    text: String,
+    /// Take the keyboard (and select the text) in the next frame.
+    focus: bool,
 }
 
 impl Gizmos {
     /// The model changed: face and edge numbers may mean something else now.
     pub(super) fn clear(&mut self) {
         self.edges.clear();
+        self.vertices.clear();
+        self.hover_vertex = None;
         self.asked_edges.clear();
         self.face = None;
         self.asked_face = None;
@@ -83,6 +113,7 @@ impl App {
         }
         if let Some(obj) = v["obj"].as_str() {
             self.gizmos.edges.insert(obj.to_string(), picking::parse_edges(v));
+            self.gizmos.vertices.insert(obj.to_string(), picking::parse_vertices(v));
         }
     }
 
@@ -123,14 +154,15 @@ impl App {
         }
         let mut objs: Vec<String> = Vec::new();
         objs.extend(self.gizmos.hover.as_ref().map(|h| h.0.clone()));
-        objs.extend(self.selection.as_ref().filter(|s| s.sub.as_deref().is_some_and(|x| x.starts_with("Edge"))).map(|s| s.obj.clone()));
+        let edge_or_corner = |x: &str| x.starts_with("Edge") || x.starts_with("Vertex");
+        objs.extend(self.selection.as_ref().filter(|s| s.sub.as_deref().is_some_and(edge_or_corner)).map(|s| s.obj.clone()));
         objs.extend(self.command.as_ref().and_then(|c| c.picked_edges()).map(|(o, _)| o.to_string()));
         for obj in objs {
             self.ask_edges(&obj);
         }
     }
 
-    fn ask_edges(&mut self, obj: &str) {
+    pub(super) fn ask_edges(&mut self, obj: &str) {
         if !self.gizmos.edges.contains_key(obj) && self.gizmos.asked_edges.insert(obj.to_string()) {
             self.request("edges", json!({ "obj": obj }), Pending::Edges(obj.to_string(), self.gizmos.generation));
         }
@@ -217,6 +249,7 @@ impl App {
         let pos = resp.hover_pos().filter(|_| !resp.dragged() && self.gizmos.slow < SLOW_LOOKS);
         let Some(pos) = pos else {
             self.gizmos.hover = None;
+            self.gizmos.hover_vertex = None;
             return;
         };
         if let Some((at, when)) = self.gizmos.hovered_at {
@@ -234,27 +267,50 @@ impl App {
         let hit = self.face_at(((pos.x - rect.min.x) * ppp) as u32, ((pos.y - rect.min.y) * ppp) as u32);
         self.gizmos.slow = if started.elapsed() > HOVER_BUDGET { self.gizmos.slow + 1 } else { 0 };
         let edges_ok = self.command.as_ref().is_none_or(|c| c.wants_edges());
+        let mut corner = None;
         self.gizmos.hover = hit.map(|(sel, _)| {
-            let edge = if edges_ok { self.edge_near(pos, std::slice::from_ref(&sel)) } else { None };
+            let hits = std::slice::from_ref(&sel);
+            corner = if self.command.is_none() { self.vertex_near(pos, hits) } else { None };
+            let edge = if edges_ok && corner.is_none() { self.edge_near(pos, hits) } else { None };
             (sel.obj, edge)
         });
+        self.gizmos.hover_vertex = corner;
     }
 
-    /// The edge within reach of `pos` that bounds one of the faces `hits` (picked around it),
-    /// so that edges hidden behind the part are not picked.
-    fn edge_near(&self, pos: Pos2, hits: &[Selection]) -> Option<u32> {
-        let project = self.project()?;
+    /// The faces `hits` (picked under and around the cursor) name, 0-based, of the first one's
+    /// object: the edges and corners the view can see there are theirs.
+    fn hit_faces(hits: &[Selection]) -> Option<(&String, Vec<u32>)> {
         let face_of = |s: &Selection| s.sub.as_deref()?.strip_prefix("Face")?.parse::<u32>().ok()?.checked_sub(1);
         let obj = &hits.first()?.obj;
-        let faces: Vec<u32> = hits.iter().filter(|s| &s.obj == obj).filter_map(face_of).collect();
+        Some((obj, hits.iter().filter(|s| &s.obj == obj).filter_map(face_of).collect()))
+    }
+
+    /// The edge within reach of `pos` that bounds one of the faces `hits`, so that edges hidden
+    /// behind the part are not picked.
+    fn edge_near(&self, pos: Pos2, hits: &[Selection]) -> Option<u32> {
+        let project = self.project()?;
+        let (obj, faces) = Self::hit_faces(hits)?;
         let edges = self.gizmos.edges.get(obj)?;
         picking::nearest_edge(edges, |e| e.faces.iter().any(|f| faces.contains(f)), &project, pos, EDGE_REACH).map(|e| e.index)
     }
 
-    /// A click in the view at `pos`, pixel (`px`, `py`): an edge near the cursor, else the
-    /// face under it, else a construction plane. A command asking for a plane takes a plane in
-    /// front of a face.
+    /// The corner within reach of `pos` at the end of an edge of the faces `hits`.
+    fn vertex_near(&self, pos: Pos2, hits: &[Selection]) -> Option<u32> {
+        let project = self.project()?;
+        let (obj, faces) = Self::hit_faces(hits)?;
+        let seen: HashSet<u32> = self.gizmos.edges.get(obj)?.iter().filter(|e| e.faces.iter().any(|f| faces.contains(f))).map(|e| e.index - 1).collect();
+        let vertices = self.gizmos.vertices.get(obj)?;
+        picking::nearest_vertex(vertices, |v| v.edges.iter().any(|e| seen.contains(e)), &project, pos, VERTEX_REACH).map(|v| v.index)
+    }
+
+    /// A click in the view at `pos`, pixel (`px`, `py`): a corner near the cursor (with no
+    /// command open), else an edge near it, else the face under it, else a construction plane.
+    /// A command asking for a plane takes a plane in front of a face. While the marking menu
+    /// is open the click is its own (see `marking_menu`).
     pub(super) fn click_view(&mut self, pos: Pos2, px: u32, py: u32, ppp: f32) {
+        if self.gizmos.wheel.is_some() {
+            return;
+        }
         let plane = self.plane_at(pos);
         if plane.is_some() && self.command.as_ref().is_some_and(|c| c.wants_plane()) {
             self.picked(plane);
@@ -289,15 +345,17 @@ impl App {
             Some((c, _)) => std::iter::once(c.clone()).chain(around.into_iter().filter(|s| s.obj == c.obj)).collect(),
             None => around,
         };
-        let edge = if edges_ok { self.edge_near(pos, &sels) } else { None };
+        let corner = if self.command.is_none() { self.vertex_near(pos, &sels) } else { None };
+        let edge = if edges_ok && corner.is_none() { self.edge_near(pos, &sels) } else { None };
         for s in &sels {
             self.ask_edges(&s.obj);
         }
-        let hit = match (edge, sels.first(), center.clone()) {
-            (Some(e), Some(s), _) => {
+        let element = corner.map(|v| format!("Vertex{v}")).or(edge.map(|e| format!("Edge{e}")));
+        let hit = match (element, sels.first(), center.clone()) {
+            (Some(sub), Some(s), _) => {
                 let label = self.tree.nodes.get(&s.obj).map_or(s.obj.as_str(), |n| n.label.as_str()).to_string();
-                self.info = Some(format!("picked {label}.Edge{e}"));
-                Some(Selection { obj: s.obj.clone(), sub: Some(format!("Edge{e}")), face_id: 0 })
+                self.info = Some(format!("picked {label}.{sub}"));
+                Some(Selection { obj: s.obj.clone(), sub: Some(sub), face_id: 0 })
             }
             (None, _, Some((sel, text))) => {
                 self.info = Some(format!("picked {text}"));
@@ -327,12 +385,23 @@ impl App {
             && !picked.iter().any(|(o, j)| o == obj && j == i)
             && let Some(e) = edge(obj, *i)
         {
-            picking::paint_edge(painter, e, &project, Color32::from_rgb(120, 185, 255));
+            picking::paint_edge(painter, e, &project, HOVER);
         }
         for (obj, i) in &picked {
             if let Some(e) = edge(obj, *i) {
                 picking::paint_edge(painter, e, &project, picking::HANDLE);
             }
+        }
+        let corner = |obj: &str, i: u32| self.gizmos.vertices.get(obj)?.iter().find(|v| v.index == i);
+        let picked_corner = self.selection.as_ref().and_then(|s| Some((s.obj.as_str(), s.sub.as_deref()?.strip_prefix("Vertex")?.parse::<u32>().ok()?)));
+        if let (Some((obj, _)), Some(i)) = (&self.gizmos.hover, self.gizmos.hover_vertex)
+            && picked_corner != Some((obj.as_str(), i))
+            && let Some(v) = corner(obj, i)
+        {
+            picking::paint_vertex(painter, v, &project, HOVER);
+        }
+        if let Some(v) = picked_corner.and_then(|(obj, i)| corner(obj, i)) {
+            picking::paint_vertex(painter, v, &project, picking::HANDLE);
         }
         if let Some(c) = &self.command
             && let Some((obj, sub)) = c.extrude_face()
@@ -348,7 +417,182 @@ impl App {
             let text = if h.starts_extrude { "drag to extrude".to_string() } else { format!("{} mm", trim(h.value)) };
             picking::paint_arrow(painter, tail, tip, near || self.gizmos.drag.is_some(), &text);
         }
+        self.marking_menu(painter.ctx(), rect);
+        self.size_box(painter.ctx());
     }
+
+    /// The marking menu. Alt pressed alone over the view, with something picked and no command
+    /// or sketch open, opens a wheel around the pointer with the commands for what is picked
+    /// (`modelling::marking_choices`); moving the pointer towards one lights it, and letting
+    /// Alt go or clicking starts it, as the ribbon would, with a box by the pointer for its
+    /// size. Letting go in the middle, Esc or leaving the window closes it with nothing done.
+    fn marking_menu(&mut self, ctx: &egui::Context, view: Rect) {
+        let (alt, alone, pointer, clicked, esc, focused) = ctx.input(|i| {
+            let m = i.modifiers;
+            (m.alt, m.alt && !m.ctrl && !m.shift && !m.command, i.pointer.latest_pos(), i.pointer.primary_clicked(), i.key_pressed(egui::Key::Escape), i.focused)
+        });
+        let pressed = alone && !self.gizmos.alt;
+        self.gizmos.alt = alt;
+        if pressed
+            && self.gizmos.wheel.is_none()
+            && self.command.is_none()
+            && self.sketch.is_none()
+            && !ctx.egui_wants_keyboard_input()
+            // Over the view itself, not over a panel floating on it.
+            && let Some(at) = pointer.filter(|p| view.contains(*p) && ctx.layer_id_at(*p).is_none_or(|l| l.order == egui::Order::Background))
+            && let Some(sel) = &self.selection
+        {
+            let label = self.tree.nodes.get(&sel.obj).map_or(sel.obj.as_str(), |n| n.label.as_str());
+            let what = match &sel.sub {
+                Some(sub) => format!("{label}.{sub}"),
+                None => label.to_string(),
+            };
+            self.gizmos.wheel = Some(Wheel { center: at, choices: modelling::marking_choices(sel.sub.as_deref()), what });
+            self.gizmos.size = None;
+        }
+        let Some(w) = &self.gizmos.wheel else { return };
+        let hot = pointer.and_then(|p| modelling::wheel_choice(p - w.center, w.choices.len()));
+        if !focused || esc || self.command.is_some() {
+            self.gizmos.wheel = None;
+        } else if !alt || clicked {
+            let center = w.center;
+            let chosen = hot.map(|k| w.choices[k]);
+            self.gizmos.wheel = None;
+            if let Some(op) = chosen {
+                self.marking_pick(op, center);
+            }
+        } else {
+            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("marking-menu")));
+            modelling::paint_wheel(&painter, w.center, w.choices, hot, pointer, &w.what);
+        }
+    }
+
+    /// A choice of the marking menu: its command starts on the selection, as from the ribbon,
+    /// and the box for its size opens where the wheel was.
+    fn marking_pick(&mut self, op: Op, at: Pos2) {
+        self.start_command(op);
+        if let Some(c) = self.command.as_ref().filter(|c| c.op == op) {
+            self.gizmos.size = Some(SizeBox { at, op, text: trim(c.amount()), focus: true });
+        }
+    }
+
+    /// The size box of the command the marking menu started: Enter makes the command's step
+    /// with the size typed, as its dialog's OK does; Esc closes the command. Gone once the
+    /// command is.
+    fn size_box(&mut self, ctx: &egui::Context) {
+        let (Some(b), Some(c)) = (self.gizmos.size.as_mut(), self.command.as_mut()) else {
+            self.gizmos.size = None;
+            return;
+        };
+        if c.op != b.op {
+            self.gizmos.size = None;
+            return;
+        }
+        let mut done: Option<bool> = None;
+        let id = egui::Id::unique("marking-size");
+        egui::Area::new(id.with("box")).fixed_pos(b.at + egui::vec2(14.0, 10.0)).order(egui::Order::Foreground).show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("{} {}", b.op.title(), b.op.amount_name().to_lowercase())).small().weak());
+                    let r = ui.add(egui::TextEdit::singleline(&mut b.text).id(id).desired_width(70.0));
+                    ui.label("mm");
+                    if b.focus {
+                        r.request_focus();
+                        if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), id) {
+                            state.cursor.set_char_range(Some(egui::text::CCursorRange::select_all_str(&b.text)));
+                            state.store(ui.ctx(), id);
+                        }
+                        b.focus = false;
+                    }
+                    if r.changed() {
+                        // The arrow on the edge follows what is typed.
+                        if let Some(v) = size_of(&b.text) {
+                            *c.amount_mut() = v;
+                        }
+                    } else if !r.has_focus() {
+                        b.text = trim(c.amount()); // the arrow was dragged
+                    }
+                    if r.lost_focus() {
+                        let (enter, esc) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+                        if enter || esc {
+                            done = Some(enter);
+                        }
+                    }
+                });
+            });
+        });
+        match done {
+            Some(true) => self.marking_apply(),
+            Some(false) => {
+                self.command = None;
+                self.gizmos.size = None;
+            }
+            None => {}
+        }
+    }
+
+    /// The size in the box goes to the command, which makes its step.
+    fn marking_apply(&mut self) {
+        let Some(mut b) = self.gizmos.size.take() else { return };
+        let Some(v) = size_of(&b.text) else {
+            self.error = Some(format!("{}: not a size above zero", b.text));
+            b.focus = true;
+            self.gizmos.size = Some(b);
+            return;
+        };
+        let Some(c) = self.command.as_mut().filter(|c| c.op == b.op) else { return };
+        *c.amount_mut() = v;
+        // One step per Enter, as the dialog's OK: a second one before the reply would make it twice.
+        if !self.pending.values().any(|p| matches!(p, Pending::Create)) {
+            self.run_command();
+        }
+        // It goes with the command when the step is made; if FreeCAD refuses the size, it stays
+        // for another.
+        self.gizmos.size = Some(b);
+    }
+
+    // ---- for the self-test -----------------------------------------------------------------
+
+    /// Click, as the mouse would, on the middle of an edge (`corner` false) or on a corner of
+    /// `obj` until one is picked: what was picked and where, or None when no click picked one.
+    pub(super) fn selftest_click(&mut self, obj: &str, corner: bool, ppp: f32) -> Option<(String, Pos2)> {
+        let (project, rect) = (self.project()?, self.gizmos.view?.1);
+        let points: Vec<(u32, Pos2)> = if corner {
+            self.gizmos.vertices.get(obj)?.iter().filter_map(|v| Some((v.index, project(v.at)?))).collect()
+        } else {
+            self.gizmos.edges.get(obj)?.iter().filter_map(|e| Some((e.index, project(e.mid)?))).collect()
+        };
+        let want = if corner { "Vertex" } else { "Edge" };
+        for (i, at) in points.into_iter().filter(|(_, p)| rect.shrink(30.0).contains(*p)) {
+            self.click_view(at, ((at.x - rect.min.x) * ppp) as u32, ((at.y - rect.min.y) * ppp) as u32, ppp);
+            let sub = self.selection.as_ref().and_then(|s| s.sub.clone());
+            if sub.as_deref() == Some(&format!("{want}{i}")) {
+                return Some((sub?, at));
+            }
+        }
+        None
+    }
+
+    /// The marking menu and its size box as they stand.
+    pub(super) fn marking_state(&self) -> Value {
+        let pointer = self.ctx.input(|i| i.pointer.latest_pos());
+        let hot = self.gizmos.wheel.as_ref().and_then(|w| Some(w.choices[modelling::wheel_choice(pointer? - w.center, w.choices.len())?].label()));
+        json!({
+            "hot": hot,
+            "wheel": self.gizmos.wheel.as_ref().map(|w| json!({
+                "at": [w.center.x, w.center.y],
+                "choices": w.choices.iter().map(|o| o.label()).collect::<Vec<_>>(),
+                "what": w.what,
+            })),
+            "size_box": self.gizmos.size.as_ref().map(|b| json!({ "op": b.op.label(), "text": b.text })),
+        })
+    }
+}
+
+/// A size as typed: a number above zero, with a comma or a point, "mm" after it or not.
+fn size_of(text: &str) -> Option<f64> {
+    let t = text.trim().trim_end_matches("mm").trim().replace(',', ".");
+    t.parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0)
 }
 
 /// A number without trailing zeros: 12.5, 3, 0.05.
@@ -366,5 +610,14 @@ mod tests {
         assert_eq!(super::trim(3.0), "3");
         assert_eq!(super::trim(0.05), "0.05");
         assert_eq!(super::trim(-0.00001), "0");
+    }
+
+    #[test]
+    fn sizes_read_as_typed() {
+        assert_eq!(super::size_of(" 2,5 "), Some(2.5));
+        assert_eq!(super::size_of("3mm"), Some(3.0));
+        assert_eq!(super::size_of("0"), None);
+        assert_eq!(super::size_of("-1"), None);
+        assert_eq!(super::size_of("abc"), None);
     }
 }

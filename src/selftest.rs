@@ -1,8 +1,10 @@
 //! `VIBECAD_SELFTEST=<dir>`: drive the window through zoom, pick, select, edit, undo, an extrude,
-//! a construction plane and a sketch drawn in sketch mode (with a picture of the whole window) with the
-//! same code the mouse and the property panel use, write frames as BMP and a `report.json`, then
-//! quit. The edit steps are meant for the sample `examples/plate.FCStd` (a Pad under a Pocket);
-//! the view and performance steps work on any document.
+//! a construction plane, a sketch drawn in sketch mode (with a picture of the whole window),
+//! clicks on an edge and a corner, and a fillet made from the marking menu, with the same code
+//! the mouse and the property panel use (the marking menu with Alt, pointer and keys given to
+//! the window as input), write frames as BMP and a `report.json`, then quit. The edit steps are
+//! meant for the sample `examples/plate.FCStd` (a Pad under a Pocket); the view and performance
+//! steps work on any document.
 
 use std::path::{Path, PathBuf};
 
@@ -24,7 +26,28 @@ pub enum Stage {
     SketchDraw,
     SketchShot,
     SketchSaved,
+    /// An edge and a corner picked by clicks on them, then the marking menu: Alt held over the
+    /// picked edge, the pointer moved left to Fillet, Alt let go, "2" and Enter typed in the
+    /// size box, as input the window receives; then undone.
+    EdgeAsk,
+    EdgePick,
+    VertexPick,
+    WheelOpen,
+    WheelPoint,
+    WheelChoose,
+    SizeType,
+    Filleted,
+    FilletUndo,
     Done,
+}
+
+/// Input the self-test gives the window, in the next frames, as if it came from the keyboard
+/// and the mouse (see `App::raw_input_hook`).
+#[derive(Default)]
+pub struct Inject {
+    /// The window taken as focused, as it is when a person holds Alt and types in it.
+    pub focus: bool,
+    pub events: Vec<eframe::egui::Event>,
 }
 
 /// A screenshot of the window: width, height, RGBA rows.
@@ -40,13 +63,18 @@ pub struct SelfTest {
     pub seen_partial: bool,
     /// The whole window as egui drew it (overlays included), once a screenshot came back.
     pub window: Window,
+    /// A screenshot of the window was asked for and has not come yet.
+    pub shot_asked: bool,
+    pub inject: Inject,
+    /// Where the picked edge is on screen, for the marking menu.
+    pub edge_at: Option<eframe::egui::Pos2>,
 }
 
 impl SelfTest {
     pub fn from_env() -> Option<Self> {
         let dir = PathBuf::from(std::env::var_os("VIBECAD_SELFTEST")?);
         std::fs::create_dir_all(&dir).ok()?;
-        Some(SelfTest { dir, stage: Stage::WaitScene, report: json!({ "steps": [] }), frames_idle: 0, seen_boxes: false, seen_partial: false, window: Window::default() })
+        Some(SelfTest { dir, stage: Stage::WaitScene, report: json!({ "steps": [] }), frames_idle: 0, seen_boxes: false, seen_partial: false, window: Window::default(), shot_asked: false, inject: Inject::default(), edge_at: None })
     }
 
     pub fn log(&mut self, step: &str, data: Value) {

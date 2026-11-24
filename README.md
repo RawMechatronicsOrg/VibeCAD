@@ -27,8 +27,9 @@ For you:
   from, with a rollback marker to drag.
 - **Sketching in place, as in Fusion.** Draw, constrain and dimension on a face or a plane;
   FreeCAD's Sketcher solves.
-- **Direct handles.** Push or pull a face by its arrow, drag a fillet's radius, pick edges; what
-  an extrude would add shows in blue, what it would cut in red.
+- **Direct handles.** Push or pull a face by its arrow, drag a fillet's radius, pick edges and
+  corners; what an extrude would add shows in blue, what it would cut in red. Hold Alt over a
+  picked edge for a wheel of what fits it (fillet, chamfer) and type the size.
 - **Native FreeCAD objects.** Sketch, plane, extrude, fillet, chamfer, mirror, patterns and
   copies are made as the Pads, Pockets and PartDesign features FreeCAD knows.
 - **Checks that point at the mistake.** The validators list thin walls, slits, steps and other
@@ -138,7 +139,8 @@ EDGE WIDTH slider sets the edge width from 1 to 4 pixels (default 1.5).
 | drag | orbit |
 | right or middle drag, shift + drag | pan |
 | wheel | zoom |
-| click | select the edge near the cursor, else the face under it (and its object) |
+| click | select the corner near the cursor, else the edge near it, else the face under it (and its object) |
+| hold Alt | marking menu for what is selected: point at a choice, let Alt go (see [Modelling](#modelling)) |
 | double click, `F` | fit all |
 | `0` `1` `2` `3` | isometric (from the front-right), front, top, right |
 | `O` | orthographic / perspective |
@@ -208,17 +210,30 @@ A panel where the properties stand shows its elements, constraints, degrees of f
 profiles. Esc drops the shape being drawn, then the tool, then the picked elements, then leaves
 the sketch, as Finish sketch does; the sketch stays selected, so Extrude takes it as its profile.
 
-**Edges and handles.** An edge under the cursor lights up light blue; a click picks it (blue), as
-a face is picked. Only edges of the faces under and around the cursor count, so edges hidden
-behind the part are not picked. In Fillet and Chamfer each click on an edge adds it or takes it
+**Edges, corners and handles.** An edge under the cursor lights up light blue; a click picks it
+(blue), as a face is picked, and the property panel says which (`picked Edge3`). A corner
+(vertex) within a few points of the cursor wins over its edges: it lights up as a dot, and a
+click picks it (`Vertex2`). Only edges and corners of the faces under and around the cursor
+count, so those hidden behind the part are not picked. Corners are picked with no command open;
+a command that takes edges takes edges only. In Fillet and Chamfer each click on an edge adds it or takes it
 out again. A selected flat face carries an arrow along its normal: drag it to push or pull the
 face, as Fusion's press-pull does. That opens Extrude with the distance dragged; the solid it
 would add shows in blue, what it would cut in red, and OK (or Enter) makes it. The Extrude
 dialog has the same arrow, and Fillet and Chamfer have one on their first edge for the radius
 or size. Values snap to round steps that follow the zoom. The edges come from the worker on
-demand (`edges`: per edge its polyline, the faces it bounds and the way out of its corner), the
-face from `face` (its triangles, centre and outward normal), and are kept until the model
-changes.
+demand (`edges`: per edge its polyline, the faces it bounds and the way out of its corner, and
+per vertex where it is and the edges that end there), the face from `face` (its triangles,
+centre and outward normal), and are kept until the model changes.
+
+**Marking menu.** Hold Alt over the view with something picked and no command open: a wheel
+opens around the pointer with the commands for what is picked. Move the pointer towards one to
+light it and let Alt go (or click) to start it; let go in the middle, or press Esc, and nothing
+happens. For an edge the wheel holds Fillet (left) and Chamfer (right). The command starts as
+from the ribbon, with the edge in its dialog and the arrow on the edge, and a box by the pointer
+takes the radius or size: type it, Enter makes the fillet or chamfer (one undoable step, the
+same `fillet` request as the dialog's OK), Esc closes the command. Over a face, a corner or a
+whole part the wheel is empty for now and says so. Alt with Ctrl or Shift, or with a text field
+being typed in, opens nothing.
 
 Typed numbers apply on Enter or when the field loses focus. Opening another file or closing the
 window asks before unsaved edits are lost. If FreeCAD crashes, File → Restart FreeCAD starts a new
@@ -505,7 +520,10 @@ python worker/test_worker.py examples/plate.FCStd path/to/assembly.FCStd
 of the boxes and one of a partly loaded scene while the document streams in, zooms in and back,
 picks faces (a grid of points and two inside the first object's box), selects `Pad`, sets
 `Length` to 12, undoes, extrudes the top face and puts a construction plane over it through the
-modelling commands, writes frames as BMP and `report.json` to `<dir>`, and quits. The
+modelling commands, draws and dimensions a sketch, clicks on an edge and on a corner, and makes
+a 2 mm fillet from the marking menu with Alt, pointer moves and keys given to the window as
+input (then undoes it), writes frames as BMP (`5-edge`, `6-vertex`, `7-wheel`, `8-filleted` are
+the whole window) and `report.json` to `<dir>`, and quits. The
 report's `load` entry is the timeline of the first scene (boxes, first meshes, all meshes, in
 ms after the request, and the worker's cache hits); `perf` gives the GPU memory of the scene,
 the time to decode and upload it, the objects and triangles drawn and the time per frame (30
@@ -528,6 +546,13 @@ documents, where the `Pad` steps just report an error.
   without depth, so they show through parts in front of them. There is no preview of a fillet.
 - Lighting edges under the cursor picks the scene once per resting position; on a scene where
   that takes over 15 ms it is turned off for the session (clicks still pick edges).
+- One element is selected at a time: Shift or Ctrl does not add edges, faces or corners to the
+  selection (in Fillet and Chamfer each click adds or removes an edge). No command takes a
+  corner yet; a picked corner selects its part for those that take a part.
+- The marking menu has choices for an edge only (Fillet, Chamfer); over a face, a corner or a
+  part it is empty. It opens only with no command open. The self-test drives it with input
+  given to egui; a real Alt key on Windows was not pressed in a test (winit leaves the window
+  menu alone when the window has none, so Alt alone does not take the focus).
 - The first view of a large assembly takes time: the 158 000-face Orbiter assembly shows its
   boxes 0.5 s after it is open, its first mesh after 2.3 s and all of it after about 19 s
   (some 3 s of that checking which shapes are closed solids); from the disk cache all of it
