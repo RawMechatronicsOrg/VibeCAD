@@ -4,9 +4,12 @@
 //! its shapes with wgpu and edits its documents through that worker.
 //!
 //!     vibecad [document.FCStd]
+//!     vibecad --mcp        an MCP server on stdio that drives the running window (see agent.rs)
 
+mod agent;
 mod app;
 mod camera;
+mod mcp;
 mod render;
 mod scene;
 mod selftest;
@@ -14,6 +17,13 @@ mod ui_chrome;
 mod worker;
 
 fn main() -> eframe::Result {
+    if std::env::args_os().nth(1).is_some_and(|a| a == "--mcp") {
+        if let Err(e) = mcp::serve() {
+            eprintln!("vibecad --mcp: {e:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let open = std::env::args_os().nth(1).map(std::path::PathBuf::from);
     // Ask the GPU for the buffer sizes it really has: wgpu's defaults stop at 256 MB, which a
     // large assembly passes.

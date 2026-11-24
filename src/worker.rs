@@ -166,7 +166,7 @@ fn push_log(log: &Mutex<VecDeque<String>>, line: String) {
     l.push_back(line);
 }
 
-fn random_hex(words: usize) -> String {
+pub(crate) fn random_hex(words: usize) -> String {
     let mut out = String::new();
     for i in 0..words {
         let mut h = std::collections::hash_map::RandomState::new().build_hasher();

@@ -12,6 +12,7 @@ pub enum Tab {
     File,
     Edit,
     View,
+    Agentic,
 }
 
 /// What a click in the ribbon asks the app to do.
@@ -36,6 +37,12 @@ pub enum Action {
     TogglePalette,
     /// In pixels.
     EdgeWidth(f32),
+    ToggleFeed,
+    /// Refuse the agent's calls until switched off again.
+    TogglePause,
+    ClearFeed,
+    /// Put the command that adds this MCP server to Claude Code on the clipboard.
+    CopyMcpSetup,
 }
 
 /// What the ribbon needs to know to enable and mark its buttons.
@@ -50,6 +57,12 @@ pub struct RibbonState {
     pub grid: bool,
     pub palette: bool,
     pub edge_width: f32,
+    pub feed: bool,
+    pub paused: bool,
+    /// Where the agent bridge listens, or why it does not.
+    pub agent: Result<u16, String>,
+    pub agent_calls: usize,
+    pub agent_running: bool,
 }
 
 pub fn ribbon(ui: &mut egui::Ui, tab: &mut Tab, s: &RibbonState, status: impl FnOnce(&mut egui::Ui)) -> Vec<Action> {
@@ -57,8 +70,12 @@ pub fn ribbon(ui: &mut egui::Ui, tab: &mut Tab, s: &RibbonState, status: impl Fn
     ui.horizontal(|ui| {
         ui.label(RichText::new("VibeCAD").strong());
         ui.add_space(12.0);
-        for (t, name) in [(Tab::File, "FILE"), (Tab::Edit, "EDIT"), (Tab::View, "VIEW")] {
-            if ui.selectable_label(*tab == t, RichText::new(name).small().strong()).clicked() {
+        for (t, name) in [(Tab::File, "FILE"), (Tab::Edit, "EDIT"), (Tab::View, "VIEW"), (Tab::Agentic, "AGENTIC")] {
+            let mut text = RichText::new(name).small().strong();
+            if t == Tab::Agentic && s.agent_running {
+                text = text.color(ui.visuals().selection.bg_fill); // the agent is working
+            }
+            if ui.selectable_label(*tab == t, text).clicked() {
                 *tab = t;
             }
         }
@@ -131,6 +148,29 @@ pub fn ribbon(ui: &mut egui::Ui, tab: &mut Tab, s: &RibbonState, status: impl Fn
                     });
                 });
             }
+            Tab::Agentic => {
+                group(ui, "AGENT", |ui| {
+                    button(ui, &mut out, Action::ToggleFeed, Icon::Feed, "Feed", true, s.feed, "The agent's tool calls as they happen, over the view");
+                    let pause = if s.paused { "Paused" } else { "Pause" };
+                    button(ui, &mut out, Action::TogglePause, Icon::Pause, pause, true, s.paused, "Refuse the agent's calls (it is told the person paused it) until clicked again");
+                    button(ui, &mut out, Action::ClearFeed, Icon::Clear, "Clear", s.agent_calls > 0, false, "Empty the feed");
+                });
+                group(ui, "MCP SERVER", |ui| {
+                    button(ui, &mut out, Action::CopyMcpSetup, Icon::Copy, "Copy setup", s.agent.is_ok(), false, "Copy the command that adds VibeCAD's MCP server to Claude Code");
+                    ui.vertical(|ui| {
+                        ui.add_space(6.0);
+                        match &s.agent {
+                            Ok(port) => {
+                                ui.label(RichText::new(format!("listening on 127.0.0.1:{port}")).small());
+                                ui.label(RichText::new(format!("{} calls this session", s.agent_calls)).small().weak());
+                            }
+                            Err(e) => {
+                                ui.colored_label(Color32::LIGHT_RED, RichText::new(e).small());
+                            }
+                        }
+                    });
+                });
+            }
         }
     });
     out
@@ -165,6 +205,10 @@ enum Icon {
     Palette,
     Log,
     Grid,
+    Feed,
+    Pause,
+    Clear,
+    Copy,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -297,6 +341,28 @@ fn paint_icon(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
                 let (a, b) = (lerp(quad[0], quad[3]), lerp(quad[1], quad[2]));
                 p.line_segment([at(a.0, a.1), at(b.0, b.1)], Stroke::new(1.0, c));
             }
+        }
+        Icon::Feed => {
+            // A column of entries, each a dot and a line.
+            for y in [0.2, 0.5, 0.8] {
+                p.circle_filled(at(0.15, y), 2.0, c);
+                p.line_segment([at(0.32, y), at(0.95, y)], s);
+            }
+        }
+        Icon::Pause => {
+            p.circle_stroke(at(0.5, 0.5), r.width() * 0.45, s);
+            for x in [0.4, 0.6] {
+                p.line_segment([at(x, 0.32), at(x, 0.68)], Stroke::new(2.0, c));
+            }
+        }
+        Icon::Clear => {
+            poly(&[(0.2, 0.25), (0.8, 0.25), (0.72, 0.95), (0.28, 0.95)], true);
+            p.line_segment([at(0.1, 0.25), at(0.9, 0.25)], s);
+            poly(&[(0.38, 0.25), (0.42, 0.08), (0.58, 0.08), (0.62, 0.25)], false);
+        }
+        Icon::Copy => {
+            p.rect_stroke(Rect::from_min_max(at(0.1, 0.25), at(0.65, 0.95)), 1.0, s, egui::StrokeKind::Middle);
+            poly(&[(0.35, 0.25), (0.35, 0.05), (0.9, 0.05), (0.9, 0.75), (0.65, 0.75)], false);
         }
         Icon::Log => {
             poly(&[(0.15, 0.05), (0.85, 0.05), (0.85, 0.95), (0.15, 0.95)], true);

@@ -8,6 +8,7 @@ use eframe::egui::{self, Color32, KeyboardShortcut, Modifiers, PointerButton, Ri
 use glam::Vec2;
 use serde_json::{Value, json};
 
+use crate::agent::{self, Bridge, Call, FeedEntry, Status, ToolResult};
 use crate::camera::{Camera, View};
 use crate::render::{Frame, GroundGrid, Renderer};
 use crate::scene::SceneData;
@@ -24,6 +25,16 @@ enum Pending {
     Edit,
     Save,
     Export,
+    /// A read-only call of the agent; its answer goes back to the agent only.
+    AgentQuery,
+}
+
+/// A tool call of the agent waiting for the worker.
+struct AgentJob {
+    call: Call,
+    /// Its entry in the feed.
+    entry: usize,
+    outlines: bool,
 }
 
 struct Node {
@@ -124,6 +135,16 @@ pub struct App {
     /// How the last scene stream went, in milliseconds since it was asked for.
     last_load: Option<Value>,
     selftest: Option<SelfTest>,
+    /// Where an MCP client reaches this window (see agent.rs), or why it cannot.
+    bridge: Result<Bridge, String>,
+    agent_jobs: HashMap<u64, AgentJob>,
+    feed: Vec<FeedEntry>,
+    show_feed: bool,
+    agent_paused: bool,
+    /// Left for the agent by the person watching; goes out with the next tool result.
+    agent_note: String,
+    note_sent: Option<String>,
+    started: Instant,
 }
 
 impl App {
@@ -159,14 +180,27 @@ impl App {
             loading: None,
             opened_at: None,
             last_load: None,
+            bridge: if SelfTest::from_env().is_some() {
+                Err("off in the self-test".into()) // it would take the user's window's agent.json
+            } else {
+                let c = cc.egui_ctx.clone();
+                Bridge::start(move || c.request_repaint()).map_err(|e| format!("agent bridge: {e:#}"))
+            },
             selftest: SelfTest::from_env(),
+            agent_jobs: HashMap::new(),
+            feed: Vec::new(),
+            show_feed: false,
+            agent_paused: false,
+            agent_note: String::new(),
+            note_sent: None,
+            started: Instant::now(),
         }
     }
 
-    fn request(&mut self, cmd: &str, args: Value, kind: Pending) {
+    fn request(&mut self, cmd: &str, args: Value, kind: Pending) -> Option<u64> {
         if self.worker_error.is_some() {
             self.error = Some("FreeCAD is not running: File → Restart FreeCAD".into());
-            return;
+            return None;
         }
         let id = self.worker.send(cmd, args);
         if let Pending::Scene { fit } = kind {
@@ -186,6 +220,7 @@ impl App {
             });
         }
         self.pending.insert(id, kind);
+        Some(id)
     }
 
     /// True when there is nothing unsaved, or the user agrees to lose it.
@@ -221,10 +256,10 @@ impl App {
 
     // ---- actions ---------------------------------------------------------------------
 
-    fn open(&mut self, path: PathBuf) {
+    fn open(&mut self, path: PathBuf) -> Option<u64> {
         self.opened_at = Some(Instant::now());
         let arg = json!({ "path": path.to_string_lossy() });
-        self.request("open", arg, Pending::Open(path));
+        self.request("open", arg, Pending::Open(path))
     }
 
     fn open_dialog(&mut self) {
@@ -282,10 +317,8 @@ impl App {
         }
     }
 
-    fn undo(&mut self, redo: bool) {
-        if self.doc_label.is_some() {
-            self.request(if redo { "redo" } else { "undo" }, json!({}), Pending::Edit);
-        }
+    fn undo(&mut self, redo: bool) -> Option<u64> {
+        if self.doc_label.is_some() { self.request(if redo { "redo" } else { "undo" }, json!({}), Pending::Edit) } else { None }
     }
 
     fn select(&mut self, sel: Option<Selection>) {
@@ -301,8 +334,8 @@ impl App {
         }
     }
 
-    fn set_prop(&mut self, obj: &str, prop: &str, value: Value) {
-        self.request("set_prop", json!({ "obj": obj, "prop": prop, "value": value }), Pending::Edit);
+    fn set_prop(&mut self, obj: &str, prop: &str, value: Value) -> Option<u64> {
+        self.request("set_prop", json!({ "obj": obj, "prop": prop, "value": value }), Pending::Edit)
     }
 
     /// Select what is under a pixel of the 3D view (or clear the selection on empty space).
@@ -346,12 +379,22 @@ impl App {
                     }
                 }
                 Event::Died(e) => {
+                    let why = format!("FreeCAD stopped: {e}");
+                    for (_, job) in std::mem::take(&mut self.agent_jobs) {
+                        self.finish_agent(ctx, job, Err(&why));
+                    }
                     self.worker_error = Some(e);
                     self.pending.clear();
                     self.loading = None;
                 }
                 Event::Stream { id, part } => self.on_stream(id, part),
                 Event::Reply(r) => {
+                    if let Some(job) = self.agent_jobs.remove(&r.id) {
+                        match &r.result {
+                            Ok(Body::Json(v)) => self.finish_agent(ctx, job, Ok(v)),
+                            Err(e) => self.finish_agent(ctx, job, Err(e)),
+                        }
+                    }
                     let Some(kind) = self.pending.remove(&r.id) else { continue };
                     match r.result {
                         Err(e) => {
@@ -416,6 +459,7 @@ impl App {
                     self.info = Some(format!("exported {} objects to {}", v["objects"], v["path"].as_str().unwrap_or("")));
                 }
                 Pending::Scene { .. } => self.on_scene_done(id, &v),
+                Pending::AgentQuery => {}
             }
         }
     }
@@ -623,7 +667,13 @@ impl App {
             grid: self.show_grid,
             palette: self.palette,
             edge_width: self.edge_width,
+            feed: self.show_feed,
+            paused: self.agent_paused,
+            agent: self.bridge.as_ref().map(|b| b.port).map_err(Clone::clone),
+            agent_calls: self.feed.len(),
+            agent_running: !self.agent_jobs.is_empty(),
         };
+        let tab_before = self.tab;
         let (busy, freecad, dead) = (self.busy(), self.freecad.clone(), self.worker_error.is_some());
         let actions = ui_chrome::ribbon(ui, &mut self.tab, &state, |ui| match (dead, freecad) {
             (true, _) => {
@@ -640,6 +690,9 @@ impl App {
                 ui.weak(format!("FreeCAD {v}"));
             }
         });
+        if self.tab == Tab::Agentic && tab_before != Tab::Agentic {
+            self.show_feed = true;
+        }
         for a in actions {
             match a {
                 Action::Open => self.open_dialog(),
@@ -648,8 +701,12 @@ impl App {
                 Action::Export => self.export_dialog(),
                 Action::Restart => self.restart(),
                 Action::Quit => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
-                Action::Undo => self.undo(false),
-                Action::Redo => self.undo(true),
+                Action::Undo => {
+                    self.undo(false);
+                }
+                Action::Redo => {
+                    self.undo(true);
+                }
                 Action::Fit => self.fit(),
                 Action::ViewFrom(dir) => ui_chrome::look_from(&mut self.camera, dir),
                 Action::ToggleOrtho => self.camera.ortho = !self.camera.ortho,
@@ -658,6 +715,20 @@ impl App {
                 Action::ToggleGrid => self.show_grid = !self.show_grid,
                 Action::TogglePalette => self.palette = !self.palette,
                 Action::EdgeWidth(w) => self.edge_width = w,
+                Action::ToggleFeed => self.show_feed = !self.show_feed,
+                Action::TogglePause => self.agent_paused = !self.agent_paused,
+                Action::ClearFeed => {
+                    // Calls still running are answered by their place in the feed.
+                    if self.agent_jobs.is_empty() {
+                        self.feed.clear();
+                    }
+                }
+                Action::CopyMcpSetup => {
+                    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "vibecad".into());
+                    let cmd = format!("claude mcp add vibecad -- \"{exe}\" --mcp");
+                    ui.ctx().copy_text(cmd.clone());
+                    self.info = Some(format!("copied: {cmd}"));
+                }
             }
         }
     }
@@ -669,11 +740,18 @@ impl App {
         ui_chrome::overlay(ctx, "tree", view, view.left_top() + egui::vec2(10.0, 10.0), egui::Align2::LEFT_TOP, 260.0, view.height() - 20.0, &title, |ui| {
             self.tree_panel(ui)
         });
+        // The feed takes the lower part of the right side; the properties keep the rest.
+        let feed_height = (view.height() * 0.55).max(200.0);
         if self.selection.is_some() {
             let top = view.right_top() + egui::vec2(-10.0, 150.0);
-            ui_chrome::overlay(ctx, "props", view, top, egui::Align2::RIGHT_TOP, 290.0, view.height() - 200.0, "Properties", |ui| {
+            let height = if self.show_feed { (view.height() - feed_height - 190.0).max(120.0) } else { view.height() - 200.0 };
+            ui_chrome::overlay(ctx, "props", view, top, egui::Align2::RIGHT_TOP, 290.0, height, "Properties", |ui| {
                 self.props_panel(ui)
             });
+        }
+        if self.show_feed {
+            let at = view.right_bottom() + egui::vec2(-10.0, -24.0);
+            ui_chrome::overlay(ctx, "feed", view, at, egui::Align2::RIGHT_BOTTOM, 430.0, feed_height, "Agent", |ui| self.feed_panel(ui));
         }
     }
 
@@ -1167,6 +1245,199 @@ impl App {
     }
 }
 
+// ---- the agent: tool calls from the MCP bridge, and their feed -------------------------
+
+impl App {
+    fn agent_calls(&mut self, ctx: &egui::Context) {
+        let calls: Vec<Call> = match &self.bridge {
+            Ok(b) => b.calls.try_iter().collect(),
+            Err(_) => return,
+        };
+        for call in calls {
+            self.agent_call(ctx, call);
+        }
+    }
+
+    fn agent_call(&mut self, ctx: &egui::Context, call: Call) {
+        self.feed.push(FeedEntry {
+            tool: call.tool.clone(),
+            args: if call.args.as_object().is_some_and(|m| !m.is_empty()) { call.args.to_string() } else { String::new() },
+            started: Instant::now(),
+            at: self.started.elapsed().as_secs_f64(),
+            status: Status::Running,
+            took: None,
+            text: String::new(),
+            images: Vec::new(),
+        });
+        let entry = self.feed.len() - 1;
+        if self.agent_paused {
+            let text = "The person watching VibeCAD paused the agent; nothing was done. Wait for them, or ask them in the chat.";
+            return self.answer_agent(ctx, call, entry, Status::Refused, ToolResult::err(text));
+        }
+        let a = &call.args;
+        let s = |k: &str| a[k].as_str().unwrap_or("").to_string();
+        let ready = self.freecad.is_some() && self.worker_error.is_none();
+        // (worker command, its arguments, how its reply is handled in the window)
+        let job = match call.tool.as_str() {
+            "get_status" => {
+                let status = json!({
+                    "document": self.doc_label,
+                    "path": self.doc_path.as_ref().map(|p| p.to_string_lossy()),
+                    "unsaved_edits": self.modified,
+                    "freecad": self.freecad,
+                    "freecad_error": self.worker_error,
+                    "loading_scene": self.loading.is_some(),
+                    "selection": self.selection.as_ref().map(|s| json!({ "object": s.obj, "sub": s.sub })),
+                    "paused": self.agent_paused,
+                });
+                return self.answer_agent(ctx, call, entry, Status::Done, ToolResult::ok(status.to_string()));
+            }
+            _ if !ready => Err("FreeCAD is not running in the window yet (or it stopped)".to_string()),
+            "open_document" if self.modified => Err("the window has unsaved edits; ask the person to save or discard them".into()),
+            "open_document" => Ok(self.open(PathBuf::from(s("path")))),
+            _ if self.doc_label.is_none() => Err("no document is open; use open_document or ask the person".to_string()),
+            "get_tree" => Ok(self.request("tree", json!({}), Pending::AgentQuery)),
+            "get_properties" => Ok(self.request("props", json!({ "obj": s("object") }), Pending::AgentQuery)),
+            "set_property" => Ok(self.set_prop(&s("object"), &s("property"), a["value"].clone())),
+            "undo" => Ok(self.undo(false)),
+            "redo" => Ok(self.undo(true)),
+            "snapshot" => Ok(self.request("snapshot", json!({ "label": a["label"] }), Pending::AgentQuery)),
+            "get_timeline" => Ok(self.request("timeline", json!({ "body": a["body"] }), Pending::AgentQuery)),
+            "slice" | "diff" => {
+                let mut args = a.clone();
+                if let Some(m) = args.as_object_mut() {
+                    m.remove("outlines");
+                }
+                Ok(self.request(&call.tool, args, Pending::AgentQuery))
+            }
+            other => Err(format!("unknown tool {other}")),
+        };
+        match job {
+            Ok(Some(id)) => {
+                let outlines = a["outlines"].as_bool() == Some(true);
+                self.agent_jobs.insert(id, AgentJob { call, entry, outlines });
+            }
+            Ok(None) => self.answer_agent(ctx, call, entry, Status::Failed, ToolResult::err("FreeCAD is not running in the window")),
+            Err(e) => self.answer_agent(ctx, call, entry, Status::Failed, ToolResult::err(e)),
+        }
+    }
+
+    /// The worker answered a call of the agent: shape the reply for it, pictures included.
+    fn finish_agent(&mut self, ctx: &egui::Context, job: AgentJob, result: Result<&Value, &String>) {
+        let AgentJob { call, entry, outlines } = job;
+        let v = match result {
+            Err(e) => return self.answer_agent(ctx, call, entry, Status::Failed, ToolResult::err(e.clone())),
+            Ok(v) => {
+                let mut v = v.clone();
+                if let Some(m) = v.as_object_mut() {
+                    m.remove("id");
+                    m.remove("ok");
+                }
+                v
+            }
+        };
+        let mut out = ToolResult::ok(String::new());
+        match call.tool.as_str() {
+            "slice" => {
+                out.images.extend(agent::render_slices(&v, 1024));
+                let data = if outlines { v.clone() } else { agent::without_outlines(&v) };
+                out.text = format!("{}\n{data}", agent::slice_legend(&v));
+            }
+            "diff" => {
+                if let Some(p) = agent::render_sections(&v["sections"], 1200) {
+                    out.images.push(p);
+                    out.text = "Picture: cuts through the centre of the changed region, normal to x, y and z (left to right; \
+                                planes (y, z), (x, z), (x, y)), with v up, each at its own scale. Grey: in both states, green: added, red: removed.\n"
+                        .into();
+                }
+                out.text.push_str(&agent::without_outlines(&v).to_string());
+            }
+            "open_document" => out.text = format!("{v}\nThe window is loading the document's shapes now."),
+            _ => out.text = v.to_string(),
+        }
+        self.answer_agent(ctx, call, entry, Status::Done, out);
+    }
+
+    fn answer_agent(&mut self, ctx: &egui::Context, call: Call, entry: usize, status: Status, mut result: ToolResult) {
+        let note = self.agent_note.trim().to_string();
+        if !note.is_empty() {
+            result.text.push_str(&format!("\n\n[Note from the person watching in VibeCAD: {note}]"));
+            self.note_sent = Some(note);
+            self.agent_note.clear();
+        }
+        if let Some(e) = self.feed.get_mut(entry) {
+            e.status = status;
+            e.took = Some(e.started.elapsed());
+            e.text = result.text.chars().take(6000).collect();
+            e.images = result
+                .images
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let img = egui::ColorImage::from_rgb([p.width, p.height], &p.rgb);
+                    ctx.load_texture(format!("agent-{entry}-{i}"), img, egui::TextureOptions::LINEAR)
+                })
+                .collect();
+        }
+        call.answer(result);
+    }
+
+    fn feed_panel(&mut self, ui: &mut egui::Ui) {
+        if self.agent_paused {
+            ui.colored_label(Color32::from_rgb(214, 140, 40), "Paused: the agent's calls are refused (AGENTIC → Pause).");
+        }
+        if let Err(e) = &self.bridge {
+            ui.colored_label(Color32::LIGHT_RED, e);
+        }
+        ui.label(RichText::new("Note to the agent, sent with its next result:").small().weak());
+        ui.add(egui::TextEdit::multiline(&mut self.agent_note).desired_rows(2).desired_width(f32::INFINITY).hint_text("e.g. the hole should go through the flange"));
+        if let Some(n) = &self.note_sent {
+            ui.label(RichText::new(format!("sent: {n}")).small().weak());
+        }
+        ui.separator();
+        if self.feed.is_empty() {
+            ui.weak("No calls yet. Connect an agent: AGENTIC → Copy setup, then run the command in a terminal.");
+            return;
+        }
+        egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
+            for (i, e) in self.feed.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    let (text, color) = match e.status {
+                        Status::Running => ("…", ui.visuals().selection.bg_fill),
+                        Status::Done => ("ok", Color32::from_rgb(40, 150, 80)),
+                        Status::Failed => ("error", Color32::LIGHT_RED),
+                        Status::Refused => ("paused", Color32::from_rgb(214, 140, 40)),
+                    };
+                    if e.status == Status::Running {
+                        ui.spinner();
+                    } else {
+                        ui.label(RichText::new(text).small().color(color));
+                    }
+                    ui.label(RichText::new(format!("{:.1}s", e.at)).small().weak());
+                    ui.strong(&e.tool);
+                    if let Some(t) = e.took {
+                        ui.label(RichText::new(format!("{} ms", t.as_millis())).small().weak());
+                    }
+                });
+                if !e.args.is_empty() {
+                    ui.add(egui::Label::new(RichText::new(&e.args).monospace().small()).truncate()).on_hover_text(&e.args);
+                }
+                for tex in &e.images {
+                    let w = ui.available_width().min(tex.size_vec2().x);
+                    let img = egui::Image::from_texture(egui::load::SizedTexture::from_handle(tex)).max_width(w);
+                    ui.add(img).on_hover_text("What the agent got: same scale in every tile; grey both states, green added, red removed");
+                }
+                if !e.text.is_empty() {
+                    egui::CollapsingHeader::new(RichText::new("result").small()).id_salt(("feed", i)).show(ui, |ui| {
+                        ui.add(egui::Label::new(RichText::new(&e.text).monospace().small()).wrap());
+                    });
+                }
+                ui.separator();
+            }
+        });
+    }
+}
+
 /// The bottom of the view's light background; the top is near white.
 const BACKGROUND: [f64; 3] = [0.84, 0.86, 0.89];
 
@@ -1192,6 +1463,7 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
         self.handle_events(&ctx);
+        self.agent_calls(&ctx);
         self.shortcuts(&ctx);
         egui::Panel::top("ribbon").show(ui, |ui| self.ribbon(ui));
         egui::Panel::bottom("status").resizable(false).show(ui, |ui| self.status_panel(ui));
@@ -1201,7 +1473,7 @@ impl eframe::App for App {
             self.selftest_step(&ctx);
             ctx.request_repaint();
         }
-        if self.busy() {
+        if self.busy() || !self.agent_jobs.is_empty() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }

@@ -73,7 +73,8 @@ one and reopens the file.
   random `VIBECAD_TOKEN`; the script connects back and must greet with the token. The listener
   closes after that one connection, and the directory is removed once FreeCAD has read the script. Every message is a JSON header plus an optional binary payload, both
   length-prefixed (see the script's docstring). Commands: `open`, `new`, `tree`, `props`,
-  `set_prop`, `set_visible`, `undo`, `redo`, `scene`, `save_as`, `export`. Requests go out as
+  `set_prop`, `set_visible`, `undo`, `redo`, `scene`, `save_as`, `export`, `snapshot`,
+  `timeline`, `slice`, `diff`. Requests go out as
   they are made; replies come back in order, a scene's stream frames before its reply.
 - **Scene.** The worker tessellates each distinct shape once (`MeshPart.meshFromShape` with one
   segment per face) and sends instances that place it, so the 265 links of an assembly with 121
@@ -128,11 +129,51 @@ one and reopens the file.
   files it names) back after a save, with the visibility set in VibeCAD written in, so FreeCAD
   shows the document as VibeCAD did. Objects added in VibeCAD get FreeCAD's default look.
 
+## Agents (MCP)
+
+An agent such as Claude Code works on the document open in the window, through an MCP server
+that is VibeCAD itself started with `--mcp`. Add it once (AGENTIC → Copy setup puts this
+command, with the right path, on the clipboard):
+
+```
+claude mcp add vibecad -- "C:\path\to\vibecad.exe" --mcp
+```
+
+`vibecad --mcp` speaks MCP on stdio and passes each tool call to the running window: the window
+listens on a random localhost port and writes it, with a random token, to `agent.json` in
+`%LOCALAPPDATA%\VibeCAD` (`~/Library/Application Support/VibeCAD`, `$XDG_RUNTIME_DIR/vibecad`),
+removed when the window closes. So the agent edits and sees the same document as the person at
+the screen, with one FreeCAD.
+
+Tools: `get_status`, `get_tree`, `get_properties`, `set_property`, `undo`, `redo`,
+`open_document` (refused while there are unsaved edits), and for checking what an edit did:
+
+- **States and timelines.** The worker keeps the exact shape of every solid body (a PartDesign
+  Body, or any solid no other shape takes as input) at each state: `s0` at open, one after
+  every edit that changed a shape (`set_property`, undo, redo; also edits made by hand), and
+  one per `snapshot`. `get_timeline` lists, per body, the states at which it changed, with its
+  volume and the change of volume. `set_property` returns `state_before` and `state_after`.
+- **`slice`**: cuts of the bodies by parallel planes along x, y, z or any normal, at given
+  offsets or spread evenly, like the slices of an MRI. The agent gets a picture of all cuts at
+  one scale, and per cut its regions with area, centre, box and holes (circular ones with their
+  diameter and centre). Given an earlier state, each cut is split exactly (2D booleans) into
+  what both states have (grey), what was added (green) and what was removed (red).
+- **`diff`**: per body, the exact added and removed solids between two states (3D booleans),
+  each with its volume, box, centre, a shape guess (box, cylinder) and its faces by surface
+  (plane normal and offset, cylinder radius and axis, cone, sphere, torus); and a picture of
+  three cuts through the changed region, one per axis, each at its own scale.
+
+The AGENTIC tab shows a feed of the agent's calls as they happen: arguments, time taken,
+result, and the pictures the agent got. **Pause** makes the window refuse the agent's calls
+(it is told the person paused it) until clicked again; a **note** typed in the feed goes out
+with the agent's next tool result.
+
 ## Tests
 
 ```
 cargo test                                         # scene decoding, the camera, the shader (naga)
 python worker/test_worker.py examples/plate.FCStd  # the worker protocol, against a real FreeCAD
+python worker/test_mcp.py                          # MCP end to end: opens the window, drives it, closes it
 ```
 
 `test_worker.py` gives the worker an empty disk cache, checks the scene stream (boxes first,

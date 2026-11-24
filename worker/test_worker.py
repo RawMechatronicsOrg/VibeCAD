@@ -150,6 +150,38 @@ def det3(a):
             + a[2] * (a[4] * a[9] - a[5] * a[8]))
 
 
+def check_states(cl, sp):
+    """The sample's Body after Pad.Length went from 6 to 12: one state per change, a timeline
+    entry for the body, a cut above the old top that is all new, and an exact difference."""
+    before, after = sp["state_before"], sp["state_after"]
+    assert before != after and sp["changed_bodies"] == ["Body"], sp
+    tl, _ = cl.call("timeline")
+    changes = tl["bodies"]["Body"]["changes"]
+    print("timeline of Body:", [(c["state"], c["cause"], c["change"], c.get("delta_volume")) for c in changes])
+    assert [c["change"] for c in changes] == ["created", "changed"] and changes[1]["delta_volume"] > 0, changes
+    snap, _ = cl.call("snapshot", label="after the pad grew")
+    assert snap["state"] not in (before, after) and snap["bodies"][0]["body"] == "Body", snap
+    # Planes at z = 3 (inside both) and z = 9 (only in the new state).
+    cut, _ = cl.call("slice", before=before, axis="z", offsets=[3.0, 9.0])
+    low, high = cut["slices"]
+    print("slice z=3 layers:", {k: v["area"] for k, v in low["layers"].items()},
+          "z=9:", {k: v["area"] for k, v in high["layers"].items()})
+    assert set(high["layers"]) == {"added"} and high["layers"]["added"]["area"] > 0, high
+    assert low["layers"]["same"]["area"] > 0 and not low["layers"].get("added", {"regions": []})["regions"], low
+    plain, _ = cl.call("slice", axis="x", count=4)
+    assert len(plain["slices"]) == 4 and all("section" in s["layers"] for s in plain["slices"]), plain["slices"][0]
+    d, _ = cl.call("diff", before=before)
+    body = d["bodies"][0]
+    added = body["added"]
+    print("diff:", body["change"], "delta volume", body["delta_volume"], "added", added["volume"], added["bbox"],
+          [s["shape"] for s in added["solids"]])
+    assert body["change"] == "changed" and abs(added["volume"] - body["delta_volume"] + body["removed"]["volume"]) < 1e-3, body
+    assert added["bbox"][2] >= 6.0 - 1e-6 and abs(added["bbox"][5] - 12.0) < 1e-6, added
+    assert set(d["sections"]) == {"x", "y", "z"}, d.keys()
+    same, _ = cl.call("diff", before=after, state=snap["state"])
+    assert same["bodies"][0]["change"] == "unchanged" and "sections" not in same, same
+
+
 def main(paths):
     cl = Client()
     for path in paths:
@@ -190,6 +222,7 @@ def main(paths):
         print("closed:", closed)
         assert closed["Pocket"] is True, closed
         assert abs(s2["bbox"][5] - 12.0) < 1e-6, s2["bbox"]
+        check_states(cl, sp)
         u, _ = cl.call("undo")
         s3 = cl.scene()
         print("after undo, bbox z:", round(s3["bbox"][5], 2), u)

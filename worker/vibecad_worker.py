@@ -60,6 +60,11 @@ ENDS_SCENE = {"scene", "open", "new", "set_prop", "undo", "redo", "set_visible"}
 ANGULAR_DEFLECTION = 0.17
 CACHE_VERSION = 3  # 2: meshes carry "curved_faces", B-rep edges only for shapes without faces; 3: finer angle
 CACHE_LIMIT = 1 << 30
+# States kept per document (the first, at open, always stays), and planes per `slice`.
+MAX_STATES = 200
+MAX_SLICES = 24
+# Points of the outlines of one `slice` reply, all cuts together; past it they are coarser.
+MAX_OUTLINE_POINTS = 200000
 
 
 class Worker:
@@ -76,6 +81,8 @@ class Worker:
         self.edited = False
         self.disk = DiskCache(cache_dir())
         self.conn = None       # set by `serve`; a scene streams through it
+        self.states = []       # see `_record`
+        self.next_state = 0
 
     # ---- documents -------------------------------------------------------------------
 
@@ -92,6 +99,9 @@ class Worker:
         self.doc.UndoMode = 1
         self.path = path
         self.gui, self.gui_files = read_gui_document(path)
+        if not still_edited or not self.states:
+            self.states, self.next_state = [], 0
+            self._record("open")
         return {"name": self.doc.Name, "label": self.doc.Label, "path": path}
 
     def cmd_new(self, req):
@@ -99,6 +109,8 @@ class Worker:
         self._reset()
         self.doc = FreeCAD.newDocument("Unnamed")
         self.doc.UndoMode = 1
+        self.states, self.next_state = [], 0
+        self._record("new")
         return {"name": self.doc.Name, "label": self.doc.Label, "path": None}
 
     def cmd_save_as(self, req):
@@ -243,7 +255,10 @@ class Worker:
             raise
         doc.commitTransaction()
         broken = [o.Name for o in doc.Objects if "Invalid" in o.State]
-        return {"broken": broken}
+        before = self.states[-1]["id"] if self.states else None
+        after = self._record("set %s.%s = %s" % (obj.Name, name, _short(value, 40)))
+        changed = self.states[-1]["changed"] if after else []
+        return {"broken": broken, "state_before": before, "state_after": after or before, "changed_bodies": changed}
 
     def cmd_set_visible(self, req):
         """Visibility belongs to the drawing, as in FreeCAD's GUI: not an undoable model edit."""
@@ -258,6 +273,7 @@ class Worker:
             self.edited = True
             doc.undo()
             doc.recompute()
+            self._record("undo")
         return {"undo": doc.UndoCount, "redo": doc.RedoCount}
 
     def cmd_redo(self, req):
@@ -266,7 +282,156 @@ class Worker:
             self.edited = True
             doc.redo()
             doc.recompute()
+            self._record("redo")
         return {"undo": doc.UndoCount, "redo": doc.RedoCount}
+
+    # ---- states, timelines, slices and differences -----------------------------------
+    #
+    # A state is the shape of every solid body at one moment: "s0" when the document was
+    # opened, then one after each edit that changed a body's shape, and one per `snapshot`.
+    # Shapes are immutable in OCCT, so a state only keeps references. A body's timeline is the
+    # states at which its shape changed.
+
+    def _record(self, cause, label=None, force=False):
+        """Add a state if a body changed since the last one (or `force`); its id, or None."""
+        shapes = solid_bodies(self._doc())
+        prints = {name: fingerprint(s) for name, (s, _) in shapes.items()}
+        last = self.states[-1] if self.states else None
+        changed = []
+        for name in sorted(set(prints) | set(last["prints"] if last else {})):
+            if last is None or last["prints"].get(name) != prints.get(name):
+                changed.append(name)
+        if last is not None and not changed and not force:
+            return None
+        sid = "s%d" % self.next_state
+        self.next_state += 1
+        state = {"id": sid, "cause": cause, "label": label, "t": round(time.time(), 3),
+                 "shapes": shapes, "prints": prints, "changed": changed}
+        self.states.append(state)
+        if len(self.states) > MAX_STATES:
+            del self.states[1]  # keep the opened document's state, drop the oldest after it
+        return sid
+
+    def _state(self, sid):
+        """{body: (shape, label)} of a state id, or of the document now for "current"."""
+        if sid in (None, "", "current"):
+            return solid_bodies(self._doc())
+        for s in self.states:
+            if s["id"] == sid:
+                return s["shapes"]
+        raise KeyError("no state %s; get_timeline lists them" % sid)
+
+    def cmd_snapshot(self, req):
+        """Name the document's state now, so it can be sliced or compared later."""
+        self._doc()
+        sid = self._record("snapshot", label=req.get("label") or None, force=True)
+        return {"state": sid, "bodies": self._body_summaries(self.states[-1])}
+
+    def cmd_timeline(self, req):
+        """Every state, and per body the states at which its shape changed."""
+        self._doc()
+        want = req.get("body")
+        bodies = {}
+        prev = {}
+        for s in self.states:
+            for name in s["changed"]:
+                if want and name != want:
+                    continue
+                entry = {"state": s["id"], "cause": s["cause"], "label": s["label"], "t": s["t"]}
+                p = s["prints"].get(name)
+                if p is None:
+                    entry["change"] = "removed"
+                else:
+                    entry["change"] = "changed" if name in prev else "created"
+                    entry["volume"], entry["area"] = p[0], p[1]
+                    if name in prev:
+                        entry["delta_volume"] = round(p[0] - prev[name][0], 6)
+                bodies.setdefault(name, {"label": (s["shapes"].get(name) or (None, name))[1], "changes": []})["changes"].append(entry)
+                if p is None:
+                    prev.pop(name, None)
+                else:
+                    prev[name] = p
+        states = [{"id": s["id"], "cause": s["cause"], "label": s["label"], "t": s["t"], "changed": s["changed"]}
+                  for s in self.states]
+        return {"states": states, "bodies": bodies, "current": self.states[-1]["id"] if self.states else None}
+
+    def _body_summaries(self, state):
+        return [{"body": name, "label": label, "volume": state["prints"][name][0], "area": state["prints"][name][1]}
+                for name, (_, label) in sorted(state["shapes"].items())]
+
+    def cmd_slice(self, req):
+        """Cuts of the bodies of `state` by parallel planes, as regions with their outlines.
+
+        "axis" is "x", "y" or "z", or "normal" a vector; the planes are normal . p = offset, at
+        "offsets", or "count" of them spread evenly over the bodies. With "before", each cut is
+        split into what both states have ("same"), what only `state` has ("added") and what only
+        `before` had ("removed"). Outlines are in the plane's own coordinates (u, v), given by
+        "basis"."""
+        after = self._pick_bodies(self._state(req.get("state")), req.get("body"))
+        before = self._pick_bodies(self._state(req["before"]), req.get("body")) if req.get("before") else None
+        normal = plane_normal(req)
+        count = min(max(int(req.get("count", 5)), 1), MAX_SLICES)
+        offsets = req.get("offsets")
+        if offsets is not None:
+            offsets = [float(d) for d in offsets][:MAX_SLICES]
+        return slice_bodies(after, before, normal, offsets, count)
+
+    def cmd_diff(self, req):
+        """What changed in each body between two states, as exact solids: "added" is in `state`
+        and not in `before`, "removed" the other way round. Each comes with its volume, box,
+        centre and faces; with "sections" (default on), three cuts through the changed region,
+        one per axis, as `slice` gives them."""
+        before = self._pick_bodies(self._state(req["before"]), req.get("body"))
+        after = self._pick_bodies(self._state(req.get("state")), req.get("body"))
+        bodies, changed_box = [], FreeCAD.BoundBox()
+        for name in sorted(set(before) | set(after)):
+            b, a = before.get(name), after.get(name)
+            label = (a or b)[1]
+            entry = {"body": name, "label": label}
+            if b is not None and a is not None and fingerprint(b[0]) == fingerprint(a[0]):
+                entry["change"] = "unchanged"
+                entry["volume"] = round(a[0].Volume, 6)
+                bodies.append(entry)
+                continue
+            try:
+                if b is None:
+                    entry["change"], added, removed = "created", a[0], None
+                elif a is None:
+                    entry["change"], added, removed = "removed", None, b[0]
+                else:
+                    entry["change"] = "changed"
+                    added, removed = a[0].cut(b[0]), b[0].cut(a[0])
+            except Exception as e:
+                entry["change"] = "changed"
+                entry["error"] = "boolean failed: " + error_text(e)
+                bodies.append(entry)
+                continue
+            entry["volume_before"] = round(b[0].Volume, 6) if b else 0.0
+            entry["volume_after"] = round(a[0].Volume, 6) if a else 0.0
+            entry["delta_volume"] = round(entry["volume_after"] - entry["volume_before"], 6)
+            scale = max(entry["volume_before"], entry["volume_after"], 1e-9)
+            for key, shape in (("added", added), ("removed", removed)):
+                d = describe_volume(shape, scale)
+                entry[key] = d
+                if d["solids"]:
+                    changed_box.add(FreeCAD.BoundBox(*d["bbox"]))
+            bodies.append(entry)
+        out = {"bodies": bodies}
+        if req.get("sections", True) and changed_box.isValid():
+            names = [e["body"] for e in bodies if e["change"] != "unchanged"]
+            c = changed_box.Center
+            out["sections"] = {}
+            for axis, n in (("x", FreeCAD.Vector(1, 0, 0)), ("y", FreeCAD.Vector(0, 1, 0)), ("z", FreeCAD.Vector(0, 0, 1))):
+                out["sections"][axis] = slice_bodies({k: after[k] for k in names if k in after},
+                                                     {k: before[k] for k in names if k in before},
+                                                     n, [round(n.dot(c), 6)], 1)
+        return out
+
+    def _pick_bodies(self, shapes, body):
+        if not body:
+            return shapes
+        names = [body] if isinstance(body, str) else list(body)
+        return {n: shapes[n] for n in names if n in shapes}
 
     # ---- geometry --------------------------------------------------------------------
 
@@ -516,6 +681,247 @@ class Worker:
         if len(colors) == n and n <= MAX_FACE_COLORS:
             return [tuple(c) for c in colors]
         return [tuple(colors[0])] * max(n, 1)
+
+
+def solid_bodies(doc):
+    """{name: (shape with solids in document coordinates, label)} of the document's parts.
+
+    A part is a PartDesign Body (its features belong to it), or any other object with solids
+    that no other shape takes as an input: the result of a Part boolean, not its tools; the
+    occurrences (links) of an assembly, not the hidden part they show. Visibility does not
+    matter: hiding a body does not change it."""
+    out = {}
+    for o in doc.Objects:
+        if _is_datum(o) or o.isDerivedFrom("App::Part") or o.isDerivedFrom("App::DocumentObjectGroup"):
+            continue
+        if not o.isDerivedFrom("PartDesign::Body"):
+            if _body_of(o) is not None:
+                continue
+            if any(not _is_container(u) for u in o.InList):
+                continue
+        placed = placed_shape(o)
+        if placed is None:
+            continue
+        shape, matrix, _ = placed
+        try:
+            if not shape.Solids:
+                continue
+            if not matrix.isUnity():
+                shape = shape.transformed(matrix)
+        except Exception:
+            continue
+        out[o.Name] = (shape, o.Label)
+    return out
+
+
+def _body_of(o):
+    for p in o.InList:
+        if p.isDerivedFrom("PartDesign::Body"):
+            return p
+    return None
+
+
+def fingerprint(shape):
+    """What tells two shapes of a body apart: volume, area, face count and box, rounded. A
+    recompute makes new shapes even where nothing moved; this says whether anything did."""
+    bb = shape.BoundBox
+    return (round(shape.Volume, 6), round(shape.Area, 6), len(shape.Faces),
+            tuple(round(v, 5) for v in (bb.XMin, bb.YMin, bb.ZMin, bb.XMax, bb.YMax, bb.ZMax)))
+
+
+def plane_normal(req):
+    axis = req.get("axis")
+    if axis is not None:
+        try:
+            return {"x": FreeCAD.Vector(1, 0, 0), "y": FreeCAD.Vector(0, 1, 0), "z": FreeCAD.Vector(0, 0, 1)}[str(axis).lower()]
+        except KeyError:
+            raise ValueError("axis must be x, y or z")
+    n = req.get("normal")
+    if n is None:
+        return FreeCAD.Vector(0, 0, 1)
+    v = FreeCAD.Vector(*[float(c) for c in n])
+    if v.Length < 1e-9 or not _finite(v.Length):
+        raise ValueError("normal must be a non-zero vector")
+    return v.normalize()
+
+
+def plane_basis(n):
+    """(u, v) in the plane normal to n. Along an axis they are the drawing views: z gives
+    (x, y), x gives (y, z), y gives (x, z) as seen from the front; otherwise u x v = n."""
+    for axis, uv in (((0, 0, 1), ((1, 0, 0), (0, 1, 0))), ((1, 0, 0), ((0, 1, 0), (0, 0, 1))),
+                     ((0, 1, 0), ((1, 0, 0), (0, 0, 1)))):
+        if n.isEqual(FreeCAD.Vector(*axis), 1e-12):
+            return FreeCAD.Vector(*uv[0]), FreeCAD.Vector(*uv[1])
+    ref = FreeCAD.Vector(0, 0, 1) if abs(n.z) < 0.9 else FreeCAD.Vector(1, 0, 0)
+    u = ref.cross(n).normalize()
+    return u, n.cross(u)
+
+
+def slice_bodies(after, before, normal, offsets, count):
+    """The cuts of `slice`: see `Worker.cmd_slice`."""
+    shapes = [s for s, _ in after.values()] + ([s for s, _ in before.values()] if before else [])
+    box = FreeCAD.BoundBox()
+    for s in shapes:
+        box.add(s.BoundBox)
+    u, v = plane_basis(normal)
+    out = {"normal": [normal.x, normal.y, normal.z], "basis": {"u": [u.x, u.y, u.z], "v": [v.x, v.y, v.z]},
+           "bodies": sorted(set(after) | set(before or {})), "compared": before is not None, "slices": []}
+    if not box.isValid():
+        out["bounds"], out["range"] = None, None
+        return out
+    corners = [FreeCAD.Vector(x, y, z) for x in (box.XMin, box.XMax) for y in (box.YMin, box.YMax) for z in (box.ZMin, box.ZMax)]
+    ds = [normal.dot(p) for p in corners]
+    us, vs = [u.dot(p) for p in corners], [v.dot(p) for p in corners]
+    out["bounds"] = [min(us), min(vs), max(us), max(vs)]
+    out["range"] = [min(ds), max(ds)]
+    if offsets is None:
+        lo, hi = min(ds), max(ds)
+        offsets = [lo + (i + 0.5) * (hi - lo) / count for i in range(count)]
+    diag = box.DiagonalLength
+    tol = max(diag * 0.001, 1e-4)
+    a = Part.makeCompound([s for s, _ in after.values()]) if after else None
+    b = Part.makeCompound([s for s, _ in before.values()]) if before else None
+    budget = [MAX_OUTLINE_POINTS // max(len(offsets), 1)]
+    for d in offsets:
+        centre = box.Center + normal * (d - normal.dot(box.Center))
+        pts = [centre + u * diag + v * diag, centre - u * diag + v * diag, centre - u * diag - v * diag, centre + u * diag - v * diag]
+        plane = Part.Face(Part.makePolygon(pts + [pts[0]]))
+        entry = {"offset": round(d, 6), "layers": {}}
+        try:
+            cut_a = a.common(plane) if a is not None else None
+            if before is None:
+                layers = {"section": cut_a}
+            else:
+                cut_b = b.common(plane) if b is not None else None
+                if cut_a is None or not cut_a.Faces:
+                    layers = {"removed": cut_b}
+                elif cut_b is None or not cut_b.Faces:
+                    layers = {"added": cut_a}
+                else:
+                    layers = {"same": cut_a.common(cut_b), "added": cut_a.cut(cut_b), "removed": cut_b.cut(cut_a)}
+            for name, shape in layers.items():
+                if shape is not None and shape.Faces:
+                    entry["layers"][name] = section_regions(shape, u, v, tol, budget)
+        except Exception as e:
+            entry["error"] = error_text(e)
+        out["slices"].append(entry)
+    return out
+
+
+def section_regions(shape, u, v, tol, budget):
+    """Faces of a cut as regions: area, centre, box and holes in (u, v), and outlines (outer
+    first) as flat [u0, v0, u1, v1, ...] lists."""
+    regions, total = [], 0.0
+    for f in shape.Faces:
+        if f.Area < 1e-9:
+            continue
+        loops, holes = [], []
+        for i, w in enumerate(f.Wires):
+            try:
+                pts = w.discretize(Deflection=tol)
+            except Exception:
+                continue
+            if len(pts) > budget[0] and len(pts) > 8:
+                pts = pts[:: max(2, len(pts) // max(budget[0], 8))]
+            budget[0] = max(budget[0] - len(pts), 64)
+            flat = []
+            for p in pts:
+                flat.extend((round(u.dot(p), 4), round(v.dot(p), 4)))
+            loops.append(flat)
+            if i > 0:
+                hole = {"points": len(pts)}
+                if len(w.Edges) == 1 and isinstance(w.Edges[0].Curve, Part.Circle):
+                    c = w.Edges[0].Curve
+                    hole = {"circle_diameter": round(2 * c.Radius, 6),
+                            "center": [round(u.dot(c.Center), 6), round(v.dot(c.Center), 6)]}
+                holes.append(hole)
+        com = f.CenterOfMass
+        bb_u = [loops[0][k] for k in range(0, len(loops[0]), 2)] if loops else [0.0]
+        bb_v = [loops[0][k] for k in range(1, len(loops[0]), 2)] if loops else [0.0]
+        regions.append({"area": round(f.Area, 6), "center": [round(u.dot(com), 6), round(v.dot(com), 6)],
+                        "box": [min(bb_u), min(bb_v), max(bb_u), max(bb_v)], "holes": holes, "loops": loops})
+        total += f.Area
+    return {"area": round(total, 6), "regions": regions}
+
+
+def describe_volume(shape, scale):
+    """Volume, box, centre and the solids of an added or removed piece. Slivers a boolean
+    leaves along shared faces (under a millionth of the body) are counted, not described."""
+    out = {"volume": 0.0, "bbox": None, "center": None, "solids": [], "slivers": 0}
+    if shape is None:
+        return out
+    solids = []
+    for s in shape.Solids:
+        if abs(s.Volume) <= max(1e-6 * scale, 1e-9):
+            out["slivers"] += 1
+        else:
+            solids.append(s)
+    if not solids:
+        return out
+    comp = Part.makeCompound(solids)
+    bb = comp.BoundBox
+    vol = sum(s.Volume for s in solids)
+    com = sum((s.CenterOfMass * s.Volume for s in solids), FreeCAD.Vector()) * (1.0 / vol)
+    out.update(volume=round(vol, 6), bbox=[round(x, 6) for x in (bb.XMin, bb.YMin, bb.ZMin, bb.XMax, bb.YMax, bb.ZMax)],
+               center=_vec(com))
+    for s in sorted(solids, key=lambda s: -s.Volume)[:20]:
+        out["solids"].append(describe_solid(s))
+    if len(solids) > 20:
+        out["solids_not_listed"] = len(solids) - 20
+    return out
+
+
+def describe_solid(s):
+    bb = s.BoundBox
+    faces = {}
+    for f in s.Faces:
+        info = surface_info(f)
+        key = json.dumps({k: v for k, v in info.items() if k != "area"}, sort_keys=True)
+        g = faces.setdefault(key, dict(info, area=0.0, count=0))
+        g["area"] = round(g["area"] + f.Area, 6)
+        g["count"] += 1
+    groups = sorted(faces.values(), key=lambda g: -g["area"])
+    kinds = collections.Counter(g["type"] for g in groups for _ in range(g["count"]))
+    size = [round(bb.XLength, 6), round(bb.YLength, 6), round(bb.ZLength, 6)]
+    shape = "solid of %d faces" % len(s.Faces)
+    if kinds == {"plane": 6} and abs(bb.XLength * bb.YLength * bb.ZLength - s.Volume) <= 1e-6 * s.Volume + 1e-9:
+        shape = "box %g x %g x %g" % tuple(size)
+    elif kinds.get("cylinder") == 1 and kinds.get("plane") == 2 and len(s.Faces) == 3:
+        cyl = next(g for g in groups if g["type"] == "cylinder")
+        height = s.Volume / (math.pi * cyl["radius"] ** 2)
+        shape = "cylinder diameter %g, height %g, axis %s through %s" % (
+            round(2 * cyl["radius"], 6), round(height, 6), cyl["axis"], cyl["point"])
+    return {"shape": shape, "volume": round(s.Volume, 6), "bbox": [round(x, 6) for x in (bb.XMin, bb.YMin, bb.ZMin, bb.XMax, bb.YMax, bb.ZMax)],
+            "size": size, "center": _vec(s.CenterOfMass), "faces": groups[:30],
+            **({"face_groups_not_listed": len(groups) - 30} if len(groups) > 30 else {})}
+
+
+def surface_info(face):
+    """A face's surface by type and the numbers that place it, rounded so equal ones group."""
+    s = face.Surface
+    name = type(s).__name__
+    try:
+        if isinstance(s, Part.Plane):
+            u0, u1, v0, v1 = face.ParameterRange
+            n = face.normalAt((u0 + u1) / 2, (v0 + v1) / 2)
+            return {"type": "plane", "normal": _vec(n, 4), "offset": round(n.dot(s.Position), 6)}
+        if isinstance(s, Part.Cylinder):
+            return {"type": "cylinder", "radius": round(s.Radius, 6), "axis": _vec(s.Axis, 4), "point": _vec(s.Center)}
+        if isinstance(s, Part.Cone):
+            return {"type": "cone", "radius": round(s.Radius, 6), "half_angle_deg": round(math.degrees(s.SemiAngle), 4),
+                    "axis": _vec(s.Axis, 4), "apex": _vec(s.Apex)}
+        if isinstance(s, Part.Sphere):
+            return {"type": "sphere", "radius": round(s.Radius, 6), "center": _vec(s.Center)}
+        if isinstance(s, Part.Toroid):
+            return {"type": "torus", "major_radius": round(s.MajorRadius, 6), "minor_radius": round(s.MinorRadius, 6),
+                    "axis": _vec(s.Axis, 4), "center": _vec(s.Center)}
+    except Exception:
+        pass
+    return {"type": name}
+
+
+def _vec(p, digits=6):
+    return [round(p.x, digits) + 0.0, round(p.y, digits) + 0.0, round(p.z, digits) + 0.0]
 
 
 def placed_shape(o):
