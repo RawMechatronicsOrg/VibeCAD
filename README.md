@@ -124,7 +124,7 @@ one and reopens the file.
   random `VIBECAD_TOKEN`; the script connects back and must greet with the token. The listener
   closes after that one connection, and the directory is removed once FreeCAD has read the script. Every message is a JSON header plus an optional binary payload, both
   length-prefixed (see the script's docstring). Commands: `open`, `new`, `tree`, `props`,
-  `set_prop`, `set_visible`, `set_tip`, `undo`, `redo`, `scene`, `save_as`, `export`, the modelling
+  `set_prop`, `set_props`, `sketch`, `set_visible`, `set_tip`, `undo`, `redo`, `scene`, `save_as`, `export`, the modelling
   ones (`datum_plane`, `extrude`, `fillet`, `mirror`, `pattern`, `copy`, `delete`), `edges`
   and `face` for picking edges and drawing handles, and the agent's (`snapshot`, `timeline`,
   `slice`, `diff`). Requests go out as
@@ -225,12 +225,31 @@ listens on a random localhost port and writes it, with a random token, to `agent
 removed when the window closes. So the agent edits and sees the same document as the person at
 the screen, with one FreeCAD.
 
-Tools: `get_status`, `get_tree`, `get_properties`, `set_property`, `undo`, `redo`,
-`open_document` (refused while there are unsaved edits), and for checking what an edit did:
+Tools: `get_status`, `get_tree`, `get_properties`, `get_sketch`, `set_property`,
+`set_properties`, `undo`, `redo`, `save`, `open_document` (refused while there are unsaved
+edits), and for checking what an edit did:
+
+- **Properties.** `get_properties` leaves out what reads as noise (shapes, materials, the raw
+  expression engine); entries the tools cannot set (links, lists, vectors) are read-only, and a
+  property bound to an expression carries it. A sketch's dimensions are properties too:
+  `Constraints.<name>`, or `Constraints.<index>` (from 0) when unnamed, in mm or degrees; a
+  reference dimension is read-only. The property panel edits them the same way.
+- **`get_sketch`**: a sketch's plane, its elements in its own (x, y) (lines, circles, arcs,
+  points, ellipses, B-splines; construction ones marked) and its constraints with what they
+  refer to, each dimension with its value and property name.
+- **`set_property` / `set_properties`**: a value, or an `expression` (`"Spreadsheet.t * 2"`;
+  `""` removes it). `set_properties` makes several changes with one recompute: one undo step,
+  one state. A change that is refused refuses them all; objects left invalid come back with
+  FreeCAD's error. With `dry_run` the document is put back as it was (no undo step, no state on
+  the timeline) and the result is kept as a trial state, `t1`, `t2`, ... (the last 20), that
+  `diff` and `slice` take like any other. A dry run is refused while undone steps wait for
+  redo: FreeCAD drops them as soon as any transaction opens.
+- **`save`**: to the document's file, or to another absolute `.FCStd` path, which becomes its
+  file; an existing file other than its own is replaced only with `overwrite`.
 
 - **States and timelines.** The worker keeps the exact shape of every solid body (a PartDesign
   Body, or any solid no other shape takes as input) at each state: `s0` at open, one after
-  every edit that changed a shape (`set_property`, undo, redo; also edits made by hand), and
+  every edit that changed a shape (`set_property(ies)`, undo, redo; also edits made by hand), and
   one per `snapshot`. `get_timeline` lists, per body, the states at which it changed, with its
   volume and the change of volume. `set_property` returns `state_before` and `state_after`.
 - **`slice`**: cuts of the bodies by parallel planes along x, y, z or any normal, at given

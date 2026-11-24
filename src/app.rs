@@ -34,7 +34,8 @@ enum Pending {
     Edges(String, u64),
     /// A face, for its handle and preview.
     Face(u64),
-    Save,
+    /// Saving to this file; it becomes the document's file once saved.
+    Save(PathBuf),
     Export,
     /// A read-only call of the agent; its answer goes back to the agent only.
     AgentQuery,
@@ -375,9 +376,12 @@ impl App {
                 .map(|p| with_default_extension(p, "FCStd")),
         };
         if let Some(p) = path {
-            self.request("save_as", json!({ "path": p.to_string_lossy() }), Pending::Save);
-            self.doc_path = Some(p);
+            self.save_to(p);
         }
+    }
+
+    fn save_to(&mut self, path: PathBuf) -> Option<u64> {
+        self.request("save_as", json!({ "path": path.to_string_lossy() }), Pending::Save(path))
     }
 
     fn export_dialog(&mut self) {
@@ -656,7 +660,8 @@ impl App {
                     }
                     self.refresh();
                 }
-                Pending::Save => {
+                Pending::Save(path) => {
+                    self.doc_path = Some(path);
                     self.modified = false;
                     let restored = v["gui_entries_restored"].as_array().map_or(0, Vec::len);
                     self.info = Some(format!(
@@ -1684,7 +1689,22 @@ impl App {
             _ if self.doc_label.is_none() => Err("no document is open; use open_document or ask the person".to_string()),
             "get_tree" => Ok(self.request("tree", json!({}), Pending::AgentQuery)),
             "get_properties" => Ok(self.request("props", json!({ "obj": s("object") }), Pending::AgentQuery)),
-            "set_property" => Ok(self.set_prop(&s("object"), &s("property"), a["value"].clone())),
+            "get_sketch" => Ok(self.request("sketch", json!({ "obj": s("object") }), Pending::AgentQuery)),
+            "set_property" | "set_properties" => {
+                let changes = match a.get("dry_run") {
+                    None | Some(Value::Bool(_)) if call.tool == "set_property" => Ok(vec![a.clone()]),
+                    None | Some(Value::Bool(_)) => agent_changes(a),
+                    Some(other) => Err(format!("dry_run is true or false, not {other}")),
+                };
+                changes.and_then(|c| c.iter().map(worker_change).collect::<Result<Vec<_>, _>>()).map(|changes| {
+                    if a["dry_run"].as_bool() == Some(true) {
+                        self.request("set_props", json!({ "changes": changes, "dry_run": true }), Pending::AgentQuery)
+                    } else {
+                        self.request("set_props", json!({ "changes": changes }), Pending::Edit)
+                    }
+                })
+            }
+            "save" => self.agent_save_path(a).map(|p| self.save_to(p)),
             "undo" => Ok(self.undo(false)),
             "redo" => Ok(self.undo(true)),
             "snapshot" => Ok(self.request("snapshot", json!({ "label": a["label"] }), Pending::AgentQuery)),
@@ -1706,6 +1726,25 @@ impl App {
             Ok(None) => self.answer_agent(ctx, call, entry, Status::Failed, ToolResult::err("FreeCAD is not running in the window")),
             Err(e) => self.answer_agent(ctx, call, entry, Status::Failed, ToolResult::err(e)),
         }
+    }
+
+    /// Where the agent's `save` writes: the document's own file, or the absolute .FCStd path
+    /// it gave, which may replace another file only with `overwrite`.
+    fn agent_save_path(&self, a: &Value) -> Result<PathBuf, String> {
+        let Some(given) = a["path"].as_str().filter(|p| !p.is_empty()) else {
+            return self.doc_path.clone().ok_or_else(|| "the document has no file yet: give a path".to_string());
+        };
+        let p = with_default_extension(PathBuf::from(given), "FCStd");
+        if !p.is_absolute() {
+            return Err(format!("{given} is not an absolute path"));
+        }
+        if !p.extension().is_some_and(|e| e.eq_ignore_ascii_case("fcstd")) {
+            return Err(format!("{given}: a FreeCAD document is saved as .FCStd"));
+        }
+        if p.exists() && Some(&p) != self.doc_path.as_ref() && a["overwrite"].as_bool() != Some(true) {
+            return Err(format!("{} exists and is not this document's file; pass overwrite: true to replace it", p.display()));
+        }
+        Ok(p)
     }
 
     /// The worker answered a call of the agent: shape the reply for it, pictures included.
@@ -1826,6 +1865,28 @@ impl App {
 
 /// The bottom of the view's light background; the top is near white.
 const BACKGROUND: [f64; 3] = [0.84, 0.86, 0.89];
+
+/// The `changes` of the agent's `set_properties`.
+fn agent_changes(a: &Value) -> Result<Vec<Value>, String> {
+    match a["changes"].as_array() {
+        Some(c) if !c.is_empty() => Ok(c.clone()),
+        _ => Err("changes: give at least one {object, property, value or expression}".into()),
+    }
+}
+
+/// One change as the agent gives it ({object, property, value | expression}), as the worker's
+/// `set_props` takes it ({obj, prop, value | expression}).
+fn worker_change(c: &Value) -> Result<Value, String> {
+    let (Some(obj), Some(prop)) = (c["object"].as_str(), c["property"].as_str()) else {
+        return Err(format!("a change needs object and property: {c}"));
+    };
+    match (c.get("value"), c.get("expression")) {
+        (Some(v), None) => Ok(json!({ "obj": obj, "prop": prop, "value": v })),
+        (None, Some(Value::String(e))) => Ok(json!({ "obj": obj, "prop": prop, "expression": e })),
+        (None, Some(_)) => Err(format!("{obj}.{prop}: an expression is a string (\"\" clears it)")),
+        _ => Err(format!("{obj}.{prop}: give either a value or an expression")),
+    }
+}
 
 fn start_worker(ctx: &egui::Context) -> Worker {
     let ctx = ctx.clone();

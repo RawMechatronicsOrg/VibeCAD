@@ -8,6 +8,7 @@ cache goes to a fresh temporary directory, so the first scene of each file is a 
 import array
 import collections
 import json
+import math
 import os
 import socket
 import struct
@@ -205,6 +206,76 @@ def check_states(cl, sp):
     assert same["bodies"][0]["change"] == "unchanged" and "sections" not in same, same
 
 
+def check_sketch_and_batch(cl):
+    """On the sample as opened: a sketch's dimensions as data and as properties, a dry run that
+    leaves the document as it was, several changes in one step, expressions, and refusals."""
+    sk, _ = cl.call("sketch", obj="HoleSketch")
+    dims = {c["property"]: c["value"] for c in sk["constraints"] if "property" in c}
+    print("HoleSketch:", [(g["type"], g.get("radius")) for g in sk["geometry"]], dims, sk["plane"]["normal"])
+    assert dims == {"Constraints.HoleDiameter": 16.0} and sk["geometry"][0]["center"] == [40.0, 25.0], sk
+    plate, _ = cl.call("sketch", obj="PlateSketch")
+    assert {c["property"] for c in plate["constraints"] if "property" in c} == {"Constraints.Width", "Constraints.Height"}
+    assert plate["constraints"][0]["refs"] == [{"geometry": 0, "at": "end"}, {"geometry": 1, "at": "start"}], plate["constraints"][0]
+    props, _ = cl.call("props", obj="HoleSketch")
+    names = {p["name"]: p for p in props["props"]}
+    assert names["Constraints.HoleDiameter"]["kind"] == "float" and not names["Constraints.HoleDiameter"]["readonly"]
+    assert not {"Shape", "ExpressionEngine", "Constraints"} & set(names), sorted(names)
+    assert all(p["readonly"] for p in props["props"] if p["kind"] == "text"), "text entries are not editable"
+    try:
+        cl.call("sketch", obj="Pad")
+        raise AssertionError("a pad is not a sketch")
+    except RuntimeError as ex:
+        print("not a sketch refused:", str(ex).splitlines()[0][:60])
+
+    length0 = [p["value"] for p in cl.call("props", obj="Pad")[0]["props"] if p["name"] == "Length"][0]
+    cl.call("set_props", changes=[{"obj": "Pad", "prop": "Length", "value": length0}])  # no redo steps left
+    tl0, _ = cl.call("timeline")
+    undo0 = cl.call("tree")[0]["undo"]
+    trial, _ = cl.call("set_props", dry_run=True, changes=[{"obj": "HoleSketch", "prop": "Constraints.HoleDiameter", "value": 20.0}])
+    print("dry run:", trial)
+    assert trial["dry_run"] and trial["changed_bodies"] == ["Body"], trial
+    assert trial["bodies"][0]["volume_after"] < trial["bodies"][0]["volume_before"], trial
+    d, _ = cl.call("diff", before=trial["state_before"], state=trial["trial"], sections=False)
+    removed = d["bodies"][0]["removed"]
+    print("diff of the trial: removed", removed["volume"], [s["shape"] for s in removed["solids"]])
+    assert abs(removed["volume"] - math.pi * (10 ** 2 - 8 ** 2) * length0) < 1e-3, removed
+    tl1, _ = cl.call("timeline")
+    assert tl1["states"] == tl0["states"] and cl.call("tree")[0]["undo"] == undo0, "a dry run leaves no trace"
+    again, _ = cl.call("sketch", obj="HoleSketch")
+    assert again["constraints"][0]["value"] == 16.0, again["constraints"][0]
+
+    both, _ = cl.call("set_props", changes=[
+        {"obj": "HoleSketch", "prop": "Constraints.HoleDiameter", "value": 20.0},
+        {"obj": "Pad", "prop": "Length", "expression": "HoleSketch.Constraints.HoleDiameter / 2"}])
+    print("two changes, one step:", both)
+    assert both["changed_bodies"] == ["Body"] and not both["broken"], both
+    assert cl.call("tree")[0]["undo"] == undo0 + 1, "one undo step"
+    pad = {p["name"]: p for p in cl.call("props", obj="Pad")[0]["props"]}
+    assert pad["Length"]["value"] == 10.0 and pad["Length"]["expression"] == "HoleSketch.Constraints.HoleDiameter / 2", pad["Length"]
+    bad, _ = cl.call("set_props", dry_run=True, changes=[{"obj": "Pad", "prop": "Length", "expression": "Nobody.x"}])
+    print("dry run, bad reference:", bad["broken"], bad["errors"][0]["error"][:60] if bad["errors"] else None)
+    assert "Pad" in bad["broken"], bad
+    for change in ({"obj": "Pad", "prop": "Length", "expression": "1 +* 2"},
+                   {"obj": "HoleSketch", "prop": "Constraints.Nope", "value": 3.0},
+                   {"obj": "PlateSketch", "prop": "Constraints.0", "value": 3.0}):
+        try:
+            cl.call("set_props", changes=[change])
+            raise AssertionError("accepted %s" % change)
+        except RuntimeError as ex:
+            print("refused:", str(ex).splitlines()[0][:70])
+    assert cl.call("tree")[0]["undo"] == undo0 + 1, "refused changes leave no step"
+    cl.call("undo")
+    assert cl.call("tree")[0]["redo"] == 1, "refused changes left the undo history whole"
+    try:  # a transaction, even an aborted one, would drop the step redo brings back
+        cl.call("set_props", dry_run=True, changes=[{"obj": "Pad", "prop": "Length", "value": 7.0}])
+        raise AssertionError("a dry run with a redo step waiting")
+    except RuntimeError as ex:
+        print("dry run with redo pending refused:", str(ex).splitlines()[0][:70])
+    assert cl.call("tree")[0]["redo"] == 1, "the redo step is still there"
+    pad = {p["name"]: p for p in cl.call("props", obj="Pad")[0]["props"]}
+    assert pad["Length"]["value"] == length0 and "expression" not in pad["Length"], pad["Length"]
+
+
 def main(paths):
     cl = Client()
     for path in paths:
@@ -284,6 +355,7 @@ def main(paths):
         saved, _ = cl.call("save_as", path=out)
         with zipfile.ZipFile(out) as z:
             print("saved:", saved, "GuiDocument.xml" in z.namelist())
+        check_sketch_and_batch(cl)
     # a document saved from FreeCAD's GUI keeps its colours through a headless save, also in place
     colored = [p for p in paths if p.endswith("EasyScanner.FCStd")]
     if colored:

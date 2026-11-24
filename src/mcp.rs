@@ -18,13 +18,29 @@ every call shows in the window's AGENTIC tab. Every solid body has a timeline: a
 one per edit that changed a shape, and one per snapshot) keeps each body's exact shape. To check an edit: \
 note the state before (set_property returns state_before and state_after), then call diff for the exact \
 added and removed solids, and slice for cross-sections (like an MRI) along any axis, optionally compared \
-with an earlier state. Lengths are in mm, volumes in mm^3. The person can pause you from the window or leave \
+with an earlier state. To try an edit without making it, pass dry_run: the document stays as it was and \
+the result is a trial state (\"t1\", ...) that diff and slice take like any other. A sketch's dimensions \
+are properties named \"Constraints.<name>\" (get_sketch lists them). Nothing is written to disk until \
+save. Lengths are in mm, volumes in mm^3. The person can pause you from the window or leave \
 you a note, which arrives at the end of a tool result.";
 
 /// The tools, with their input schemas.
 pub fn tools() -> Value {
     let state = json!({ "type": "string", "description": "A state id from get_timeline (\"s0\", \"s3\", ...), or \"current\" (the default)." });
     let body = json!({ "type": "string", "description": "Only this body (its object name from get_timeline or get_tree); default all solid bodies." });
+    let change = |extra: Value| {
+        let mut props = json!({
+            "object": { "type": "string", "description": "Object name, e.g. \"Pad\"." },
+            "property": { "type": "string", "description": "As get_properties names it: \"Length\", \"Placement.x\", or a sketch's dimension \"Constraints.HoleDiameter\"." },
+            "value": { "description": "A number (in the property's unit: mm, degrees), boolean, string or enumeration value." },
+            "expression": { "type": "string", "description": "Instead of value: bind the property to an expression, e.g. \"Spreadsheet.thickness * 2\" or \"HoleSketch.Constraints.HoleDiameter / 2\"; \"\" removes it." }
+        });
+        if let (Some(p), Some(e)) = (props.as_object_mut(), extra.as_object()) {
+            p.extend(e.clone());
+        }
+        props
+    };
+    let dry_run = json!({ "type": "boolean", "description": "Compute the result, then put the document back: no undo step, no state on the timeline. Returns the trial state's id (\"t1\", ...) for diff and slice. Refused while undone steps wait for redo, which it would drop." });
     json!([
         {
             "name": "get_status",
@@ -38,17 +54,26 @@ pub fn tools() -> Value {
         },
         {
             "name": "get_properties",
-            "description": "The properties of one object, with values, units and which are editable.",
+            "description": "The properties of one object, with values, units, which are editable, and the expression a property is bound to. A sketch's dimensions are among them as \"Constraints.<name>\" (\"Constraints.<index>\" when unnamed).",
             "inputSchema": { "type": "object", "properties": { "object": { "type": "string", "description": "Object name, e.g. \"Pad\"." } }, "required": ["object"] }
         },
         {
+            "name": "get_sketch",
+            "description": "A sketch as data: its plane (origin, normal, x direction), its elements in the sketch's (x, y) (lines, circles, arcs, points, ...; construction ones marked) and its constraints with what they refer to; each dimension with its value, unit and the property name that set_property takes.",
+            "inputSchema": { "type": "object", "properties": { "object": { "type": "string", "description": "The sketch's object name, e.g. \"HoleSketch\"." } }, "required": ["object"] }
+        },
+        {
             "name": "set_property",
-            "description": "Set a property and recompute (one undo step). Returns invalid objects, state_before and state_after and the bodies whose shape changed: pass them to diff or slice.",
+            "description": "Set a property to a value, or bind it to an expression, and recompute (one undo step). Returns invalid objects with their errors, state_before and state_after and the bodies whose shape changed: pass them to diff or slice. With dry_run nothing stays changed.",
+            "inputSchema": { "type": "object", "properties": change(json!({ "dry_run": dry_run })), "required": ["object", "property"] }
+        },
+        {
+            "name": "set_properties",
+            "description": "Several set_property changes with one recompute: one undo step and one state, so dimensions that only make sense together never pass through a broken model. A change that is refused (unknown object or property, bad expression) refuses them all.",
             "inputSchema": { "type": "object", "properties": {
-                "object": { "type": "string" },
-                "property": { "type": "string", "description": "e.g. \"Length\"." },
-                "value": { "description": "A number (in the property's unit: mm, degrees), boolean, string or enumeration value." }
-            }, "required": ["object", "property", "value"] }
+                "changes": { "type": "array", "minItems": 1, "items": { "type": "object", "properties": change(json!({})), "required": ["object", "property"] } },
+                "dry_run": dry_run
+            }, "required": ["changes"] }
         },
         { "name": "undo", "description": "Undo the last model edit.", "inputSchema": { "type": "object", "properties": {} } },
         { "name": "redo", "description": "Redo the last undone edit.", "inputSchema": { "type": "object", "properties": {} } },
@@ -85,6 +110,14 @@ pub fn tools() -> Value {
                 "body": body,
                 "sections": { "type": "boolean", "description": "Include the three cuts (default true)." }
             }, "required": ["before"] }
+        },
+        {
+            "name": "save",
+            "description": "Save the document to its file, or with path to another .FCStd file, which then becomes its file. A path to an existing file other than the document's own is refused unless overwrite is true.",
+            "inputSchema": { "type": "object", "properties": {
+                "path": { "type": "string", "description": "An absolute path ending in .FCStd; default the document's own file." },
+                "overwrite": { "type": "boolean", "description": "Replace an existing file at path." }
+            } }
         },
         {
             "name": "open_document",

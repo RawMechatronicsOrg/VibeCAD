@@ -61,13 +61,24 @@ MAX_FACE_COLORS = 20000
 # Finished meshes are sent at most this often, in seconds, so the window keeps up.
 BATCH_SECONDS = 0.3
 # Requests that change what the scene shows; one arriving during a scene stream ends it.
-ENDS_SCENE = {"scene", "open", "new", "set_prop", "undo", "redo", "set_visible",
+ENDS_SCENE = {"scene", "open", "new", "set_prop", "set_props", "undo", "redo", "set_visible",
               "set_tip", "datum_plane", "extrude", "fillet", "mirror", "pattern", "copy", "delete"}
 LINK_TYPES = ("App::Link", "App::LinkElement")
 # How FreeCAD's origin planes turn (yaw, pitch, roll): XY faces +Z, XZ -Y, YZ +X.
 BASE_PLANES = {"XY": (0, 0, 0), "XZ": (0, 0, 90), "YZ": (90, 0, 90)}
 # The parts of a placement the property panel edits as numbers.
 PLACEMENT_PARTS = ("x", "y", "z", "yaw", "pitch", "roll")
+# Their paths in FreeCAD's expressions.
+PLACEMENT_PATHS = ("Base.x", "Base.y", "Base.z", "Rotation.Yaw", "Rotation.Pitch", "Rotation.Roll")
+# Properties left out of `props`: shapes and materials read as "<Solid object at 0x...>" or
+# "?", expressions come per property instead, and a sketch's constraints as "Constraints.<name>".
+HIDDEN_PROPERTY_TYPES = {"Part::PropertyPartShape", "App::PropertyExpressionEngine",
+                         "Materials::PropertyMaterial", "Sketcher::PropertyConstraintList"}
+# Sketch constraints that carry a dimension, and its unit.
+DATUM_UNITS = {"Distance": "mm", "DistanceX": "mm", "DistanceY": "mm", "Radius": "mm", "Diameter": "mm",
+               "Angle": "°"}
+# Trial states of dry runs kept per document.
+MAX_TRIALS = 20
 # Part of every disk cache key: bump when `encode_mesh` changes what it writes.
 # Largest angle, in radians, one segment of a curve may turn by: 10 degrees, so circles are
 # round on screen and the rims of parts that sit in each other's holes line up closely.
@@ -80,7 +91,7 @@ MAX_SLICES = 24
 # Points of the outlines of one `slice` reply, all cuts together; past it they are coarser.
 MAX_OUTLINE_POINTS = 200000
 # Requests answered while a scene streams, between two of its frames: they only read.
-ANSWERED_DURING_SCENE = {"tree", "props", "edges", "face"}
+ANSWERED_DURING_SCENE = {"tree", "props", "sketch", "edges", "face"}
 # Tessellators that have not connected this long after their start are given up.
 TESSELLATOR_START_SECONDS = 60
 
@@ -132,10 +143,10 @@ class Modelling:
             if made is not None and made.isDerivedFrom("PartDesign::Feature") and not made.Shape.Solids:
                 raise RuntimeError("%s: no solid is left" % made.Label)
         except Exception:
-            doc.abortTransaction()
+            abort_transaction(doc)
             doc.recompute()
             raise
-        doc.commitTransaction()
+        commit_transaction(doc)
         self._follow_tips(tips)
         for o in hide:
             self.gui.setdefault(o.Name, {})["visible"] = False
@@ -635,6 +646,21 @@ def _vec(v):
     return [round(v.x, 6), round(v.y, 6), round(v.z, 6)]
 
 
+def abort_transaction(doc):
+    """Undo what the open transaction changed. `openTransaction` also names the application's
+    active transaction, and an abort that found nothing changed leaves it open: the next undo
+    would then be recorded as a new step and drop the redo steps. Close it too."""
+    doc.abortTransaction()
+    FreeCAD.closeActiveTransaction(True)
+
+
+def commit_transaction(doc):
+    """Make the open transaction one undo step, and close the application's active one (see
+    `abort_transaction`), which a transaction that changed nothing leaves open."""
+    doc.commitTransaction()
+    FreeCAD.closeActiveTransaction(False)
+
+
 def _direction(m, at, d):
     """Direction `d` at point `at`, moved by matrix `m` and made unit length (zero stays zero)."""
     w = m.multVec(at + d) - m.multVec(at)
@@ -686,11 +712,57 @@ def placement_entries(obj, name, value, group, readonly):
             for i, (part, x) in enumerate(zip(PLACEMENT_PARTS, numbers))]
 
 
+def constraint_entries(obj, group, readonly):
+    """A sketch's dimensions as numbers the property panel edits: "Constraints.<name>", or
+    "Constraints.<index>" (from 0) for one without a name. Reference dimensions are read-only."""
+    out = []
+    for i, c in enumerate(obj.Constraints):
+        if c.Type not in DATUM_UNITS:
+            continue
+        value = constraint_value(c)
+        out.append({"name": "Constraints." + (c.Name or str(i)), "group": group, "type": "Sketcher::Constraint" + c.Type,
+                    "readonly": readonly or not c.Driving, "kind": "float", "value": value,
+                    "unit": DATUM_UNITS[c.Type], "text": "%g %s" % (value, DATUM_UNITS[c.Type])})
+    return out
+
+
+def constraint_value(c):
+    """A dimension in its unit: mm, or degrees for an angle (FreeCAD keeps radians)."""
+    return round(math.degrees(c.Value) if c.Type == "Angle" else c.Value, 9)
+
+
+def constraint_index(obj, key):
+    """The index of a sketch's constraint named `key`, or numbered `key` (from 0)."""
+    for i, c in enumerate(obj.Constraints):
+        if c.Name and c.Name == key:
+            return i
+    if key.isdigit() and int(key) < len(obj.Constraints):
+        return int(key)
+    raise KeyError("%s has no constraint %s; get_sketch lists them" % (obj.Label, key))
+
+
+def is_sketch(obj):
+    return obj.isDerivedFrom("Sketcher::SketchObject")
+
+
 def set_property(obj, name, value):
-    """obj.name = value, where name may be one of `placement_entries`' parts."""
+    """obj.name = value, where name may be one of `placement_entries`' parts or of a sketch's
+    `constraint_entries`."""
     base, _, part = name.partition(".")
     if not part:
         setattr(obj, name, value)
+        return
+    if base == "Constraints" and is_sketch(obj):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("%s is a dimension: give a number" % name)
+        i = constraint_index(obj, part)
+        c = obj.Constraints[i]
+        if c.Type not in DATUM_UNITS:
+            raise ValueError("constraint %s is %s: it has no value to set" % (part, c.Type))
+        if not c.Driving:
+            raise ValueError("constraint %s is a reference dimension: it measures, it is not set" % part)
+        unit = "deg" if c.Type == "Angle" else "mm"
+        obj.setDatum(i, FreeCAD.Units.Quantity("%.12g %s" % (float(value), unit)))
         return
     if part not in PLACEMENT_PARTS or obj.getTypeIdOfProperty(base) != "App::PropertyPlacement":
         raise ValueError("no property " + name)
@@ -704,6 +776,94 @@ def set_property(obj, name, value):
         ypr[("yaw", "pitch", "roll").index(part)] = float(value)
         pl.Rotation = FreeCAD.Rotation(*ypr)
     setattr(obj, base, pl)
+
+
+def expression_path(obj, name):
+    """FreeCAD's path of a property as `props` names it: "Placement.x" is "Placement.Base.x",
+    "Constraints.3" is "Constraints[3]"."""
+    base, _, part = name.partition(".")
+    if part and part in PLACEMENT_PARTS and obj.getTypeIdOfProperty(base) == "App::PropertyPlacement":
+        return "%s.%s" % (base, PLACEMENT_PATHS[PLACEMENT_PARTS.index(part)])
+    if part and base == "Constraints" and is_sketch(obj):
+        i = constraint_index(obj, part)
+        return name if obj.Constraints[i].Name else "Constraints[%d]" % i
+    return name
+
+
+def property_name(path):
+    """`expression_path` the other way round: how `props` names the property of a path."""
+    path = path.lstrip(".")
+    base, _, rest = path.partition(".")
+    if rest in PLACEMENT_PATHS:
+        return "%s.%s" % (base, PLACEMENT_PARTS[PLACEMENT_PATHS.index(rest)])
+    if path.startswith("Constraints[") and path.endswith("]"):
+        return "Constraints." + path[len("Constraints["):-1]
+    return path
+
+
+def set_expression(obj, name, expression):
+    """Bind a property to an expression ("Spreadsheet.thickness * 2"); empty clears it. A bad
+    expression is refused here; one naming what does not exist breaks the object on recompute."""
+    obj.setExpression(expression_path(obj, name), expression or None)
+
+
+def expressions_of(obj):
+    """{property name as `props` gives it: expression}."""
+    try:
+        engine = obj.ExpressionEngine
+    except Exception:
+        return {}
+    return {property_name(path): expr for path, expr in engine}
+
+
+def describe_geometry(g):
+    """One element of a sketch, in the sketch's own (x, y) coordinates."""
+    kind = type(g).__name__
+
+    def p2(v):
+        return [round(v.x, 6), round(v.y, 6)]
+
+    d = {"type": kind}
+    if kind == "LineSegment":
+        d.update(start=p2(g.StartPoint), end=p2(g.EndPoint), length=round(g.length(), 6))
+    elif kind == "Circle":
+        d.update(center=p2(g.Center), radius=round(g.Radius, 6))
+    elif kind == "ArcOfCircle":
+        d.update(center=p2(g.Center), radius=round(g.Radius, 6), start=p2(g.StartPoint), end=p2(g.EndPoint),
+                 start_angle=round(math.degrees(g.FirstParameter), 6), end_angle=round(math.degrees(g.LastParameter), 6))
+    elif kind == "Point":
+        d.update(at=[round(g.X, 6), round(g.Y, 6)])
+    elif kind in ("Ellipse", "ArcOfEllipse"):
+        d.update(center=p2(g.Center), major_radius=round(g.MajorRadius, 6), minor_radius=round(g.MinorRadius, 6))
+    elif kind == "BSplineCurve":
+        d.update(degree=g.Degree, poles=[p2(p) for p in g.getPoles()])
+    if kind in ("ArcOfEllipse", "BSplineCurve"):
+        try:
+            d.update(start=p2(g.StartPoint), end=p2(g.EndPoint))
+        except Exception:
+            pass
+    return d
+
+
+# Where on an element a constraint holds, as Sketcher numbers it.
+CONSTRAINT_POS = {1: "start", 2: "end", 3: "center"}
+
+
+def constraint_ref(geo, pos):
+    """What a constraint refers to: an element of the sketch (index), an axis, or external."""
+    if geo == -2000:  # GeoEnum::GeoUndef
+        return None
+    if geo >= 0:
+        ref = {"geometry": geo}
+    elif geo == -1:
+        ref = {"axis": "x"}
+    elif geo == -2:
+        ref = {"axis": "y"}
+    else:
+        ref = {"external": -geo - 3}
+    if pos in CONSTRAINT_POS:
+        ref["at"] = CONSTRAINT_POS[pos]
+    return ref
 
 
 class Worker(Modelling):
@@ -726,6 +886,8 @@ class Worker(Modelling):
         self.crashed = []      # (key, shape) of shapes that stopped two tessellators
         self.states = []       # see `_record`
         self.next_state = 0
+        self.trials = {}       # dry runs: id -> state, see `cmd_set_props`
+        self.next_trial = 0
 
     # ---- documents -------------------------------------------------------------------
 
@@ -744,6 +906,7 @@ class Worker(Modelling):
         self.gui, self.gui_files = read_gui_document(path)
         if not still_edited or not self.states:
             self.states, self.next_state = [], 0
+            self.trials.clear()
             self._record("open")
         return {"name": self.doc.Name, "label": self.doc.Label, "path": path}
 
@@ -753,6 +916,7 @@ class Worker(Modelling):
         self.doc = FreeCAD.newDocument("Unnamed")
         self.doc.UndoMode = 1
         self.states, self.next_state = [], 0
+        self.trials.clear()
         self._record("new")
         return {"name": self.doc.Name, "label": self.doc.Label, "path": None}
 
@@ -864,6 +1028,11 @@ class Worker(Modelling):
             if "Hidden" in status:
                 continue
             ptype = obj.getTypeIdOfProperty(name)
+            if ptype == "Sketcher::PropertyConstraintList" and is_sketch(obj):
+                props.extend(constraint_entries(obj, obj.getGroupOfProperty(name) or "Sketch", "ReadOnly" in status))
+                continue
+            if ptype in HIDDEN_PROPERTY_TYPES:
+                continue
             try:
                 value = obj.getPropertyByName(name)
             except Exception as e:
@@ -898,29 +1067,128 @@ class Worker(Modelling):
                 entry["kind"] = "enum"
                 entry["value"] = str(value)
                 entry["options"] = list(obj.getEnumerationsOfProperty(name) or [])
+            if entry["kind"] == "text":
+                entry["readonly"] = True  # links, lists, vectors: not set from here
             props.append(entry)
+        expressions = expressions_of(obj)
+        for entry in props:
+            if entry["name"] in expressions:
+                entry["expression"] = expressions[entry["name"]]
         errors = [] if "Invalid" not in obj.State else [_object_error(obj)]
         return {"obj": obj.Name, "label": obj.Label, "type": obj.TypeId, "props": props,
                 "state": list(obj.State), "errors": errors}
 
+    def cmd_sketch(self, req):
+        """A sketch as data: its plane, its elements and its constraints, each dimension with
+        the property name `set_prop` takes ("Constraints.<name>" or "Constraints.<index>")."""
+        sk = self._obj(req["obj"])
+        if not is_sketch(sk):
+            raise ValueError("%s is a %s, not a sketch" % (sk.Label, sk.TypeId))
+        pl = sk.getGlobalPlacement()
+        r = pl.Rotation
+        geometry = []
+        for i, g in enumerate(sk.Geometry):
+            d = describe_geometry(g)
+            d["index"] = i
+            d["construction"] = bool(sk.getConstruction(i))
+            geometry.append(d)
+        expressions = expressions_of(sk)
+        constraints = []
+        for i, c in enumerate(sk.Constraints):
+            refs = (constraint_ref(c.First, c.FirstPos), constraint_ref(c.Second, c.SecondPos),
+                    constraint_ref(c.Third, c.ThirdPos))
+            d = {"index": i, "type": c.Type, "name": c.Name or None, "driving": bool(c.Driving),
+                 "active": bool(getattr(c, "IsActive", True)), "refs": [r_ for r_ in refs if r_ is not None]}
+            if c.Type in DATUM_UNITS:
+                prop = "Constraints." + (c.Name or str(i))
+                d.update(value=constraint_value(c), unit=DATUM_UNITS[c.Type], property=prop)
+                if prop in expressions:
+                    d["expression"] = expressions[prop]
+            constraints.append(d)
+        external = [{"object": o.Name, "element": e} for o, subs in (sk.ExternalGeometry or []) for e in subs]
+        return {"obj": sk.Name, "label": sk.Label,
+                "plane": {"origin": _vec(pl.Base), "normal": _vec(r.multVec(FreeCAD.Vector(0, 0, 1))),
+                          "x_dir": _vec(r.multVec(FreeCAD.Vector(1, 0, 0)))},
+                "geometry": geometry, "constraints": constraints, "external": external,
+                "fully_constrained": bool(getattr(sk, "FullyConstrained", False)),
+                "state": list(sk.State), "errors": [] if "Invalid" not in sk.State else [_object_error(sk)]}
+
     def cmd_set_prop(self, req):
+        return self.cmd_set_props({"changes": [{"obj": req["obj"], "prop": req["prop"], "value": req["value"]}]})
+
+    def cmd_set_props(self, req):
+        """Set properties, each {"obj", "prop", "value"} or {"obj", "prop", "expression"} (an
+        empty expression clears one), with one recompute: one undo step and one state. With
+        "dry_run" the document is put back as it was, and the result is kept as a trial state
+        ("t1", ...) that `slice` and `diff` take like any other."""
         doc = self._doc()
-        obj = self._obj(req["obj"])
-        name, value = req["prop"], req["value"]
-        if isinstance(value, float) and not math.isfinite(value):
-            # OCCT does not survive a NaN or infinite dimension: refuse it before FreeCAD sees it.
-            raise ValueError("%s must be a finite number" % name)
+        changes = req.get("changes") or []
+        if not changes:
+            raise ValueError("no changes given")
+        steps = []
+        for ch in changes:
+            obj, name = self._obj(ch.get("obj") or ""), ch.get("prop") or ""
+            if not name:
+                raise ValueError("a change of %s names no property" % obj.Name)
+            if "expression" in ch:
+                steps.append((obj, name, "expression", ch["expression"]))
+                continue
+            if "value" not in ch:
+                raise ValueError("%s.%s: give a value or an expression" % (obj.Name, name))
+            value = ch["value"]
+            if isinstance(value, float) and not math.isfinite(value):
+                # OCCT does not survive a NaN or infinite dimension: refuse it before FreeCAD sees it.
+                raise ValueError("%s must be a finite number" % name)
+            steps.append((obj, name, "value", value))
+        title = "; ".join("set %s.%s %s %s" % (o.Name, n, "=" if k == "value" else ":=", _short(v, 40))
+                          for o, n, k, v in steps)
+        dry = bool(req.get("dry_run"))
+        if dry and doc.RedoCount:
+            # Opening a transaction drops FreeCAD's redo steps, even one that is aborted.
+            raise ValueError("a dry run would drop the %d step(s) that redo can bring back: redo them, or make "
+                             "an edit, first" % doc.RedoCount)
+        was_edited = self.edited
         self.edited = True
-        doc.openTransaction("Set " + name)
+        doc.openTransaction(title if len(steps) == 1 else "Set %d properties" % len(steps))
+        committed = False
         try:
-            set_property(obj, name, value)
+            for obj, name, kind, v in steps:
+                if kind == "expression":
+                    set_expression(obj, name, v)
+                else:
+                    set_property(obj, name, v)
             doc.recompute()
-        except Exception:
-            doc.abortTransaction()
-            raise
-        doc.commitTransaction()
-        broken = [o.Name for o in doc.Objects if "Invalid" in o.State]
-        return dict({"broken": broken}, **self._record_edit("set %s.%s = %s" % (obj.Name, name, _short(value, 40))))
+            invalid = [o for o in doc.Objects if "Invalid" in o.State]
+            out = {"broken": [o.Name for o in invalid],
+                   "errors": [{"object": o.Name, "error": _object_error(o)} for o in invalid]}
+            if dry:
+                out.update(self._trial(title))
+                return out
+            commit_transaction(doc)
+            committed = True
+        finally:
+            if not committed:  # refused, failed, or a dry run: put the document back
+                abort_transaction(doc)
+                doc.recompute()
+                if dry:
+                    self.edited = was_edited
+        out.update(self._record_edit(title))
+        return out
+
+    def _trial(self, cause):
+        """The shapes of a dry run, as a state outside the timeline, against the last state."""
+        shapes = solid_bodies(self._doc())
+        prints = {name: fingerprint(s) for name, (s, _) in shapes.items()}
+        last = self.states[-1]
+        changed = [n for n in sorted(set(prints) | set(last["prints"])) if last["prints"].get(n) != prints.get(n)]
+        self.next_trial += 1
+        tid = "t%d" % self.next_trial
+        self.trials[tid] = {"id": tid, "cause": cause, "shapes": shapes, "prints": prints, "changed": changed}
+        while len(self.trials) > MAX_TRIALS:
+            del self.trials[next(iter(self.trials))]
+        bodies = [{"body": n, "volume_before": last["prints"][n][0] if n in last["prints"] else 0.0,
+                   "volume_after": prints[n][0] if n in prints else 0.0} for n in changed]
+        return {"dry_run": True, "trial": tid, "state_before": last["id"], "changed_bodies": changed, "bodies": bodies}
 
     def cmd_set_visible(self, req):
         """Visibility belongs to the drawing, as in FreeCAD's GUI: not an undoable model edit."""
@@ -943,9 +1211,9 @@ class Worker(Modelling):
             body.Tip = feature
             doc.recompute()
         except Exception:
-            doc.abortTransaction()
+            abort_transaction(doc)
             raise
-        doc.commitTransaction()
+        commit_transaction(doc)
         self._follow_tips(tips)
         broken = [o.Name for o in doc.Objects if "Invalid" in o.State]
         return dict({"broken": broken}, **self._record_edit("set tip of %s to %s" % (body.Name, feature.Name)))
@@ -1024,7 +1292,10 @@ class Worker(Modelling):
         for s in self.states:
             if s["id"] == sid:
                 return s["shapes"]
-        raise KeyError("no state %s; get_timeline lists them" % sid)
+        if sid in self.trials:
+            return self.trials[sid]["shapes"]
+        raise KeyError("no state %s; get_timeline lists the states, and the trial states of the "
+                       "last %d dry runs are kept" % (sid, MAX_TRIALS))
 
     def cmd_snapshot(self, req):
         """Name the document's state now, so it can be sliced or compared later."""
@@ -1288,7 +1559,8 @@ class Worker(Modelling):
             return False
         if not self.conn.poll():
             return True  # the window went away
-        return any(r.get("cmd") in ENDS_SCENE for r in self.conn.pending)
+        # A dry run puts the document back as it was: it waits for the scene, as reads do.
+        return any(r.get("cmd") in ENDS_SCENE and not r.get("dry_run") for r in self.conn.pending)
 
     def _disk_key(self, m, tol):
         """A key for the disk cache that a later process finds again, or None.

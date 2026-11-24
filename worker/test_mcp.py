@@ -4,8 +4,8 @@
     python worker/test_mcp.py [path/to/vibecad.exe] [out_dir]
 
 Needs a built window (default target/release/vibecad[.exe]) and FreeCAD. Writes the pictures
-the agent got to out_dir (default: a temporary directory) and closes the window at the end;
-the sample on disk is not changed (nothing is saved).
+the agent got, and the document the agent saved, to out_dir (default: a temporary directory)
+and closes the window at the end; the sample on disk is not changed.
 """
 import base64
 import json
@@ -110,6 +110,41 @@ def main(exe, out):
         tl = json_part(text)
         print("timeline:", [(c["state"], c["cause"], c.get("delta_volume")) for c in tl["bodies"]["Body"]["changes"]])
         assert [c["cause"] for c in tl["bodies"]["Body"]["changes"]][-1] == "undo", tl
+        err, text, _ = m.tool("get_sketch", object="HoleSketch")
+        sk = json_part(text)
+        print("get_sketch:", [(c["property"], c["value"]) for c in sk["constraints"] if "property" in c])
+        assert not err and sk["constraints"][0]["property"] == "Constraints.HoleDiameter", text[:300]
+        err, text, _ = m.tool("set_property", object="HoleSketch", property="Constraints.HoleDiameter", value=24.0, dry_run=True)
+        print("dry run with a redo step waiting refused:", err, text[:70])
+        assert err, "a dry run would drop the redo step"
+        err, text, _ = m.tool("redo")
+        err, text, _ = m.tool("set_property", object="HoleSketch", property="Constraints.HoleDiameter", value=24.0, dry_run=True)
+        trial = json_part(text)
+        print("dry run:", trial)
+        assert not err and trial["dry_run"] and trial["changed_bodies"] == ["Body"], text
+        err, text, imgs = m.tool("diff", before=trial["state_before"], state=trial["trial"])
+        assert not err and json_part(text)["bodies"][0]["delta_volume"] < 0 and len(imgs) == 1, text[:300]
+        open(os.path.join(out, "dry_run_diff.png"), "wb").write(imgs[0])
+        err, text, _ = m.tool("set_properties", changes=[
+            {"object": "HoleSketch", "property": "Constraints.HoleDiameter", "value": 24.0},
+            {"object": "Pad", "property": "Length", "expression": "HoleSketch.Constraints.HoleDiameter / 4"}])
+        both = json_part(text)
+        print("set_properties:", both)
+        assert not err and both["changed_bodies"] == ["Body"], text
+        err, text, _ = m.tool("set_property", object="Pad", property="Length")
+        print("neither value nor expression:", err, text[:60])
+        assert err
+        saved_to = os.path.join(out, "agent_saved.FCStd")
+        if os.path.exists(saved_to):  # from an earlier run into the same out_dir
+            os.remove(saved_to)
+        err, text, _ = m.tool("save", path=saved_to)
+        print("save:", err, text[:120])
+        assert not err and os.path.exists(saved_to), text
+        err, text, _ = m.tool("get_status")
+        assert json.loads(text)["path"] == saved_to and not json.loads(text)["unsaved_edits"], text
+        err, text, _ = m.tool("save", path=SAMPLE)
+        print("overwriting another file refused:", err, text[:70])
+        assert err
         err, text, _ = m.tool("diff", before="s99")
         print("bad state refused:", err, text[:60])
         assert err
